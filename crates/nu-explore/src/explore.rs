@@ -1,6 +1,9 @@
 use crate::{
-    PagerConfig, run_pager,
+    PagerConfig,
+    commands::TryCmd, // Added
+    run_pager,
     util::{create_lscolors, create_map},
+    views::TryView, // Added
 };
 use nu_ansi_term::{Color, Style};
 use nu_color_config::{StyleComputer, get_color_map};
@@ -43,6 +46,7 @@ impl Command for Explore {
                 "When quitting, output the value of the cell the cursor was on",
                 Some('p'),
             )
+            .switch("try", "Start with the pager in :try mode", None)
             .category(Category::Viewers)
     }
 
@@ -61,6 +65,8 @@ impl Command for Explore {
         let show_index: bool = call.has_flag(engine_state, stack, "index")?;
         let tail: bool = call.has_flag(engine_state, stack, "tail")?;
         let peek_value: bool = call.has_flag(engine_state, stack, "peek")?;
+
+        let start_in_try_mode: bool = call.has_flag(engine_state, stack, "try")?; // Get the new flag
 
         let nu_config = stack.get_config(engine_state);
         let style_computer = StyleComputer::from_config(engine_state, stack);
@@ -83,8 +89,11 @@ impl Command for Explore {
             peek_value,
             tail,
             &cwd,
+            start_in_try_mode, // Pass the new flag
         );
-
+        // If starting in try mode, and input is empty, we might want to reconsider.
+        // However, `run_pager` already handles empty input by showing help.
+        // If we want a dedicated "empty try" mode, that's a further change.
         let result = run_pager(engine_state, &mut stack.clone(), input, config);
 
         match result {
@@ -130,6 +139,12 @@ impl Command for Explore {
             Example {
                 description: "Explore a JSON file, then save the last visited sub-structure to a file",
                 example: r#"open file.json | explore --peek | to json | save part.json"#,
+                result: None,
+            },
+            Example {
+                // Added example for --try
+                description: "Open explore in :try mode with the current directory's information",
+                example: r#"ls | explore --try"#,
                 result: None,
             },
         ]

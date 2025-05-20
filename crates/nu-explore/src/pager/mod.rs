@@ -10,10 +10,11 @@ use self::{
 };
 use super::views::{Layout, View};
 use crate::{
+    commands::TryCmd, // Added
     explore::ExploreConfig,
     nu_common::{NuColor, NuConfig, NuStyle},
     registry::{Command, CommandRegistry},
-    views::{ViewConfig, util::nu_style_to_tui},
+    views::{TryView, ViewConfig, util::nu_style_to_tui}, // Added TryView
 };
 use anyhow::Result;
 use crossterm::{
@@ -152,6 +153,7 @@ pub struct PagerConfig<'a> {
     pub tail: bool,
     // Just a cached dir we are working in used for color manipulations
     pub cwd: String,
+    pub start_in_try_mode: bool, // Added field
 }
 
 impl<'a> PagerConfig<'a> {
@@ -163,6 +165,7 @@ impl<'a> PagerConfig<'a> {
         peek_value: bool,
         tail: bool,
         cwd: &str,
+        start_in_try_mode: bool, // Added parameter
     ) -> Self {
         Self {
             nu_config,
@@ -172,6 +175,7 @@ impl<'a> PagerConfig<'a> {
             peek_value,
             tail,
             cwd: cwd.to_string(),
+            start_in_try_mode, // Initialize field
         }
     }
 }
@@ -183,10 +187,22 @@ fn render_ui(
     stack: &mut Stack,
     pager: &mut Pager<'_>,
     info: &mut ViewInfo,
-    view: Option<Page>,
+    // view: Option<Page>,
+    mut view: Option<Page>, // Changed from `view: Option<Page>`
     commands: CommandRegistry,
 ) -> Result<Option<Value>> {
     let events = UIEvents::new();
+
+    // Determine initial view if --try is used
+    if pager.config.start_in_try_mode && view.is_none() {
+        // We need to get the input value to pass to TryCmd/TryView.
+        // The `input` PipelineData is in `explore.rs`'s `run` and then passed to `lib.rs`'s `run_pager`.
+        // `run_pager` then conditionally creates views. We'll adjust `run_pager` in `lib.rs`
+        // to create the TryView there if needed, and pass it as the `view` argument here.
+        // For now, this logic branch in `render_ui` for `start_in_try_mode` will be handled by `run_pager`
+        // in `lib.rs` setting the initial `view`.
+    }
+
     let mut view_stack = ViewStack::new(view, Vec::new());
 
     loop {
@@ -196,9 +212,9 @@ fn render_ui(
 
         let mut layout = Layout::default();
         {
-            let info = info.clone();
+            let info_clone = info.clone(); // Renamed to avoid conflict
             term.draw(|f| {
-                draw_frame(f, &mut view_stack.curr_view, pager, &mut layout, info);
+                draw_frame(f, &mut view_stack.curr_view, pager, &mut layout, info_clone);
             })?;
         }
 
@@ -241,9 +257,9 @@ fn render_ui(
                 info.report = Some(Report::success(cmd_name));
             }
 
-            let info = info.clone();
+            let info_clone = info.clone(); // Renamed
             term.draw(|f| {
-                draw_info(f, pager, info);
+                draw_info(f, pager, info_clone);
             })?;
         }
 

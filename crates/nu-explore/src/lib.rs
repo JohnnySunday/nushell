@@ -20,7 +20,10 @@ use nu_protocol::{
 };
 use pager::{Page, Pager, PagerConfig};
 use registry::CommandRegistry;
-use views::{BinaryView, Orientation, Preview, RecordView};
+// use views::{BinaryView, Orientation, Preview, RecordView};
+use crate::commands::ViewCommand;
+
+use views::{BinaryView, Orientation, Preview, RecordView, TryView, ViewConfig as NuViewConfig}; // Added TryView & NuViewConfig
 
 mod util {
     pub use super::nu_common::{create_lscolors, create_map};
@@ -35,6 +38,64 @@ fn run_pager(
     let mut p = Pager::new(config.clone());
     let commands = create_command_registry();
 
+    // Handle --try flag first
+    if config.start_in_try_mode {
+        p.show_message("Started in :try mode. Type your Nushell command and press Enter.");
+        // We need the initial input value for TryView
+        // collect_pipeline consumes the input, so we need to be careful if we want to use it later.
+        // For TryView, it usually operates on a single Value.
+        // Let's assume `input` might be a stream. We might need to collect it first if TryView expects a concrete Value.
+        // The TryCmd::spawn expects an Option<Value>.
+
+        let initial_value = match input {
+            PipelineData::Empty => Value::nothing(nu_protocol::Span::unknown()),
+            PipelineData::Value(val, ..) => val,
+            PipelineData::ListStream(mut stream, ..) => {
+                // For a list stream, :try might operate on the whole list,
+                // or perhaps it should signal an error, or take the first element?
+                // Current TryView takes a single Value. Let's make it operate on the list as a whole.
+                Value::list(
+                    stream.into_value().into_list()?,
+                    nu_protocol::Span::unknown(),
+                )
+            }
+            PipelineData::ByteStream(bs, ..) => {
+                // Convert bytestream to Binary or String for TryView
+                // This matches how BinaryView handles it roughly
+                match bs.into_bytes() {
+                    Ok(bytes) => Value::binary(bytes, nu_protocol::Span::unknown()),
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "Failed to read bytestream for --try: {}",
+                            e
+                        ));
+                    }
+                }
+            }
+        };
+        let view_config = NuViewConfig::new(
+            config.nu_config,
+            config.explore_config,
+            config.style_computer,
+            config.lscolors,
+            &config.cwd,
+        );
+
+        let mut try_cmd = TryCmd::new(); // Default command can be empty
+        let try_view_result = try_cmd.spawn(engine_state, stack, Some(initial_value), &view_config);
+
+        match try_view_result {
+            Ok(try_view) => {
+                let page = Page::new(try_view, true); // true for stackable, adjust if needed
+                return p.run(engine_state, stack, Some(page), commands);
+            }
+            Err(e) => {
+                // If TryView spawning fails, maybe fall back to default view or show error.
+                // For now, let's propagate the error.
+                return Err(e);
+            }
+        }
+    }
     let is_record = matches!(input, PipelineData::Value(Value::Record { .. }, ..));
     let is_binary = matches!(
         input,
@@ -47,7 +108,7 @@ fn run_pager(
         let view = binary_view(input, config.explore_config)?;
         return p.run(engine_state, stack, Some(view), commands);
     }
-
+    // `input` is consumed by collect_pipeline here if not binary or try mode
     let (columns, data) = collect_pipeline(input)?;
 
     let has_no_input = columns.is_empty() && data.is_empty();
