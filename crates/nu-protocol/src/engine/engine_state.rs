@@ -10,6 +10,7 @@ use crate::{
         description::{Doccomments, build_desc},
     },
     eval_const::create_nu_constant,
+    report_error::ReportLog,
     shell_error::io::IoError,
 };
 use fancy_regex::Regex;
@@ -115,6 +116,7 @@ pub struct EngineState {
     startup_time: i64,
     is_debugging: IsDebugging,
     pub debugger: Arc<Mutex<Box<dyn Debugger>>>,
+    pub report_log: Arc<Mutex<ReportLog>>,
 
     pub jobs: Arc<Mutex<Jobs>>,
 
@@ -201,6 +203,7 @@ impl EngineState {
             startup_time: -1,
             is_debugging: IsDebugging::new(false),
             debugger: Arc::new(Mutex::new(Box::new(NoopDebugger))),
+            report_log: Arc::default(),
             jobs: Arc::new(Mutex::new(Jobs::default())),
             current_job: CurrentJob {
                 id: JobId::new(0),
@@ -368,13 +371,6 @@ impl EngineState {
         Ok(())
     }
 
-    pub fn has_overlay(&self, name: &[u8]) -> bool {
-        self.scope
-            .overlays
-            .iter()
-            .any(|(overlay_name, _)| name == overlay_name)
-    }
-
     pub fn active_overlay_ids<'a, 'b>(
         &'b self,
         removed_overlays: &'a [Vec<u8>],
@@ -412,7 +408,7 @@ impl EngineState {
     }
 
     /// Translate overlay IDs from other to IDs in self
-    pub fn translate_overlay_ids(&self, other: &ScopeFrame) -> Vec<OverlayId> {
+    fn translate_overlay_ids(&self, other: &ScopeFrame) -> Vec<OverlayId> {
         let other_names = other.active_overlays.iter().map(|other_id| {
             &other
                 .overlays
@@ -520,10 +516,7 @@ impl EngineState {
     }
 
     #[cfg(feature = "plugin")]
-    pub fn update_plugin_file(
-        &self,
-        updated_items: Vec<PluginRegistryItem>,
-    ) -> Result<(), ShellError> {
+    fn update_plugin_file(&self, updated_items: Vec<PluginRegistryItem>) -> Result<(), ShellError> {
         // Updating the signatures plugin file with the added signatures
         use std::fs::File;
 
@@ -775,6 +768,30 @@ impl EngineState {
         &[0u8; 0]
     }
 
+    /// If the span's content starts with the given prefix, return two subspans
+    /// corresponding to this prefix, and the rest of the content.
+    pub fn span_match_prefix(&self, span: Span, prefix: &[u8]) -> Option<(Span, Span)> {
+        let contents = self.get_span_contents(span);
+
+        if contents.starts_with(prefix) {
+            span.split_at(prefix.len())
+        } else {
+            None
+        }
+    }
+
+    /// If the span's content ends with the given postfix, return two subspans
+    /// corresponding to the rest of the content, and this postfix.
+    pub fn span_match_postfix(&self, span: Span, prefix: &[u8]) -> Option<(Span, Span)> {
+        let contents = self.get_span_contents(span);
+
+        if contents.ends_with(prefix) {
+            span.split_at(span.len() - prefix.len())
+        } else {
+            None
+        }
+    }
+
     /// Get the global config from the engine state.
     ///
     /// Use [`Stack::get_config()`] instead whenever the `Stack` is available, as it takes into
@@ -1015,10 +1032,7 @@ impl EngineState {
         cwd.into_os_string()
             .into_string()
             .map_err(|err| ShellError::NonUtf8Custom {
-                msg: format!(
-                    "The current working directory is not a valid utf-8 string: {:?}",
-                    err
-                ),
+                msg: format!("The current working directory is not a valid utf-8 string: {err:?}"),
                 span: Span::unknown(),
             })
     }

@@ -64,6 +64,7 @@ pub fn load_standard_library(
             "std/testing",
             include_str!("../std/testing/mod.nu"),
         ),
+        ("mod.nu", "std/clip", include_str!("../std/clip/mod.nu")),
     ];
 
     for (filename, std_subdir_name, content) in std_submodules.drain(..) {
@@ -125,6 +126,11 @@ pub fn load_standard_library(
             "mod.nu",
             "std-rfc/tables",
             include_str!("../std-rfc/tables/mod.nu"),
+        ),
+        (
+            "mod.nu",
+            "std-rfc/iter",
+            include_str!("../std-rfc/iter/mod.nu"),
         ),
     ];
 

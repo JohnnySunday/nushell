@@ -6,6 +6,7 @@ use crate::{
     },
 };
 use chrono::DateTime;
+use polars_plan::plans::DynLiteralValue;
 use std::sync::Arc;
 
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
@@ -236,7 +237,10 @@ impl PluginCommand for AsDateTime {
         call: &EvaluatedCall,
         input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
-        command(plugin, engine, call, input).map_err(LabeledError::from)
+        let metadata = input.metadata();
+        command(plugin, engine, call, input)
+            .map_err(LabeledError::from)
+            .map(|pd| pd.set_metadata(metadata))
     }
 }
 
@@ -291,7 +295,9 @@ fn command(
                     None,
                     None,
                     options,
-                    Expr::Literal(LiteralValue::String(PlSmallStr::from_string(ambiguous))),
+                    Expr::Literal(LiteralValue::Dyn(DynLiteralValue::Str(
+                        PlSmallStr::from_string(ambiguous),
+                    ))),
                 )
                 .into();
             res.to_pipeline_data(plugin, engine, call.head)
@@ -321,7 +327,9 @@ fn command_lazy(
             None,
             None,
             options,
-            Expr::Literal(LiteralValue::String(PlSmallStr::from_string(ambiguous))),
+            Expr::Literal(LiteralValue::Dyn(DynLiteralValue::Str(
+                PlSmallStr::from_string(ambiguous),
+            ))),
         )]),
     )
     .to_pipeline_data(plugin, engine, call.head)

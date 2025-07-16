@@ -598,7 +598,12 @@ impl ByteStream {
         match self.stream {
             ByteStreamSource::Read(mut read) => {
                 let mut buf = Vec::new();
-                read.read_to_end(&mut buf).map_err(&from_io_error)?;
+                read.read_to_end(&mut buf).map_err(|err| {
+                    match ShellErrorBridge::try_from(err) {
+                        Ok(ShellErrorBridge(err)) => err,
+                        Err(err) => ShellError::Io(from_io_error(err)),
+                    }
+                })?;
                 Ok(buf)
             }
             ByteStreamSource::File(mut file) => {
@@ -1427,7 +1432,7 @@ mod tests {
             match value {
                 Ok(value) => string.push_str(&value.into_string().expect("not a string")),
                 Err(err) => {
-                    println!("string so far: {:?}", string);
+                    println!("string so far: {string:?}");
                     println!("got error: {err:?}");
                     assert!(!string.is_empty());
                     assert!(matches!(err, ShellError::NonUtf8Custom { .. }));

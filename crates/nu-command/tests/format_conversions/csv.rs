@@ -79,6 +79,17 @@ fn table_to_csv_text_skipping_headers_after_conversion() {
 }
 
 #[test]
+fn table_to_csv_float_doesnt_become_int() {
+    let actual = nu!(pipeline(
+        r#"
+            [[a]; [1.0]] | to csv | from csv | get 0.a | describe
+        "#
+    ));
+
+    assert_eq!(actual.out, "float")
+}
+
+#[test]
 fn infers_types() {
     Playground::setup("filter_from_csv_test_1", |dirs, sandbox| {
         sandbox.with_files(&[FileWithContentToBeTrimmed(
@@ -315,7 +326,7 @@ fn from_csv_text_with_missing_columns_to_table() {
             r#"
                 open los_tres_caballeros.txt
                 | from csv --flexible
-                | get -i rusty_luck
+                | get -o rusty_luck
                 | compact
                 | length
             "#

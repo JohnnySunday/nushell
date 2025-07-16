@@ -118,7 +118,10 @@ fn find_with_regex_in_table_keeps_row_if_one_column_matches() {
         "[[name nickname]; [Maurice moe] [Laurence larry]] | find --no-highlight --regex ce | get name | to json -r"
     );
 
-    assert_eq!(actual.out, r#"["Maurice","Laurence"]"#);
+    assert_eq!(
+        actual.out,
+        r#"["\u001b[37mMauri\u001b[0m\u001b[41;37mce\u001b[0m\u001b[37m\u001b[0m","\u001b[37mLauren\u001b[0m\u001b[41;37mce\u001b[0m\u001b[37m\u001b[0m"]"#
+    );
     assert_eq!(actual_no_highlight.out, r#"["Maurice","Laurence"]"#);
 }
 
@@ -289,4 +292,21 @@ fn find_with_string_search_with_special_char_6() {
         "[{\"d\":\"\\u001b[37ma\\u001b[0m\\u001b[41;37m[]\\u001b[0m\\u001b[37mb\\u001b[0m\"}]"
     );
     assert_eq!(actual_no_highlight.out, "[{\"d\":\"a[]b\"}]");
+}
+
+#[test]
+fn find_in_nested_list_dont_match_bracket() {
+    let actual = nu!(r#"[ [foo bar] [foo baz] ] | find "[" | to json -r"#);
+
+    assert_eq!(actual.out, "[]");
+}
+
+#[test]
+fn find_and_highlight_in_nested_list() {
+    let actual = nu!(r#"[ [foo bar] [foo baz] ] | find "foo" | to json -r"#);
+
+    assert_eq!(
+        actual.out,
+        r#"[["\u001b[37m\u001b[0m\u001b[41;37mfoo\u001b[0m\u001b[37m\u001b[0m","bar"],["\u001b[37m\u001b[0m\u001b[41;37mfoo\u001b[0m\u001b[37m\u001b[0m","baz"]]"#
+    );
 }

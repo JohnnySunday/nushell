@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use nu_engine::command_prelude::*;
-use nu_protocol::{Signals, ast::PathMember, report_shell_warning};
+use nu_protocol::{DeprecationEntry, DeprecationType, ReportMode, Signals, ast::PathMember};
 
 #[derive(Clone)]
 pub struct Get;
@@ -41,8 +41,13 @@ If multiple cell paths are given, this will produce a list of values."#
             )
             .rest("rest", SyntaxShape::CellPath, "Additional cell paths.")
             .switch(
+                "optional",
+                "make all cell path members optional (returns `null` for missing values)",
+                Some('o'),
+            )
+            .switch(
                 "ignore-errors",
-                "ignore missing data (make all cell path members optional)",
+                "ignore missing data (make all cell path members optional) (deprecated)",
                 Some('i'),
             )
             .switch(
@@ -131,29 +136,37 @@ If multiple cell paths are given, this will produce a list of values."#
     ) -> Result<PipelineData, ShellError> {
         let cell_path: CellPath = call.req(engine_state, stack, 0)?;
         let rest: Vec<CellPath> = call.rest(engine_state, stack, 1)?;
-        let ignore_errors = call.has_flag(engine_state, stack, "ignore-errors")?;
-        let sensitive_span = call.get_flag_span(stack, "sensitive");
+        let optional = call.has_flag(engine_state, stack, "optional")?
+            || call.has_flag(engine_state, stack, "ignore-errors")?;
         let metadata = input.metadata();
-        if let Some(span) = sensitive_span {
-            report_shell_warning(
-                engine_state,
-                &ShellError::Deprecated {
-                    deprecated: "sensitive flag",
-                    suggestion: "",
-                    span,
-                    help: Some("cell-paths are case-sensitive by default"),
-                },
-            );
-        }
         action(
             input,
             cell_path,
             rest,
-            ignore_errors,
+            optional,
             engine_state.signals().clone(),
             call.head,
         )
         .map(|x| x.set_metadata(metadata))
+    }
+
+    fn deprecation_info(&self) -> Vec<DeprecationEntry> {
+        vec![
+            DeprecationEntry {
+                ty: DeprecationType::Flag("sensitive".into()),
+                report_mode: ReportMode::FirstUse,
+                since: Some("0.105.0".into()),
+                expected_removal: None,
+                help: Some("Cell-paths are now case-sensitive by default.\nTo access fields case-insensitively, add `!` after the relevant path member.".into())
+            },
+            DeprecationEntry {
+                ty: DeprecationType::Flag("ignore-errors".into()),
+                report_mode: ReportMode::FirstUse,
+                since: Some("0.106.0".into()),
+                expected_removal: None,
+                help: Some("This flag has been renamed to `--optional (-o)` to better reflect its behavior.".into())
+            }
+        ]
     }
 }
 
@@ -161,29 +174,19 @@ fn action(
     input: PipelineData,
     mut cell_path: CellPath,
     mut rest: Vec<CellPath>,
-    ignore_errors: bool,
+    optional: bool,
     signals: Signals,
     span: Span,
 ) -> Result<PipelineData, ShellError> {
-    if ignore_errors {
+    if optional {
         cell_path.make_optional();
         for path in &mut rest {
             path.make_optional();
         }
     }
 
-    match input {
-        PipelineData::Empty => return Err(ShellError::PipelineEmpty { dst_span: span }),
-        // Allow chaining of get -i
-        PipelineData::Value(val @ Value::Nothing { .. }, ..) if !ignore_errors => {
-            return Err(ShellError::OnlySupportsThisInputType {
-                exp_input_type: "table or record".into(),
-                wrong_type: "nothing".into(),
-                dst_span: span,
-                src_span: val.span(),
-            });
-        }
-        _ => (),
+    if let PipelineData::Empty = input {
+        return Err(ShellError::PipelineEmpty { dst_span: span });
     }
 
     if rest.is_empty() {

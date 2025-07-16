@@ -5,7 +5,7 @@ use nu_protocol::{
 };
 
 use chrono::DateTime;
-use polars_ops::pivot::{PivotAgg, pivot};
+use polars_ops::pivot::{PivotAgg, pivot_stable};
 
 use crate::{
     PolarsPlugin,
@@ -193,6 +193,7 @@ impl PluginCommand for PivotDF {
         call: &EvaluatedCall,
         input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
+        let metadata = input.metadata();
         match PolarsPluginObject::try_from_pipeline(plugin, input, call.head)? {
             PolarsPluginObject::NuDataFrame(df) => command_eager(plugin, engine, call, df),
             PolarsPluginObject::NuLazyFrame(lazy) => {
@@ -207,6 +208,7 @@ impl PluginCommand for PivotDF {
             }),
         }
         .map_err(LabeledError::from)
+        .map(|pd| pd.set_metadata(metadata))
     }
 }
 
@@ -235,7 +237,7 @@ fn command_eager(
 
     let polars_df = df.to_polars();
     // todo add other args
-    let pivoted = pivot(
+    let pivoted = pivot_stable(
         &polars_df,
         &on_col_string,
         Some(&index_col_string),

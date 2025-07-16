@@ -1,8 +1,9 @@
 use super::chained_error::ChainedError;
 use crate::{
     ConfigError, LabeledError, ParseError, Span, Spanned, Type, Value, ast::Operator,
-    engine::StateWorkingSet, format_shell_error, record,
+    engine::StateWorkingSet, format_cli_error, record,
 };
+use job::JobError;
 use miette::Diagnostic;
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroI32;
@@ -10,6 +11,7 @@ use thiserror::Error;
 
 pub mod bridge;
 pub mod io;
+pub mod job;
 pub mod location;
 
 /// The fundamental error type for the evaluation engine. These cases represent different kinds of errors
@@ -917,7 +919,7 @@ pub enum ShellError {
     /// This is the main I/O error, for further details check the error kind and additional context.
     #[error(transparent)]
     #[diagnostic(transparent)]
-    Io(io::IoError),
+    Io(#[from] io::IoError),
 
     /// A name was not found. Did you mean a different name?
     ///
@@ -1217,12 +1219,12 @@ This is an internal Nushell error, please file an issue https://github.com/nushe
         span: Span,
     },
 
-    #[error("{deprecated} is deprecated and will be removed in a future release")]
-    #[diagnostic()]
-    Deprecated {
-        deprecated: &'static str,
-        suggestion: &'static str,
-        #[label("{deprecated} is deprecated. {suggestion}")]
+    #[error("{deprecation_type} deprecated.")]
+    #[diagnostic(code(nu::shell::deprecated), severity(Warning))]
+    DeprecationWarning {
+        deprecation_type: &'static str,
+        suggestion: String,
+        #[label("{suggestion}")]
         span: Span,
         #[help]
         help: Option<&'static str>,
@@ -1381,60 +1383,9 @@ On Windows, this would be %USERPROFILE%\AppData\Roaming"#
         span: Option<Span>,
     },
 
-    #[error("Job {id} not found")]
-    #[diagnostic(
-        code(nu::shell::job_not_found),
-        help(
-            "The operation could not be completed, there is no job currently running with this id"
-        )
-    )]
-    JobNotFound {
-        id: usize,
-        #[label = "job not found"]
-        span: Span,
-    },
-
-    #[error("No frozen job to unfreeze")]
-    #[diagnostic(
-        code(nu::shell::no_frozen_job),
-        help("There is currently no frozen job to unfreeze")
-    )]
-    NoFrozenJob {
-        #[label = "no frozen job"]
-        span: Span,
-    },
-
-    #[error("Job {id} is not frozen")]
-    #[diagnostic(
-        code(nu::shell::job_not_frozen),
-        help("You tried to unfreeze a job which is not frozen")
-    )]
-    JobNotFrozen {
-        id: usize,
-        #[label = "job not frozen"]
-        span: Span,
-    },
-
-    #[error("The job {id} is frozen")]
-    #[diagnostic(
-        code(nu::shell::job_is_frozen),
-        help("This operation cannot be performed because the job is frozen")
-    )]
-    JobIsFrozen {
-        id: usize,
-        #[label = "This job is frozen"]
-        span: Span,
-    },
-
-    #[error("No message was received in the requested time interval")]
-    #[diagnostic(
-        code(nu::shell::recv_timeout),
-        help("No message arrived within the specified time limit")
-    )]
-    RecvTimeout {
-        #[label = "timeout"]
-        span: Span,
-    },
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Job(#[from] JobError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -1467,7 +1418,7 @@ impl ShellError {
             "msg" => Value::string(self.to_string(), span),
             "debug" => Value::string(format!("{self:?}"), span),
             "raw" => Value::error(self.clone(), span),
-            "rendered" => Value::string(format_shell_error(working_set, &self), span),
+            "rendered" => Value::string(format_cli_error(working_set, &self, Some("nu::shell::error")), span),
             "json" => Value::string(serde_json::to_string(&self).expect("Could not serialize error"), span),
         };
 
@@ -1480,7 +1431,7 @@ impl ShellError {
 
     // TODO: Implement as From trait
     pub fn wrap(self, working_set: &StateWorkingSet, span: Span) -> ParseError {
-        let msg = format_shell_error(working_set, &self);
+        let msg = format_cli_error(working_set, &self, None);
         ParseError::LabeledError(
             msg,
             "Encountered error during parse-time evaluation".into(),
@@ -1560,15 +1511,15 @@ fn shell_error_serialize_roundtrip() {
         from_type: "Bar".into(),
         help: Some("this is a test".into()),
     };
-    println!("orig_error = {:#?}", original_error);
+    println!("orig_error = {original_error:#?}");
 
     let serialized =
         serde_json::to_string_pretty(&original_error).expect("serde_json::to_string_pretty failed");
-    println!("serialized = {}", serialized);
+    println!("serialized = {serialized}");
 
     let deserialized: ShellError =
         serde_json::from_str(&serialized).expect("serde_json::from_str failed");
-    println!("deserialized = {:#?}", deserialized);
+    println!("deserialized = {deserialized:#?}");
 
     // We don't expect the deserialized error to be the same as the original error, but its miette
     // properties should be comparable

@@ -1,6 +1,6 @@
 use std::{borrow::Cow, fs::File, sync::Arc};
 
-use nu_path::{AbsolutePathBuf, expand_path_with};
+use nu_path::{expand_path, expand_path_with};
 use nu_protocol::{
     DataSource, DeclId, ENV_VARIABLE_ID, Flag, IntoPipelineData, IntoSpanned, ListStream, OutDest,
     PipelineData, PipelineMetadata, PositionalArg, Range, Record, RegId, ShellError, Signals,
@@ -888,9 +888,7 @@ fn literal_value(
             if *no_expand {
                 Value::string(path, span)
             } else {
-                let cwd = ctx.engine_state.cwd(Some(ctx.stack))?;
-                let path = expand_path_with(path, cwd, true);
-
+                let path = expand_path(path, true);
                 Value::string(path.to_string_lossy(), span)
             }
         }
@@ -904,13 +902,7 @@ fn literal_value(
             } else if *no_expand {
                 Value::string(path, span)
             } else {
-                let cwd = ctx
-                    .engine_state
-                    .cwd(Some(ctx.stack))
-                    .map(AbsolutePathBuf::into_std_path_buf)
-                    .unwrap_or_default();
-                let path = expand_path_with(path, cwd, true);
-
+                let path = expand_path(path, true);
                 Value::string(path.to_string_lossy(), span)
             }
         }
@@ -1167,6 +1159,7 @@ fn gather_arguments(
 
     // Arguments that didn't get consumed by required/optional
     let mut rest = vec![];
+    let mut rest_span: Option<Span> = None;
 
     // If we encounter a spread, all further positionals should go to rest
     let mut always_spread = false;
@@ -1186,12 +1179,19 @@ fn gather_arguments(
                     }
                     callee_stack.add_var(var_id, val);
                 } else {
+                    rest_span = Some(rest_span.map_or(val.span(), |s| s.append(val.span())));
                     rest.push(val);
                 }
             }
-            Argument::Spread { vals, .. } => {
+            Argument::Spread {
+                vals,
+                span: spread_span,
+                ..
+            } => {
                 if let Value::List { vals, .. } = vals {
                     rest.extend(vals);
+                    // Rest variable should span the spread syntax, not the list values
+                    rest_span = Some(rest_span.map_or(spread_span, |s| s.append(spread_span)));
                     // All further positional args should go to spread
                     always_spread = true;
                 } else if let Value::Error { error, .. } = vals {
@@ -1226,7 +1226,7 @@ fn gather_arguments(
 
     // Add the collected rest of the arguments if a spread argument exists
     if let Some(rest_arg) = &block.signature.rest_positional {
-        let rest_span = rest.first().map(|v| v.span()).unwrap_or(call_head);
+        let rest_span = rest_span.unwrap_or(call_head);
         let var_id = expect_positional_var_id(rest_arg, rest_span)?;
         callee_stack.add_var(var_id, Value::list(rest, rest_span));
     }

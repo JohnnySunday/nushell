@@ -971,6 +971,8 @@ pub fn parse_internal_call(
     let signature = working_set.get_signature(decl);
     let output = signature.get_output_type();
 
+    let deprecation = decl.deprecation_info();
+
     // storing the var ID for later due to borrowing issues
     let lib_dirs_var_id = match decl.name() {
         "use" | "overlay use" | "source-env" if decl.is_keyword() => {
@@ -1264,6 +1266,16 @@ pub fn parse_internal_call(
 
     check_call(working_set, command_span, &signature, &call);
 
+    deprecation
+        .into_iter()
+        .filter_map(|entry| entry.parse_warning(&signature.name, &call))
+        .for_each(|warning| {
+            // FIXME: if two flags are deprecated and both are used in one command,
+            // the second flag's deprecation won't show until the first flag is removed
+            // (but it won't be flagged as reported until it is actually reported)
+            working_set.warning(warning);
+        });
+
     if signature.creates_scope {
         working_set.exit_scope();
     }
@@ -1304,7 +1316,6 @@ pub fn parse_call(working_set: &mut StateWorkingSet, spans: &[Span], head: Span)
             }
         }
 
-        // TODO: Try to remove the clone
         let decl = working_set.get_decl(decl_id);
 
         let parsed_call = if let Some(alias) = decl.as_alias() {
@@ -1677,7 +1688,7 @@ pub fn parse_int(working_set: &mut StateWorkingSet, span: Span) -> Expression {
             Expression::new(working_set, Expr::Int(num), span, Type::Int)
         } else {
             working_set.error(ParseError::InvalidLiteral(
-                format!("invalid digits for radix {}", radix),
+                format!("invalid digits for radix {radix}"),
                 "int".into(),
                 span,
             ));
@@ -2057,6 +2068,10 @@ pub fn parse_brace_expr(
     } else if matches!(second_token_contents, Some(TokenContents::Pipe))
         || matches!(second_token_contents, Some(TokenContents::PipePipe))
     {
+        if matches!(shape, SyntaxShape::Block) {
+            working_set.error(ParseError::Mismatch("block".into(), "closure".into(), span));
+            return Expression::garbage(working_set, span);
+        }
         parse_closure_expression(working_set, shape, span)
     } else if matches!(third_token, Some(b":")) {
         parse_full_cell_path(working_set, None, span)
@@ -2786,13 +2801,24 @@ pub fn parse_unit_value<'res>(
             None => number_part,
         };
 
-        // Convert all durations to nanoseconds to not lose precision
-        let num = match unit_to_ns_factor(&unit) {
+        // Convert all durations to nanoseconds, and filesizes to bytes,
+        // to minimize loss of precision
+        let factor = match ty {
+            Type::Filesize => unit_to_byte_factor(&unit),
+            Type::Duration => unit_to_ns_factor(&unit),
+            _ => None,
+        };
+
+        let num = match factor {
             Some(factor) => {
-                let num_ns = num_float * factor;
-                if i64::MIN as f64 <= num_ns && num_ns <= i64::MAX as f64 {
-                    unit = Unit::Nanosecond;
-                    num_ns as i64
+                let num_base = num_float * factor;
+                if i64::MIN as f64 <= num_base && num_base <= i64::MAX as f64 {
+                    unit = if ty == Type::Filesize {
+                        Unit::Filesize(FilesizeUnit::B)
+                    } else {
+                        Unit::Nanosecond
+                    };
+                    num_base as i64
                 } else {
                     // not safe to convert, because of the overflow
                     num_float as i64
@@ -2915,6 +2941,27 @@ fn unit_to_ns_factor(unit: &Unit) -> Option<f64> {
         Unit::Hour => Some(60.0 * 60.0 * 1_000_000_000.0),
         Unit::Day => Some(24.0 * 60.0 * 60.0 * 1_000_000_000.0),
         Unit::Week => Some(7.0 * 24.0 * 60.0 * 60.0 * 1_000_000_000.0),
+        _ => None,
+    }
+}
+
+fn unit_to_byte_factor(unit: &Unit) -> Option<f64> {
+    match unit {
+        Unit::Filesize(FilesizeUnit::B) => Some(1.0),
+        Unit::Filesize(FilesizeUnit::KB) => Some(1_000.0),
+        Unit::Filesize(FilesizeUnit::MB) => Some(1_000_000.0),
+        Unit::Filesize(FilesizeUnit::GB) => Some(1_000_000_000.0),
+        Unit::Filesize(FilesizeUnit::TB) => Some(1_000_000_000_000.0),
+        Unit::Filesize(FilesizeUnit::PB) => Some(1_000_000_000_000_000.0),
+        Unit::Filesize(FilesizeUnit::EB) => Some(1_000_000_000_000_000_000.0),
+        Unit::Filesize(FilesizeUnit::KiB) => Some(1024.0),
+        Unit::Filesize(FilesizeUnit::MiB) => Some(1024.0 * 1024.0),
+        Unit::Filesize(FilesizeUnit::GiB) => Some(1024.0 * 1024.0 * 1024.0),
+        Unit::Filesize(FilesizeUnit::TiB) => Some(1024.0 * 1024.0 * 1024.0 * 1024.0),
+        Unit::Filesize(FilesizeUnit::PiB) => Some(1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0),
+        Unit::Filesize(FilesizeUnit::EiB) => {
+            Some(1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0)
+        }
         _ => None,
     }
 }
@@ -3340,10 +3387,7 @@ pub fn parse_import_pattern(working_set: &mut StateWorkingSet, spans: &[Span]) -
                     "list"
                 };
                 working_set.error(ParseError::WrongImportPattern(
-                    format!(
-                        "{} member can be only at the end of an import pattern",
-                        what
-                    ),
+                    format!("{what} member can be only at the end of an import pattern"),
                     prev_span,
                 ));
                 return Expression::new(
@@ -4724,7 +4768,7 @@ pub fn parse_block_expression(working_set: &mut StateWorkingSet, span: Span) -> 
 
     let block_id = working_set.add_block(Arc::new(output));
 
-    Expression::new(working_set, Expr::Block(block_id), span, Type::Any)
+    Expression::new(working_set, Expr::Block(block_id), span, Type::Block)
 }
 
 pub fn parse_match_block_expression(working_set: &mut StateWorkingSet, span: Span) -> Expression {
@@ -6069,7 +6113,7 @@ fn check_record_key_or_value(
                 let colon_position = i + string_value.span.start;
                 ParseError::InvalidLiteral(
                     "colon".to_string(),
-                    format!("bare word specifying record {}", position),
+                    format!("bare word specifying record {position}"),
                     Span::new(colon_position, colon_position + 1),
                 )
             })
@@ -6496,7 +6540,7 @@ pub fn parse_block(
 }
 
 /// Compile an IR block for the `Block`, adding a compile error on failure
-fn compile_block(working_set: &mut StateWorkingSet<'_>, block: &mut Block) {
+pub fn compile_block(working_set: &mut StateWorkingSet<'_>, block: &mut Block) {
     match nu_engine::compile(working_set, block) {
         Ok(ir_block) => {
             block.ir_block = Some(ir_block);

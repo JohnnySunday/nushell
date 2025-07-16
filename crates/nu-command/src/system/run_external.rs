@@ -187,12 +187,10 @@ impl Command for External {
             }
         } else if potential_powershell_script {
             command.args([
-                "-Command",
+                "-File",
                 &path_to_ps1_executable.unwrap_or_default().to_string_lossy(),
             ]);
-            for arg in &args {
-                command.raw_arg(arg.item.clone());
-            }
+            command.args(args.into_iter().map(|s| s.item));
         } else {
             command.args(args.into_iter().map(|s| s.item));
         }
@@ -277,11 +275,8 @@ impl Command for External {
         );
 
         let mut child = child.map_err(|err| {
-            IoError::new_internal(
-                err,
-                "Could not spawn foreground child",
-                nu_protocol::location!(),
-            )
+            let context = format!("Could not spawn foreground child: {err}");
+            IoError::new_internal(err, context, nu_protocol::location!())
         })?;
 
         if let Some(thread_job) = engine_state.current_thread_job() {

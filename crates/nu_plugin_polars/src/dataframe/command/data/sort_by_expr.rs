@@ -115,6 +115,7 @@ impl PluginCommand for LazySortBy {
         call: &EvaluatedCall,
         input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
+        let metadata = input.metadata();
         let vals: Vec<Value> = call.rest(0)?;
         let expr_value = Value::list(vals, call.head);
         let expressions = NuExpression::extract_exprs(plugin, expr_value)?;
@@ -148,7 +149,8 @@ impl PluginCommand for LazySortBy {
             nulls_last: vec![nulls_last],
             multithreaded: true,
             maintain_order,
-            // todo - expose limit
+            // Applying a limit here will result in a panic
+            // it is not supported by polars in this context
             limit: None,
         };
 
@@ -160,6 +162,7 @@ impl PluginCommand for LazySortBy {
         );
         lazy.to_pipeline_data(plugin, engine, call.head)
             .map_err(LabeledError::from)
+            .map(|pd| pd.set_metadata(metadata))
     }
 }
 
