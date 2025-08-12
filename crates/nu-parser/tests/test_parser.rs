@@ -293,6 +293,21 @@ pub fn parse_filesize() {
 }
 
 #[test]
+pub fn parse_non_utf8_fails() {
+    let engine_state = EngineState::new();
+    let mut working_set = StateWorkingSet::new(&engine_state);
+
+    // Panic when parsing units was triggered by non-UTF8 characters
+    // due to bad handling via `String::from_utf8_lossy`
+    //
+    // See https://github.com/nushell/nushell/pull/16355
+    let _block = parse(&mut working_set, None, b"0\xffB", true);
+
+    // Asserting on the exact error doesn't make as much sense as
+    assert!(!working_set.parse_errors.is_empty());
+}
+
+#[test]
 pub fn parse_cell_path() {
     let engine_state = EngineState::new();
     let mut working_set = StateWorkingSet::new(&engine_state);
@@ -1634,6 +1649,46 @@ mod string {
             assert_eq!(subexprs[1], &Expr::String("foo".to_string()));
             assert!(matches!(subexprs[2], &Expr::FullCellPath(..)));
             assert_eq!(subexprs[3], &Expr::String("bar".to_string()));
+        }
+
+        /// PR with summary of the issue: https://github.com/nushell/nushell/pull/16235
+        /// Release Notes Mention: https://www.nushell.sh/blog/2025-07-23-nushell_0_106_0.html#regression-bare-word-interpolation-on-both-sides-does-not-work-toc
+        #[test]
+        pub fn parse_string_interpolation_bare_starting_and_ending_subexpr() {
+            let engine_state = EngineState::new();
+            let mut working_set = StateWorkingSet::new(&engine_state);
+
+            let block = parse(
+                &mut working_set,
+                None,
+                b"(100 + 20 + 3)/bar/(300 + 20 + 1)",
+                true,
+            );
+
+            assert!(working_set.parse_errors.is_empty(),);
+
+            let [pipeline] = block.pipelines.as_slice() else {
+                panic!("expected 1 pipeline")
+            };
+            let [element] = pipeline.elements.as_slice() else {
+                panic!("expected 1 pipeline element")
+            };
+            assert!(element.redirection.is_none());
+
+            let Expr::StringInterpolation(expressions) = &element.expr.expr else {
+                panic!("Expected an `Expr::StringInterpolation`")
+            };
+            let subexprs: Vec<_> = expressions.iter().map(|e| &e.expr).collect();
+
+            let [
+                Expr::FullCellPath(..),
+                Expr::String(s),
+                Expr::FullCellPath(..),
+            ] = subexprs.as_slice()
+            else {
+                panic!("AST does not have the expected structure")
+            };
+            assert_eq!(s, "/bar/");
         }
 
         #[test]
