@@ -35,6 +35,13 @@ impl Command for Explore {
                 "Show or hide column headers (default true)",
                 None,
             )
+            .named(
+                // Add this named flag
+                "inline",
+                SyntaxShape::Int,
+                "Display the pager inline with a fixed height",
+                None,
+            )
             .switch("index", "Show row indexes when viewing a list", Some('i'))
             .switch(
                 "tail",
@@ -67,7 +74,7 @@ impl Command for Explore {
         let peek_value: bool = call.has_flag(engine_state, stack, "peek")?;
 
         let start_in_try_mode: bool = call.has_flag(engine_state, stack, "try")?; // Get the new flag
-
+        let inline_height: Option<i64> = call.get_flag(engine_state, stack, "inline")?; // Add this line
         let nu_config = stack.get_config(engine_state);
         let style_computer = StyleComputer::from_config(engine_state, stack);
 
@@ -90,6 +97,7 @@ impl Command for Explore {
             tail,
             &cwd,
             start_in_try_mode, // Pass the new flag
+            inline_height,
         );
         // If starting in try mode, and input is empty, we might want to reconsider.
         // However, `run_pager` already handles empty input by showing help.
@@ -145,6 +153,12 @@ impl Command for Explore {
                 // Added example for --try
                 description: "Open explore in :try mode with the current directory's information",
                 example: r#"ls | explore --try"#,
+                result: None,
+            },
+            Example {
+                // Added example for --inline
+                description: "Display ls output inline with a height of 10 lines",
+                example: r#"ls | explore --inline 10"#,
                 result: None,
             },
         ]

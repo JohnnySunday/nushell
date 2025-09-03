@@ -189,4 +189,5 @@ fn create_aliases(registry: &mut CommandRegistry) {
     registry.create_aliases("e", ExpandCmd::NAME);
     registry.create_aliases("q", QuitCmd::NAME);
     registry.create_aliases("q!", QuitCmd::NAME);
+    registry.create_aliases("T", TryCmd::NAME);
 }

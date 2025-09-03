@@ -25,6 +25,8 @@ use crossterm::{
         enable_raw_mode,
     },
 };
+use ratatui::{TerminalOptions, Viewport};
+
 use events::UIEvents;
 use lscolors::LsColors;
 use nu_color_config::StyleComputer;
@@ -94,12 +96,30 @@ impl<'a> Pager<'a> {
         commands: CommandRegistry,
     ) -> Result<Option<Value>> {
         // setup terminal
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, Clear(ClearType::All))?;
 
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend)?;
+        let mut stdout = io::stdout();
+
+        // Conditionally set up the terminal for inline or alternate screen mode
+        let mut terminal = if let Some(height) = self.config.inline {
+            enable_raw_mode()?;
+            execute!(stdout)?;
+            ratatui::init_with_options(TerminalOptions {
+                viewport: Viewport::Inline(height),
+            })
+        } else {
+            enable_raw_mode()?;
+            execute!(stdout, EnterAlternateScreen, Clear(ClearType::All))?;
+            let backend = CrosstermBackend::new(stdout);
+            Terminal::new(backend)?
+        };
+
+        // old code
+        // enable_raw_mode()?;
+        // let mut stdout = io::stdout();
+        // execute!(stdout, EnterAlternateScreen, Clear(ClearType::All))?;
+        //
+        // let backend = CrosstermBackend::new(stdout);
+        // let mut terminal = Terminal::new(backend)?;
 
         let mut info = ViewInfo {
             status: Some(Report::default()),
@@ -120,9 +140,20 @@ impl<'a> Pager<'a> {
             commands,
         )?;
 
-        // restore terminal
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        // Cleanup logic
+        if self.config.inline.is_none() {
+            // Only leave alternate screen if not in inline mode
+            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        } else {
+            execute!(terminal.backend_mut())?;
+            terminal.clear()?;
+        }
+
+        // old
+        // restore terminal
+        // disable_raw_mode()?;
+        // execute!(io::stdout(), LeaveAlternateScreen)?;
 
         Ok(result)
     }
@@ -155,9 +186,11 @@ pub struct PagerConfig<'a> {
     // Just a cached dir we are working in used for color manipulations
     pub cwd: String,
     pub start_in_try_mode: bool, // Added field
+    pub inline: Option<u16>,     // Add this field
 }
 
 impl<'a> PagerConfig<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         nu_config: &'a NuConfig,
         explore_config: &'a ExploreConfig,
@@ -167,7 +200,9 @@ impl<'a> PagerConfig<'a> {
         tail: bool,
         cwd: &str,
         start_in_try_mode: bool, // Added parameter
+        inline: Option<i64>,     // Add this argument
     ) -> Self {
+        let inline = inline.map(|h| h as u16); // Convert to u16
         Self {
             nu_config,
             explore_config,
@@ -177,6 +212,7 @@ impl<'a> PagerConfig<'a> {
             tail,
             cwd: cwd.to_string(),
             start_in_try_mode, // Initialize field
+            inline,
         }
     }
 }
