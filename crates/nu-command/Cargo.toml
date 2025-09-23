@@ -115,6 +115,7 @@ ureq = { workspace = true, default-features = false, features = [
 	"charset",
 	"gzip",
 	"json",
+	"platform-verifier",
 ], optional = true }
 url = { workspace = true }
 uu_cp = { workspace = true, optional = true }
@@ -163,20 +164,22 @@ workspace = true
 [target.'cfg(windows)'.dependencies.windows]
 features = [
 	"Win32_Foundation",
+	"Win32_Networking_WinSock",
+	"Win32_NetworkManagement_IpHelper",
+	"Win32_Security",
 	"Win32_Storage_FileSystem",
 	"Win32_System_Environment",
 	"Win32_System_SystemServices",
-	"Win32_Security",
 	"Win32_System_Threading",
 ]
 workspace = true
 
 [features]
-default = ["os", "rustls-tls"]
+default = ["os", "network", "rustls-tls"]
 os = [
 	# include other features
 	"js",
-	"network",
+	"nu-engine/os",
 	"nu-protocol/os",
 	"nu-utils/os",
 
@@ -194,7 +197,6 @@ os = [
 	"uu_uname",
 	"uu_whoami",
 	"which",
-	"ureq/platform-verifier"
 ]
 
 # The dependencies listed below need 'getrandom'.
