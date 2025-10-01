@@ -55,7 +55,7 @@ fn run_pager(
                 // or perhaps it should signal an error, or take the first element?
                 // Current TryView takes a single Value. Let's make it operate on the list as a whole.
                 Value::list(
-                    stream.into_value().into_list()?,
+                    stream.into_value()?.into_list()?,
                     nu_protocol::Span::unknown(),
                 )
             }
