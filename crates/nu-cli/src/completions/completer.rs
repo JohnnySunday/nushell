@@ -7,8 +7,11 @@ use crate::completions::{
 use nu_color_config::{color_record_to_nustyle, lookup_ansi_color_style};
 use nu_parser::{parse, parse_module_file_or_dir};
 use nu_protocol::{
-    CommandWideCompleter, Completion, Span, Type, Value,
-    ast::{Argument, Block, Expr, Expression, FindMapResult, ListItem, Traverse},
+    CommandWideCompleter, Completion, GetSpan, Span, Type, Value,
+    ast::{
+        Argument, Block, Expr, Expression, FindMapResult, ListItem, PipelineRedirection,
+        RedirectionTarget, Traverse,
+    },
     engine::{EngineState, Stack, StateWorkingSet},
 };
 use reedline::{Completer as ReedlineCompleter, Suggestion};
@@ -31,6 +34,16 @@ fn find_pipeline_element_by_position<'a>(
     }
     let closure = |expr: &'a Expression| find_pipeline_element_by_position(expr, working_set, pos);
     match &expr.expr {
+        Expr::RowCondition(block_id)
+        | Expr::Subexpression(block_id)
+        | Expr::Block(block_id)
+        | Expr::Closure(block_id) => {
+            let block = working_set.get_block(*block_id);
+            // check redirection target for sub blocks before diving recursively into them
+            check_redirection_in_block(block.as_ref(), pos)
+                .map(FindMapResult::Found)
+                .unwrap_or_default()
+        }
         Expr::Call(call) => call
             .arguments
             .iter()
@@ -42,14 +55,25 @@ fn find_pipeline_element_by_position<'a>(
         Expr::ExternalCall(head, arguments) => arguments
             .iter()
             .find_map(|arg| arg.expr().find_map(working_set, &closure))
-            .or(head.as_ref().find_map(working_set, &closure))
+            .or_else(|| {
+                // For aliased external_call, the span of original external command head should fail the
+                // contains(pos) check, thus avoiding recursion into its head expression.
+                // See issue #7648 for details.
+                let span = working_set.get_span(head.span_id);
+                if span.contains(pos) {
+                    // This is for complicated external head expressions, e.g. `^(echo<tab> foo)`
+                    head.as_ref().find_map(working_set, &closure)
+                } else {
+                    None
+                }
+            })
             .or(Some(expr))
             .map(FindMapResult::Found)
             .unwrap_or_default(),
         // complete the operator
         Expr::BinaryOp(lhs, _, rhs) => lhs
             .find_map(working_set, &closure)
-            .or(rhs.find_map(working_set, &closure))
+            .or_else(|| rhs.find_map(working_set, &closure))
             .or(Some(expr))
             .map(FindMapResult::Found)
             .unwrap_or_default(),
@@ -76,6 +100,34 @@ fn find_pipeline_element_by_position<'a>(
             .unwrap_or_default(),
         _ => FindMapResult::Continue,
     }
+}
+
+/// Helper function to extract file-path expression from redirection target
+fn check_redirection_target(target: &RedirectionTarget, pos: usize) -> Option<&Expression> {
+    let expr = target.expr();
+    expr.and_then(|expression| {
+        if let Expr::String(_) = expression.expr
+            && expression.span.contains(pos)
+        {
+            expr
+        } else {
+            None
+        }
+    })
+}
+
+/// For redirection target completion
+/// https://github.com/nushell/nushell/issues/16827
+fn check_redirection_in_block(block: &Block, pos: usize) -> Option<&Expression> {
+    block.pipelines.iter().find_map(|pipeline| {
+        pipeline.elements.iter().find_map(|element| {
+            element.redirection.as_ref().and_then(|redir| match redir {
+                PipelineRedirection::Single { target, .. } => check_redirection_target(target, pos),
+                PipelineRedirection::Separate { out, err } => check_redirection_target(out, pos)
+                    .or_else(|| check_redirection_target(err, pos)),
+            })
+        })
+    })
 }
 
 /// Before completion, an additional character `a` is added to the source as a placeholder for correct parsing results.
@@ -218,9 +270,12 @@ impl NuCompleter {
         if !extra_placeholder {
             pos_to_search = pos_to_search.saturating_sub(1);
         }
-        let Some(element_expression) = block.find_map(working_set, &|expr: &Expression| {
-            find_pipeline_element_by_position(expr, working_set, pos_to_search)
-        }) else {
+        let Some(element_expression) = block
+            .find_map(working_set, &|expr: &Expression| {
+                find_pipeline_element_by_position(expr, working_set, pos_to_search)
+            })
+            .or_else(|| check_redirection_in_block(block.as_ref(), pos_to_search))
+        else {
             return vec![];
         };
 
@@ -341,10 +396,12 @@ impl NuCompleter {
         // unfinished argument completion for commands
         match &element_expression.expr {
             Expr::Call(call) => {
+                let signature = working_set.get_decl(call.decl_id).signature();
                 // NOTE: the argument to complete is not necessarily the last one
                 // for lsp completion, we don't trim the text,
                 // so that `def`s after pos can be completed
                 let mut positional_arg_indices = Vec::new();
+
                 for (arg_idx, arg) in call.arguments.iter().enumerate() {
                     let span = arg.span();
 
@@ -355,8 +412,6 @@ impl NuCompleter {
                         }
                         continue;
                     }
-
-                    let signature = working_set.get_decl(call.decl_id).signature();
 
                     // Get custom completion from PositionalArg or Flag
                     let completion = {
@@ -609,29 +664,14 @@ impl NuCompleter {
                         break;
                     }
                 }
-
-                // for external executable path completion with spaces, #16712
-                if suggestions.is_empty()
-                    && head.span.contains(pos)
-                    && let Expr::GlobPattern(_, _) = &head.expr
-                {
-                    let (new_span, prefix) =
-                        strip_placeholder_if_any(working_set, &head.span, strip);
-                    let ctx = Context::new(working_set, new_span, prefix, offset);
-                    return self.process_completion(&mut FileCompletion, &ctx);
-                }
             }
             _ => (),
         }
 
         // if no suggestions yet, fallback to file completion
         if suggestions.is_empty() {
-            let (new_span, prefix) = strip_placeholder_with_rsplit(
-                working_set,
-                &element_expression.span,
-                |c| *c == b' ',
-                strip,
-            );
+            let (new_span, prefix) =
+                strip_placeholder_if_any(working_set, &element_expression.span, strip);
             let ctx = Context::new(working_set, new_span, prefix, offset);
             suggestions.extend(self.process_completion(&mut FileCompletion, &ctx));
         }
@@ -895,6 +935,24 @@ pub fn map_value_completions<'a>(
                             Value::Record { .. } => Some(color_record_to_nustyle(value)),
                             _ => None,
                         };
+                    }
+                    "span" => {
+                        if let Value::Record { val: span, .. } = value {
+                            let start = span
+                                .get("start")
+                                .and_then(|val| val.as_int().ok())
+                                .and_then(|x| usize::try_from(x).ok());
+                            let end = span
+                                .get("end")
+                                .and_then(|val| val.as_int().ok())
+                                .and_then(|x| usize::try_from(x).ok());
+                            if let (Some(start), Some(end)) = (start, end) {
+                                suggestion.span = reedline::Span {
+                                    start: start.min(end),
+                                    end,
+                                };
+                            }
+                        }
                     }
                     _ => (),
                 }

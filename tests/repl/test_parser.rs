@@ -567,10 +567,26 @@ fn starts_with_operator_succeeds() -> TestResult {
 }
 
 #[test]
+fn not_starts_with_operator_succeeds() -> TestResult {
+    run_test(
+        r#"[Moe Larry Curly] | where $it not-starts-with L | str join"#,
+        "MoeCurly",
+    )
+}
+
+#[test]
 fn ends_with_operator_succeeds() -> TestResult {
     run_test(
         r#"[Moe Larry Curly] | where $it ends-with ly | str join"#,
         "Curly",
+    )
+}
+
+#[test]
+fn not_ends_with_operator_succeeds() -> TestResult {
+    run_test(
+        r#"[Moe Larry Curly] | where $it not-ends-with y | str join"#,
+        "Moe",
     )
 }
 
@@ -822,6 +838,76 @@ fn filesize_is_not_hex() -> TestResult {
 #[test]
 fn let_variable_type_mismatch() -> TestResult {
     fail_test(r#"let x: int = "foo""#, "expected int, found string")
+}
+
+#[test]
+fn let_variable_table_runtime_cast() -> TestResult {
+    let outcome = nu!(
+        experimental: vec!["enforce-runtime-annotations".to_string()],
+        r#"let x: table = ([[a]; [1]] | to nuon | from nuon); $x | describe"#,
+    );
+
+    // Type::Any should be accepted by compatible types (record can convert to table)
+    assert!(outcome.out.contains("table<a: int>"));
+    Ok(())
+}
+
+#[test]
+fn let_variable_table_runtime_mismatch() -> TestResult {
+    let outcome = nu!(
+        experimental: vec!["enforce-runtime-annotations".to_string()],
+        r#"mut x: table<b: int> = ([[b]; [1]]  | to nuon | from nuon); $x = [[a]; [1]]"#,
+    );
+
+    // This conversion should fail due to a key mismatch
+    assert!(
+        outcome
+            .err
+            .contains("does not operate between 'table<b: int>' and 'table<a: int>'")
+    );
+    Ok(())
+}
+
+#[test]
+fn mut_variable_table_runtime_mismatch() -> TestResult {
+    let outcome = nu!(
+        experimental: vec!["enforce-runtime-annotations".to_string()],
+        r#"mut x: table<b: int> = ([[b]; [1]]  | to nuon | from nuon); $x = [[a]; [1]]"#,
+    );
+
+    assert!(
+        outcome
+            .err
+            .contains("does not operate between 'table<b: int>' and 'table<a: int>'")
+    );
+    Ok(())
+}
+
+#[test]
+fn let_variable_record_runtime_cast() -> TestResult {
+    let outcome = nu!(
+        experimental: vec!["enforce-runtime-annotations".to_string()],
+        r#"let x: record<a: int> = ({a: 1} | to nuon | from nuon); $x | describe"#,
+    );
+    // Records from Type::Any sources should be convertible to tables when field types match
+    assert!(outcome.out.contains("record<a: int>"));
+    Ok(())
+}
+
+#[test]
+fn let_variable_record_runtime_mismatch() -> TestResult {
+    let outcome = nu!(
+        experimental: vec!["enforce-runtime-annotations".to_string()],
+        r#"let x: record<b: int> = ({a: 1} | to nuon | from nuon); $x | describe"#,
+    );
+
+    // This conversion should fail due to a key mismatch
+    assert!(
+        outcome
+            .err
+            .contains("can't convert record<a: int> to record<b: int>")
+    );
+    Ok(())
 }
 
 #[test]

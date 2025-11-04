@@ -96,6 +96,12 @@ pub fn type_compatible(lhs: &Type, rhs: &Type) -> bool {
             is_compatible(lhs, rhs)
         }
         (Type::Glob, Type::String) => true,
+        (Type::CellPath, other) => {
+            other.is_subtype_of(&Type::CellPath) || Type::CellPath.is_subtype_of(other)
+        }
+        (Type::OneOf(types), u) | (u, Type::OneOf(types)) => {
+            types.iter().any(|t| type_compatible(t, u))
+        }
         (lhs, rhs) => lhs == rhs,
     }
 }
@@ -620,7 +626,12 @@ pub fn math_result_type(
                 }
             }
         }
-        Operator::Comparison(Comparison::StartsWith | Comparison::EndsWith) => {
+        Operator::Comparison(
+            Comparison::StartsWith
+            | Comparison::NotStartsWith
+            | Comparison::EndsWith
+            | Comparison::NotEndsWith,
+        ) => {
             match (&lhs.ty, &rhs.ty) {
                 (Type::String | Type::Any, Type::String | Type::Any) => (Type::Bool, None),
                 // TODO: should this include glob?

@@ -15,7 +15,7 @@ use nu_protocol::{
 };
 use nu_std::load_standard_library;
 use nu_test_support::fs;
-use reedline::{Completer, Suggestion};
+use reedline::{Completer, Span, Suggestion};
 use rstest::{fixture, rstest};
 use support::{
     completions_helpers::{
@@ -98,12 +98,14 @@ fn extern_completer() -> NuCompleter {
     let record = r#"
         def animals [] { [ "cat", "dog", "eel" ] }
         def fruits [] { [ "apple", "banana" ] }
+        def options [] { [ '"first item"', '"second item"', '"third item' ] }
         extern spam [
             animal: string@animals
             fruit?: string@fruits
             ...rest: string@animals
             --foo (-f): string@animals
             -b: string@animals
+            --options: string@options
         ]
     "#;
     assert!(support::merge_input(record.as_bytes(), &mut engine, &mut stack).is_ok());
@@ -175,18 +177,6 @@ fn fuzzy_alpha_sort_completer() -> NuCompleter {
 
     // Instantiate a new completer
     NuCompleter::new(Arc::new(engine), Arc::new(stack))
-}
-
-#[test]
-fn variables_dollar_sign_with_variablecompletion() {
-    let (_, _, engine, stack) = new_engine();
-
-    let mut completer = NuCompleter::new(Arc::new(engine), Arc::new(stack));
-
-    let target_dir = "$ ";
-    let suggestions = completer.complete(target_dir, target_dir.len());
-
-    assert_eq!(9, suggestions.len());
 }
 
 #[rstest]
@@ -282,91 +272,84 @@ fn customcompletions_no_sort() {
     match_suggestions(&expected, &suggestions);
 }
 
-/// Fallback to file completions if custom completer returns null
 #[test]
-fn customcompletions_fallback() {
+fn custom_completions_override_span() {
     let (_, _, mut engine, mut stack) = new_engine();
     let command = r#"
-        def comp [] { null }
+        def comp [] { [{ value: blech, span: { start: 1, end: 10 } }] }
         def my-command [arg: string@comp] {}"#;
     assert!(support::merge_input(command.as_bytes(), &mut engine, &mut stack).is_ok());
 
     let mut completer = NuCompleter::new(Arc::new(engine), Arc::new(stack));
-    let completion_str = "my-command test";
+    let completion_str = "my-command b";
     let suggestions = completer.complete(completion_str, completion_str.len());
-    let expected = [folder("test_a"), file("test_a_symlink"), folder("test_b")];
-    match_suggestions_by_string(&expected, &suggestions);
+    let expected = vec![Suggestion {
+        value: "blech".to_string(),
+        span: Span::new(1, 10),
+        ..Default::default()
+    }];
+    assert_eq!(expected, suggestions);
 }
 
+#[rstest]
+/// Fallback to file completions if custom completer returns null
+#[case::fallback(r#"
+    def comp [] { null }
+    def my-command [arg: string@comp] {}"#,
+    "my-command test", None,
+    vec![folder("test_a"), file("test_a_symlink"), folder("test_b")]
+)]
 /// Custom function arguments mixed with subcommands
-#[test]
-fn custom_arguments_and_subcommands() {
-    let (_, _, mut engine, mut stack) = new_engine();
-    let command = r#"
-        def foo [i: directory] {}
-        def "foo test bar" [] {}"#;
-    assert!(support::merge_input(command.as_bytes(), &mut engine, &mut stack).is_ok());
-
-    let mut completer = NuCompleter::new(Arc::new(engine), Arc::new(stack));
-    let completion_str = "foo test";
-    let suggestions = completer.complete(completion_str, completion_str.len());
-    // including both subcommand and directory completions
-    let expected = [
-        folder("test_a"),
-        file("test_a_symlink"),
-        folder("test_b"),
-        "foo test bar".into(),
-    ];
-    match_suggestions_by_string(&expected, &suggestions);
-}
-
-/// Custom function flags mixed with subcommands
-#[test]
-fn custom_flags_and_subcommands() {
-    let (_, _, mut engine, mut stack) = new_engine();
-    let command = r#"
-        def foo [--test: directory] {}
-        def "foo --test bar" [] {}"#;
-    assert!(support::merge_input(command.as_bytes(), &mut engine, &mut stack).is_ok());
-
-    let mut completer = NuCompleter::new(Arc::new(engine), Arc::new(stack));
-    let completion_str = "foo --test";
-    let suggestions = completer.complete(completion_str, completion_str.len());
-    // including both flag and directory completions
-    let expected: Vec<_> = vec!["--test", "foo --test bar"];
-    match_suggestions(&expected, &suggestions);
-}
-
+#[case::arguments_and_subcommands(r#"
+    def foo [i: directory] {}
+    def "foo test bar" [] {}"#,
+    "foo test", None,
+    vec![folder("test_a"), file("test_a_symlink"), folder("test_b"), "foo test bar".into()]
+)]
 /// If argument type is something like int/string, complete only subcommands
-#[test]
-fn custom_arguments_vs_subcommands() {
+#[case::arguments_vs_subcommands(r#"
+    def foo [i: string] {}
+    def "foo test bar" [] {}"#,
+    "foo test", None,
+    vec!["foo test bar".into()]
+)]
+/// Custom function flags mixed with subcommands
+#[case::flags_and_subcommands(r#"
+    def foo [--test: directory] {}
+    def "foo --test bar" [] {}"#,
+    "foo --test", None,
+    vec!["--test".into(), "foo --test bar".into()]
+)]
+#[case::defined_inline(
+    "",
+    "export def say [
+    animal: string@[cat dog]
+    ] { }; say ", None,
+    vec!["cat".into(), "dog".into()]
+)]
+#[case::short_flags(
+    "def foo [-A, -B: string@[cat dog] ] {}",
+    "foo -B ", None,
+    vec!["cat".into(), "dog".into()]
+)]
+#[case::flag_name_vs_value(
+    "def foo [-A, -B: string@[cat dog] ] {}",
+    "foo -B cat", Some("foo -B".len()),
+    vec!["-B".into()]
+)]
+fn custom_completions(
+    #[case] command: &str,
+    #[case] input: &str,
+    #[case] pos: Option<usize>,
+    #[case] expected: Vec<String>,
+) {
     let (_, _, mut engine, mut stack) = new_engine();
-    let command = r#"
-        def foo [i: string] {}
-        def "foo test bar" [] {}"#;
     assert!(support::merge_input(command.as_bytes(), &mut engine, &mut stack).is_ok());
 
     let mut completer = NuCompleter::new(Arc::new(engine), Arc::new(stack));
-    let completion_str = "foo test";
-    let suggestions = completer.complete(completion_str, completion_str.len());
-    // including only subcommand completions
-    let expected: Vec<_> = vec!["foo test bar"];
-    match_suggestions(&expected, &suggestions);
-}
-
-#[test]
-fn custom_completions_defined_inline() {
-    let (_, _, engine, stack) = new_engine();
-
-    let mut completer = NuCompleter::new(Arc::new(engine), Arc::new(stack));
-    let completion_str = "def animals [] { [cat dog] }
-export def say [
-  animal: string@animals
-] { }; say ";
-    let suggestions = completer.complete(completion_str, completion_str.len());
-    // including only subcommand completions
-    let expected: Vec<_> = vec!["cat", "dog"];
-    match_suggestions(&expected, &suggestions);
+    // `pos` defaults to `input.len()` if set to None
+    let suggestions = completer.complete(input, pos.unwrap_or(input.len()));
+    match_suggestions_by_string(&expected, &suggestions);
 }
 
 #[test]
@@ -690,15 +673,15 @@ fn dotnu_stdlib_completions() {
 
     let completion_str = "use `std-rfc/cli";
     let suggestions = completer.complete(completion_str, completion_str.len());
-    match_suggestions(&vec!["`std-rfc/clip"], &suggestions);
+    match_suggestions(&vec!["std-rfc/clip"], &suggestions);
 
     let completion_str = "use \"std";
     let suggestions = completer.complete(completion_str, completion_str.len());
-    match_suggestions(&vec!["\"std", "\"std-rfc"], &suggestions);
+    match_suggestions(&vec!["std", "std-rfc"], &suggestions);
 
     let completion_str = "overlay use 'std-rfc/cli";
     let suggestions = completer.complete(completion_str, completion_str.len());
-    match_suggestions(&vec!["'std-rfc/clip"], &suggestions);
+    match_suggestions(&vec!["std-rfc/clip"], &suggestions);
 }
 
 #[test]
@@ -770,17 +753,13 @@ fn dotnu_completions_const_nu_lib_dirs() {
 }
 
 #[test]
-#[ignore]
 fn external_completer_trailing_space() {
     // https://github.com/nushell/nushell/issues/6378
     let block = "{|spans| $spans}";
     let input = "gh alias ";
 
     let suggestions = run_external_completion(block, input);
-    assert_eq!(3, suggestions.len());
-    assert_eq!("gh", suggestions.first().unwrap().value);
-    assert_eq!("alias", suggestions.get(1).unwrap().value);
-    assert_eq!("", suggestions.get(2).unwrap().value);
+    match_suggestions(&vec!["gh", "alias", ""], &suggestions);
 }
 
 #[test]
@@ -835,6 +814,20 @@ fn external_completer_fallback() {
         fs::fixtures().join("external_completions"),
     );
     match_suggestions(&expected, &suggestions);
+}
+
+#[test]
+fn external_completer_override_span() {
+    let block = "{|spans| [{ value: blech, span: { start: 1, end: 10 } }]}";
+    let input = "foo b";
+
+    let suggestions = run_external_completion(block, input);
+    let expected = vec![Suggestion {
+        value: "blech".to_string(),
+        span: Span::new(1, 10),
+        ..Default::default()
+    }];
+    assert_eq!(expected, suggestions);
 }
 
 /// Fallback to external completions for flags of `sudo`
@@ -2505,100 +2498,69 @@ fn filecompletions_triggers_after_cursor() {
     match_suggestions(&expected_paths, &suggestions);
 }
 
-#[rstest]
-fn extern_custom_completion_positional(mut extern_completer: NuCompleter) {
-    let suggestions = extern_completer.complete("spam ", 5);
-    let expected: Vec<_> = vec!["cat", "dog", "eel"];
+#[test]
+fn filecompletions_for_redirection_target() {
+    let (_, _, engine, stack) = new_engine_helper(fs::fixtures().join("external_completions"));
+    let mut completer = NuCompleter::new(Arc::new(engine), Arc::new(stack));
+
+    let expected = vec!["`dir with space/bar baz`", "`dir with space/foo`"];
+    let command = "(echo 'foo' o+e> `dir with space/`";
+    let suggestions = completer.complete(command, command.len());
+    match_suggestions(&expected, &suggestions);
+
+    let command = "echo 'foo' o> foo e> `dir with space/`";
+    let suggestions = completer.complete(command, command.len());
     match_suggestions(&expected, &suggestions);
 }
 
 #[rstest]
-fn extern_custom_completion_optional(mut extern_completer: NuCompleter) {
-    let suggestions = extern_completer.complete("spam foo -f bar ", 16);
-    let expected: Vec<_> = vec!["apple", "banana"];
-    match_suggestions(&expected, &suggestions);
-}
-
-#[rstest]
-fn extern_custom_completion_rest(mut extern_completer: NuCompleter) {
-    let suggestions = extern_completer.complete("spam foo -f bar baz ", 20);
-    let expected: Vec<_> = vec!["cat", "dog", "eel"];
-    match_suggestions(&expected, &suggestions);
-    let suggestions = extern_completer.complete("spam foo -f bar baz qux ", 24);
-    match_suggestions(&expected, &suggestions);
-}
-
-#[rstest]
-fn extern_custom_completion_long_flag_1(mut extern_completer: NuCompleter) {
-    let suggestions = extern_completer.complete("spam --foo=", 11);
-    let expected: Vec<_> = vec!["cat", "dog", "eel"];
-    match_suggestions(&expected, &suggestions);
-}
-
-#[rstest]
-fn extern_custom_completion_long_flag_2(mut extern_completer: NuCompleter) {
-    let suggestions = extern_completer.complete("spam --foo ", 11);
-    let expected: Vec<_> = vec!["cat", "dog", "eel"];
-    match_suggestions(&expected, &suggestions);
-}
-
-#[rstest]
-fn extern_custom_completion_long_flag_short(mut extern_completer: NuCompleter) {
-    let suggestions = extern_completer.complete("spam -f ", 8);
-    let expected: Vec<_> = vec!["cat", "dog", "eel"];
-    match_suggestions(&expected, &suggestions);
-}
-
-#[rstest]
-fn extern_custom_completion_short_flag(mut extern_completer: NuCompleter) {
-    let suggestions = extern_completer.complete("spam -b ", 8);
-    let expected: Vec<_> = vec!["cat", "dog", "eel"];
-    match_suggestions(&expected, &suggestions);
-}
-
+#[case::positional("spam ", "animal")]
+#[case::optional("spam foo -f bar ", "fruit")]
+#[case::rest1("spam foo -f bar baz ", "animal")]
+#[case::rest2("spam foo -f bar baz qux ", "animal")]
+#[case::long_flag1("spam --foo=", "animal")]
+#[case::long_flag1("spam --foo=", "animal")]
+#[case::long_flag_short("spam -f ", "animal")]
+#[case::short_flag("spam -b ", "animal")]
 /// When we're completing the flag name itself, not its value,
 /// custom completions should not be used
-#[rstest]
-fn custom_completion_flag_name_not_value(mut extern_completer: NuCompleter) {
-    let suggestions = extern_completer.complete("spam --f", 8);
-    match_suggestions(&vec!["--foo"], &suggestions);
-    // Also test with partial short flag
-    let suggestions = extern_completer.complete("spam -f", 7);
-    match_suggestions(&vec!["-f"], &suggestions);
-}
-
-#[rstest]
-fn extern_complete_flags(mut extern_completer: NuCompleter) {
-    let suggestions = extern_completer.complete("spam -", 6);
-    let expected: Vec<_> = vec!["--foo", "-b", "-f"];
+#[case::long_flag_name_not_value("spam --f", "--foo")]
+#[case::short_flag_name_not_value("spam -f", "-f")]
+#[case::flags("spam -", "flags")]
+// https://github.com/nushell/nushell/issues/16860
+#[case::options_with_quotes1("spam --options ", "options")]
+#[case::options_with_quotes2("spam --options \"", "options")]
+#[case::options_with_quotes3("spam --options `", "options")]
+#[case::options_with_quotes4("spam --options 'third", "\"third item")]
+fn extern_custom_completion(
+    mut extern_completer: NuCompleter,
+    #[case] input: &str,
+    #[case] answer: &str,
+) {
+    let suggestions = extern_completer.complete(input, input.len());
+    let expected = match answer {
+        "animal" => vec!["cat", "dog", "eel"],
+        "fruit" => vec!["apple", "banana"],
+        "options" => vec!["\"first item\"", "\"second item\"", "\"third item"],
+        "flags" => vec!["--foo", "--options", "-b", "-f"],
+        _ => vec![answer],
+    };
     match_suggestions(&expected, &suggestions);
 }
 
 #[rstest]
-fn custom_completer_triggers_cursor_before_word(mut custom_completer: NuCompleter) {
-    let suggestions = custom_completer.complete("cmd foo  bar", 8);
-    let expected: Vec<_> = vec!["cmd", "foo", ""];
-    match_suggestions(&expected, &suggestions);
-}
-
-#[rstest]
-fn custom_completer_triggers_cursor_on_word_left_boundary(mut custom_completer: NuCompleter) {
-    let suggestions = custom_completer.complete("cmd foo bar", 8);
-    let expected: Vec<_> = vec!["cmd", "foo", ""];
-    match_suggestions(&expected, &suggestions);
-}
-
-#[rstest]
-fn custom_completer_triggers_cursor_next_to_word(mut custom_completer: NuCompleter) {
-    let suggestions = custom_completer.complete("cmd foo bar", 11);
-    let expected: Vec<_> = vec!["cmd", "foo", "bar"];
-    match_suggestions(&expected, &suggestions);
-}
-
-#[rstest]
-fn custom_completer_triggers_cursor_after_word(mut custom_completer: NuCompleter) {
-    let suggestions = custom_completer.complete("cmd foo bar ", 12);
-    let expected: Vec<_> = vec!["cmd", "foo", "bar", ""];
+#[case::cursor_before_word(8, vec![""])]
+#[case::cursor_on_word_left_boundary(9, vec![""])]
+#[case::cursor_next_to_word(12, vec!["bar"])]
+#[case::cursor_after_word(13, vec!["bar", ""])]
+fn custom_completer_triggers_cursor_before_word(
+    mut custom_completer: NuCompleter,
+    #[case] position: usize,
+    #[case] extra: Vec<&str>,
+) {
+    let suggestions = custom_completer.complete("cmd foo  bar ", position);
+    let mut expected: Vec<_> = vec!["cmd", "foo"];
+    expected.extend(extra);
     match_suggestions(&expected, &suggestions);
 }
 
@@ -2681,7 +2643,6 @@ fn exact_match_case_insensitive() {
     });
 }
 
-#[ignore = "was reverted, still needs fixing"]
 #[rstest]
 fn alias_offset_bug_7648() {
     let (_, _, mut engine, mut stack) = new_engine();
@@ -2691,16 +2652,15 @@ fn alias_offset_bug_7648() {
     assert!(support::merge_input(alias.as_bytes(), &mut engine, &mut stack).is_ok());
 
     let mut completer = NuCompleter::new(Arc::new(engine), Arc::new(stack));
+    let suggestions = completer.complete("e", 1);
+    assert!(!suggestions.is_empty());
 
-    // Issue #7648
-    // Nushell crashes when an alias name is shorter than the alias command
-    // and the alias command is a external command
-    // This happens because of offset is not correct.
-    // This crashes before PR #7779
-    let _suggestions = completer.complete("e", 1);
+    // Make sure completion in complicated external head expression still works
+    let input = "^(ls | e";
+    let suggestions = completer.complete(input, input.len());
+    assert!(!suggestions.is_empty());
 }
 
-#[ignore = "was reverted, still needs fixing"]
 #[rstest]
 fn alias_offset_bug_7754() {
     let (_, _, mut engine, mut stack) = new_engine();
@@ -2710,12 +2670,8 @@ fn alias_offset_bug_7754() {
     assert!(support::merge_input(alias.as_bytes(), &mut engine, &mut stack).is_ok());
 
     let mut completer = NuCompleter::new(Arc::new(engine), Arc::new(stack));
-
-    // Issue #7754
-    // Nushell crashes when an alias name is shorter than the alias command
-    // and the alias command contains pipes.
-    // This crashes before PR #7756
-    let _suggestions = completer.complete("ll -a | c", 9);
+    let suggestions = completer.complete("ll -a | c", 9);
+    assert!(!suggestions.is_empty());
 }
 
 #[rstest]
@@ -2759,9 +2715,9 @@ fn operator_completions(mut custom_completer: NuCompleter) {
 
     let suggestions = custom_completer.complete("'str' ", 6);
     // == != > < >= <= in not-in
-    // has not-has starts-with ends-with
+    // has not-has starts-with not-starts-with ends-with not-ends-with
     // =~ !~ like not-like ++
-    assert_eq!(17, suggestions.len());
+    assert_eq!(19, suggestions.len());
     let suggestions = custom_completer.complete("'str' +", 7);
     let expected: Vec<_> = vec!["++"];
     match_suggestions(&expected, &suggestions);
@@ -2824,9 +2780,9 @@ fn cell_path_operator_completions(mut custom_completer: NuCompleter) {
 
     let suggestions = custom_completer.complete("const f = {'foo': [1, '1']}; $f.foo.1 ", 38);
     // == != > < >= <= in not-in
-    // has not-has starts-with ends-with
+    // has not-has starts-with not-starts-with ends-with not-ends-with
     // =~ !~ like not-like ++
-    assert_eq!(17, suggestions.len());
+    assert_eq!(19, suggestions.len());
     let suggestions = custom_completer.complete("const f = {'foo': [1, '1']}; $f.foo.1 ++", 40);
     let expected: Vec<_> = vec!["++"];
     match_suggestions(&expected, &suggestions);
@@ -2836,10 +2792,10 @@ fn cell_path_operator_completions(mut custom_completer: NuCompleter) {
 fn assignment_operator_completions(mut custom_completer: NuCompleter) {
     let suggestions = custom_completer.complete("mut foo = ''; $foo ", 19);
     // == != > < >= <= in not-in
-    // has not-has starts-with ends-with
+    // has not-has starts-with not-starts-with ends-with not-ends-with
     // =~ !~ like not-like ++
     // = ++=
-    assert_eq!(19, suggestions.len());
+    assert_eq!(21, suggestions.len());
     let suggestions = custom_completer.complete("mut foo = ''; $foo ++", 21);
     let expected: Vec<_> = vec!["++", "++="];
     match_suggestions(&expected, &suggestions);
@@ -2886,7 +2842,7 @@ fn assignment_operator_completions(mut custom_completer: NuCompleter) {
 
     // all operators for type any
     let suggestions = custom_completer.complete("ls | where name ", 16);
-    assert_eq!(30, suggestions.len());
+    assert_eq!(32, suggestions.len());
     let expected: Vec<_> = vec!["starts-with"];
     let suggestions = custom_completer.complete("ls | where name starts", 22);
     match_suggestions(&expected, &suggestions);
@@ -2902,10 +2858,10 @@ fn cellpath_assignment_operator_completions() {
     let completion_str = "$foo.foo.1 ";
     let suggestions = completer.complete(completion_str, completion_str.len());
     // == != > < >= <= in not-in
-    // has not-has starts-with ends-with
+    // has not-has starts-with not-starts-with ends-with not-ends-with
     // =~ !~ like not-like ++
     // = ++=
-    assert_eq!(19, suggestions.len());
+    assert_eq!(21, suggestions.len());
     let completion_str = "$foo.foo.1 ++";
     let suggestions = completer.complete(completion_str, completion_str.len());
     let expected: Vec<_> = vec!["++", "++="];
@@ -2973,9 +2929,9 @@ fn nested_alias_expansion_for_external_completions() {
 fn type_inferenced_operator_completions(mut custom_completer: NuCompleter) {
     let suggestions = custom_completer.complete("let f = {'foo': [1, '1']}; $f.foo.1 ", 36);
     // == != > < >= <= in not-in
-    // has not-has starts-with ends-with
+    // has not-has starts-with not-starts-with ends-with not-ends-with
     // =~ !~ like not-like ++
-    assert_eq!(17, suggestions.len());
+    assert_eq!(19, suggestions.len());
     let suggestions = custom_completer.complete("const f = {'foo': [1, '1']}; $f.foo.1 ++", 38);
     let expected: Vec<_> = vec!["++"];
     match_suggestions(&expected, &suggestions);

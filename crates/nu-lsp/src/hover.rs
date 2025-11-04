@@ -228,7 +228,6 @@ mod hover_tests {
     use assert_json_diff::assert_json_eq;
     use nu_test_support::fs::fixtures;
     use rstest::rstest;
-    use std::time::Duration;
 
     #[rstest]
     #[case::variable("var.nu", (2, 0), "```\ntable\n``` \n---\nimmutable")]
@@ -244,7 +243,7 @@ mod hover_tests {
         "command.nu", (5, 8),
         "Concatenate multiple strings into a single string, with an optional separator between each.\n---\n### Usage \n```nu\n  str join {flags} (separator)\n```\n\n### Flags\n\n  `-h`, `--help` - Display the help message for this command\n\n\n### Parameters\n\n  `separator`: `<string>` - Optional separator to use when creating string. (optional)\n\n\n### Input/output types\n\n```nu\n list<any> | string\n string | string\n\n```\n### Example(s)\n  Create a string from input\n```nu\n  ['nu', 'shell'] | str join\n```\n  Create a string from input with a separator\n```nu\n  ['nu', 'shell'] | str join '-'\n```\n"
     )]
-    #[case::cell_path1("use.nu", (2, 3), "```\nlist<any>\n```")]
+    #[case::cell_path1("use.nu", (2, 3), "```\nlist<oneof<int, record<bar: int>>>\n```")]
     #[case::cell_path2("use.nu", (2, 7), "```\nrecord<bar: int>\n```")]
     #[case::cell_path3("use.nu", (2, 11), "```\nint\n```\n---\n2")]
     fn hover_single_request(
@@ -261,9 +260,7 @@ mod hover_tests {
 
         open_unchecked(&client_connection, script.clone());
         let (line, character) = cursor;
-        let resp = send_hover_request(&client_connection, script, line, character)
-            .recv_timeout(Duration::from_secs(3))
-            .unwrap();
+        let resp = send_hover_request(&client_connection, script, line, character);
 
         assert_json_eq!(
             result_from_message(resp)["contents"]["value"],
@@ -271,6 +268,7 @@ mod hover_tests {
         );
     }
 
+    #[ignore = "long-tail disk IO fails the CI workflow"]
     #[test]
     fn hover_on_external_command() {
         let (client_connection, _recv) = initialize_language_server(None, None);
@@ -280,9 +278,7 @@ mod hover_tests {
         let script = path_to_uri(&script);
 
         open_unchecked(&client_connection, script.clone());
-        let resp = send_hover_request(&client_connection, script, 6, 2)
-            .recv_timeout(Duration::from_secs(10))
-            .unwrap();
+        let resp = send_hover_request(&client_connection, script, 6, 2);
 
         let hover_text = result_from_message(resp)["contents"]["value"].to_string();
 
@@ -293,12 +289,12 @@ mod hover_tests {
     }
 
     #[rstest]
-    #[case::use_record("hover/use.nu", (0, 19), "\"```\\nrecord<foo: list<any>>\\n``` \\n---\\nimmutable\"", true)]
-    #[case::use_function("hover/use.nu", (0, 22), "\"\\n---\\n### Usage \\n```nu\\n  foo {flags}\\n```\\n\\n### Flags", true)]
-    #[case::cell_path("workspace/baz.nu", (8, 42), "\"```\\nstring\\n```\\n---\\nconst value\"", false)]
-    #[case::module_first("workspace/foo.nu", (15, 15), "\"# cmt\"", false)]
-    #[case::module_second("workspace/foo.nu", (17, 27), "\"# sub cmt\"", false)]
-    #[case::module_third("workspace/foo.nu", (19, 33), "\"# sub sub cmt\"", false)]
+    #[case::use_record("hover/use.nu", (0, 19), "```\nrecord<foo: list<oneof<int, record<bar: int>>>>\n``` \n---\nimmutable", true)]
+    #[case::use_function("hover/use.nu", (0, 22), "\n---\n### Usage \n```nu\n  foo {flags}\n```\n\n### Flags", true)]
+    #[case::cell_path("workspace/baz.nu", (8, 42), "```\nstring\n```\n---\nconst value", false)]
+    #[case::module_first("workspace/foo.nu", (15, 15), "# cmt", false)]
+    #[case::module_second("workspace/foo.nu", (17, 27), "# sub cmt", false)]
+    #[case::module_third("workspace/foo.nu", (19, 33), "# sub sub cmt", false)]
     fn hover_on_exportable(
         #[case] filename: &str,
         #[case] cursor: (u32, u32),
@@ -316,12 +312,13 @@ mod hover_tests {
 
         open_unchecked(&client_connection, script_uri.clone());
         let (line, character) = cursor;
-        let resp = send_hover_request(&client_connection, script_uri, line, character)
-            .recv_timeout(Duration::from_secs(3))
-            .unwrap();
+        let resp = send_hover_request(&client_connection, script_uri, line, character);
         let result = result_from_message(resp);
 
-        let actual = result["contents"]["value"].to_string().replace("\\r", "");
+        let actual = result["contents"]["value"]
+            .as_str()
+            .unwrap()
+            .replace("\r", "");
 
         assert!(actual.starts_with(expected_prefix));
     }
