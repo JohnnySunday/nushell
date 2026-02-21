@@ -44,12 +44,11 @@ impl Command for Explore {
                 "When quitting, output the value of the cell the cursor was on.",
                 Some('p'),
             )
-           .named(
-                // Add this named flag
+            .named(
                 "inline",
                 SyntaxShape::Int,
                 "Display the pager inline with a fixed height",
-                None,
+                Some('I'),
             )
             .category(Category::Viewers)
     }
@@ -69,7 +68,11 @@ impl Command for Explore {
         let show_index: bool = call.has_flag(engine_state, stack, "index")?;
         let tail: bool = call.has_flag(engine_state, stack, "tail")?;
         let peek_value: bool = call.has_flag(engine_state, stack, "peek")?;
-        let inline_height: Option<i64> = call.get_flag(engine_state, stack, "inline")?; 
+
+        //TODO: figure out how many lines to show when launched with `--inline` flag but without a
+        //value
+        let inline_height: Option<i64> = call.get_flag(engine_state, stack, "inline")?;
+
         let nu_config = stack.get_config(engine_state);
         let style_computer = StyleComputer::from_config(engine_state, stack);
 
@@ -142,7 +145,6 @@ impl Command for Explore {
                 result: None,
             },
             Example {
-                // Added example for --inline
                 description: "Display ls output inline with a height of 10 lines",
                 example: r#"ls | explore --inline 10"#,
                 result: None,
