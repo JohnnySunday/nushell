@@ -33,6 +33,10 @@ use nu_protocol::{
     engine::{EngineState, Stack},
 };
 use ratatui::{backend::CrosstermBackend, layout::Rect, widgets::Block};
+
+use ratatui::{TerminalOptions, Viewport};
+
+
 use std::{
     cmp::min,
     io::{self, Stdout},
@@ -95,13 +99,26 @@ impl<'a> Pager<'a> {
         commands: CommandRegistry,
     ) -> Result<Option<Value>> {
         // setup terminal
-        enable_raw_mode()?;
+        // enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, Clear(ClearType::All))?;
+        
+        // let backend = CrosstermBackend::new(stdout);
+        // let mut terminal = Terminal::new(backend)?;
+        // Conditionally set up the terminal for inline or alternate screen mode
+        let mut terminal = if let Some(height) = self.config.inline {
+            enable_raw_mode()?;
+            execute!(stdout)?;
+            ratatui::init_with_options(TerminalOptions {
+                viewport: Viewport::Inline(height),
+            })
+        } else {
+            enable_raw_mode()?;
+            execute!(stdout, EnterAlternateScreen, Clear(ClearType::All))?;
+            let backend = CrosstermBackend::new(stdout);
+            Terminal::new(backend)?
+        };
 
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend)?;
-
+        
         let mut info = ViewInfo {
             status: Some(Report::default()),
             ..Default::default()
@@ -123,7 +140,14 @@ impl<'a> Pager<'a> {
 
         // restore terminal
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+       // Cleanup logic
+        if self.config.inline.is_none() {
+            // Only leave alternate screen if not in inline mode
+            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        } else {
+            execute!(terminal.backend_mut())?;
+            terminal.clear()?;
+        }
 
         Ok(result)
     }
@@ -155,6 +179,7 @@ pub struct PagerConfig<'a> {
     pub tail: bool,
     // Just a cached dir we are working in used for color manipulations
     pub cwd: String,
+    pub inline: Option<u16>,
 }
 
 impl<'a> PagerConfig<'a> {
@@ -166,7 +191,9 @@ impl<'a> PagerConfig<'a> {
         peek_value: bool,
         tail: bool,
         cwd: &str,
+        inline: Option<i64>,
     ) -> Self {
+        let inline = inline.map(|x| x as u16);
         Self {
             nu_config,
             explore_config,
@@ -175,6 +202,7 @@ impl<'a> PagerConfig<'a> {
             peek_value,
             tail,
             cwd: cwd.to_string(),
+            inline,
         }
     }
 }

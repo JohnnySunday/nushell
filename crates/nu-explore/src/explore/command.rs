@@ -44,6 +44,13 @@ impl Command for Explore {
                 "When quitting, output the value of the cell the cursor was on.",
                 Some('p'),
             )
+           .named(
+                // Add this named flag
+                "inline",
+                SyntaxShape::Int,
+                "Display the pager inline with a fixed height",
+                None,
+            )
             .category(Category::Viewers)
     }
 
@@ -62,7 +69,7 @@ impl Command for Explore {
         let show_index: bool = call.has_flag(engine_state, stack, "index")?;
         let tail: bool = call.has_flag(engine_state, stack, "tail")?;
         let peek_value: bool = call.has_flag(engine_state, stack, "peek")?;
-
+        let inline_height: Option<i64> = call.get_flag(engine_state, stack, "inline")?; 
         let nu_config = stack.get_config(engine_state);
         let style_computer = StyleComputer::from_config(engine_state, stack);
 
@@ -84,6 +91,7 @@ impl Command for Explore {
             peek_value,
             tail,
             &cwd,
+            inline_height,
         );
 
         let result = run_pager(engine_state, &mut stack.clone(), input, config);
@@ -131,6 +139,12 @@ impl Command for Explore {
             Example {
                 description: "Explore a JSON file, then save the last visited sub-structure to a file",
                 example: r#"open file.json | explore --peek | to json | save part.json"#,
+                result: None,
+            },
+            Example {
+                // Added example for --inline
+                description: "Display ls output inline with a height of 10 lines",
+                example: r#"ls | explore --inline 10"#,
                 result: None,
             },
         ]
