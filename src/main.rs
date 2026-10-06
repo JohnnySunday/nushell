@@ -8,18 +8,18 @@ mod run;
 mod signals;
 #[cfg(unix)]
 mod terminal;
-mod test_bins;
 
+#[cfg(feature = "lsp")]
+use crate::run::run_lsp;
 use crate::{
-    command::parse_cli_args_from_env,
-    config_files::set_config_path,
+    command::{ParsedCli, parse_cli_args_from_env},
     logger::{configure, logger},
 };
 use log::{Level, trace};
 use miette::Result;
 use nu_cli::gather_parent_env_vars;
+use nu_config::{CliOverrides, ConfigError, ConfigWarning, SystemEnv, resolve_paths};
 use nu_engine::{convert_env_values, exit::cleanup_exit};
-use nu_lsp::LanguageServer;
 use nu_path::absolute_with;
 use nu_protocol::{
     ByteStream, Config, IntoValue, PipelineData, ShellError, Span, Spanned, Type, Value,
@@ -30,12 +30,7 @@ use nu_std::load_standard_library;
 use nu_utils::perf;
 use run::{run_commands, run_file, run_repl};
 use signals::ctrlc_protection;
-use std::{
-    borrow::Cow,
-    path::{PathBuf, absolute},
-    str::FromStr,
-    sync::Arc,
-};
+use std::{borrow::Cow, io::Write, path::PathBuf, str::FromStr, sync::Arc};
 
 /// Get the directory where the Nushell executable is located.
 fn current_exe_directory() -> PathBuf {
@@ -71,17 +66,77 @@ fn current_dir_from_environment() -> PathBuf {
     }
 }
 
+/// Mirror of miette's private `Panic` diagnostic so we keep the
+/// `RUST_BACKTRACE=1` help text and backtrace rendering when reporting a panic.
+#[derive(Debug)]
+struct Panic(String);
+
+impl std::fmt::Display for Panic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let backtrace = std::backtrace::Backtrace::capture();
+        if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+            write!(f, "{}\n{backtrace}", self.0)
+        } else {
+            write!(f, "{}", self.0)
+        }
+    }
+}
+
+impl std::error::Error for Panic {}
+
+impl miette::Diagnostic for Panic {
+    fn help<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        Some(Box::new(
+            "set the `RUST_BACKTRACE=1` environment variable to display a backtrace.",
+        ))
+    }
+}
+
 fn main() -> Result<()> {
-    let entire_start_time = std::time::Instant::now();
-    let mut start_time = std::time::Instant::now();
-    miette::set_panic_hook();
-    let miette_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |x| {
-        crossterm::terminal::disable_raw_mode().expect("unable to disable raw mode");
-        miette_hook(x);
+    // `$nu.startup-time` runs from here to the moment the shell is ready: the first prompt in the
+    // REPL, the start of evaluation for `-c` and script runs, or the start of serving for the
+    // `--lsp`, `--mcp` and `--dap` servers. It starts inside the shell, as bash's and zsh's timers
+    // do, rather than at process creation: the process keeps its creation time and CPU time across
+    // `exec`, so after `exec nu` those would also count the program that ran before.
+    let entire_start_time = nu_utils::time::Instant::now();
+    let mut start_time = entire_start_time;
+    // Replicated from `miette::set_panic_hook`, but writes via `writeln!(io::stderr(), …)`
+    // instead of `eprintln!`. `eprintln!`/`println!` panic on a broken stderr/stdout
+    // (parent terminal/pty closed), so when our parent (Codex, Ghostty, an MCP host, …)
+    // exits and closes our pipes, the original hook re-panics from inside the panic
+    // handler — and Rust escalates the double-panic to `abort()`, producing a crash
+    // report for what should be a clean shutdown.
+    std::panic::set_hook(Box::new(|info| {
+        // Completion sources are isolated and convert their panics into ShellErrors. The hook
+        // runs before catch_unwind, so do not print a second, misleading prompt-level panic.
+        if nu_cli::completion_source_is_active() {
+            return;
+        }
+        use miette::Context;
+
+        // Best-effort terminal restore; never panic from inside the hook.
+        let _ = crossterm::terminal::disable_raw_mode();
+
+        let mut message = "Something went wrong".to_string();
+        let payload = info.payload();
+        if let Some(msg) = payload.downcast_ref::<&str>() {
+            message = (*msg).to_string();
+        } else if let Some(msg) = payload.downcast_ref::<String>() {
+            message.clone_from(msg);
+        }
+
+        let mut report: miette::Result<()> = Err(Panic(message).into());
+        if let Some(loc) = info.location() {
+            report = report
+                .with_context(|| format!("at {}:{}:{}", loc.file(), loc.line(), loc.column()));
+        }
+        if let Err(err) = report.with_context(|| "Main thread panicked.".to_string()) {
+            let _ = writeln!(std::io::stderr(), "Error: {err:?}");
+        }
     }));
 
-    let engine_state = EngineState::new();
+    let mut engine_state = EngineState::new();
+    engine_state.set_startup_start(entire_start_time);
 
     // Parse commandline args very early and load experimental options to allow loading different
     // commands based on experimental options.
@@ -96,27 +151,22 @@ fn main() -> Result<()> {
     experimental_options::load(&engine_state, &parsed_nu_cli_args, !script_name.is_empty());
 
     let mut engine_state = command_context::add_command_context(engine_state);
+    // Logged once the logger exists, below.
+    let engine_setup_elapsed = start_time.elapsed();
 
-    // Provide `version` the features of this nu binary
+    // Provide `version` with data of this nu binary
+    let version = env!("CARGO_PKG_VERSION")
+        .parse()
+        .expect("cargo sets valid version");
+    nu_cmd_lang::VERSION.set(version).expect("VERSION is unset");
+
     let cargo_features = env!("NU_FEATURES").split(",").map(Cow::Borrowed).collect();
     nu_cmd_lang::VERSION_NU_FEATURES
         .set(cargo_features)
-        .expect("unable to set VERSION_NU_FEATURES");
+        .expect("VERSION_NU_FEATURES is unset");
 
     // Get the current working directory from the environment.
     let init_cwd = current_dir_from_environment();
-
-    // Custom additions
-    let delta = {
-        let mut working_set = nu_protocol::engine::StateWorkingSet::new(&engine_state);
-        working_set.add_decl(Box::new(nu_cli::NuHighlight));
-        working_set.add_decl(Box::new(nu_cli::Print));
-        working_set.render()
-    };
-
-    if let Err(err) = engine_state.merge_delta(delta) {
-        report_shell_error(None, &engine_state, &err);
-    }
 
     #[cfg(feature = "mcp")]
     let handle_ctrlc = !parsed_nu_cli_args.mcp;
@@ -129,68 +179,90 @@ fn main() -> Result<()> {
     #[cfg(all(feature = "rustls-tls", feature = "network"))]
     nu_command::tls::CRYPTO_PROVIDER.default();
 
-    // Begin: Default NU_LIB_DIRS, NU_PLUGIN_DIRS
-    // Set default NU_LIB_DIRS and NU_PLUGIN_DIRS here before the env.nu is processed. If
-    // the env.nu file exists, these values will be overwritten, if it does not exist, or
-    // there is an error reading it, these values will be used.
-    let nushell_config_path: PathBuf = nu_path::nu_config_dir().map(Into::into).unwrap_or_default();
-    if let Ok(xdg_config_home) = std::env::var("XDG_CONFIG_HOME")
-        && !xdg_config_home.is_empty()
-    {
-        if nushell_config_path
-            != absolute_with(&xdg_config_home, &init_cwd)
-                .unwrap_or(PathBuf::from(&xdg_config_home))
-                .join("nushell")
-        {
+    // ── Resolve all config paths ──────────────────────────────────────────
+    // Path ownership (read this before changing startup):
+    //   1. CliOverrides::from_path_strings — only place that absolute-izes CLI paths
+    //   2. resolve_paths — only place that reads XDG/env/platform dirs
+    //   3. engine_state.config_dirs — single source of truth for the rest of the process
+    // Do not call free path helpers (env / dirs) after this block.
+    let cli_overrides = CliOverrides::from_path_strings(
+        parsed_nu_cli_args
+            .config_home
+            .as_ref()
+            .map(|s| s.item.as_str()),
+        parsed_nu_cli_args
+            .config_file
+            .as_ref()
+            .map(|s| s.item.as_str()),
+        parsed_nu_cli_args
+            .env_file
+            .as_ref()
+            .map(|s| s.item.as_str()),
+        #[cfg(feature = "plugin")]
+        parsed_nu_cli_args
+            .plugin_file
+            .as_ref()
+            .map(|s| s.item.as_str()),
+        &init_cwd,
+    );
+
+    let (config_dirs, warnings) = match resolve_paths(&SystemEnv, &cli_overrides) {
+        Ok(result) => result,
+        Err(ConfigError::ConfigDirNotFound) => {
             report_shell_error(
                 None,
                 &engine_state,
-                &ShellError::InvalidXdgConfig {
-                    xdg: xdg_config_home,
-                    default: nushell_config_path.display().to_string(),
+                &ShellError::ConfigDirNotFound {
+                    span: Span::unknown(),
                 },
             );
-        } else if let Some(old_config) = dirs::config_dir()
-            .and_then(|p| absolute(p).ok())
-            .map(|p| p.join("nushell"))
-        {
-            let xdg_config_empty = nushell_config_path
-                .read_dir()
-                .map_or(true, |mut dir| dir.next().is_none());
-            let old_config_empty = old_config
-                .read_dir()
-                .map_or(true, |mut dir| dir.next().is_none());
-            if !old_config_empty && xdg_config_empty {
-                eprintln!(
-                    "WARNING: XDG_CONFIG_HOME has been set but {} is empty.\n",
-                    nushell_config_path.display(),
-                );
-                eprintln!(
-                    "Nushell will not move your configuration files from {}",
-                    old_config.display()
-                );
+            // Minimal fallback so the engine can still start
+            (nu_config::NushellConfigDirs::empty(), vec![])
+        }
+    };
+
+    // Emit non-fatal warnings via their Display impl (single message source).
+    for w in &warnings {
+        match w {
+            ConfigWarning::XdgConfigIgnored { xdg, resolved } => {
+                // Keep the structured shell error so existing tests/matchers work.
+                let err = ShellError::InvalidXdgConfig {
+                    xdg: xdg.clone(),
+                    default: resolved.display().to_string(),
+                };
+                report_shell_error(None, &engine_state, &err);
+            }
+            ConfigWarning::OldConfigDirHasFiles { .. } => {
+                eprintln!("{w}");
             }
         }
     }
 
-    let default_nushell_completions_path = if let Some(mut path) = nu_path::data_dir() {
-        path.push("nushell");
-        path.push("completions");
-        path.into()
-    } else {
-        std::path::PathBuf::new()
-    };
+    engine_state.config_dirs = config_dirs;
+    // Do NOT set `engine_state.plugin_path` here.
+    //
+    // `plugin_path` is only set when the plugin registry is actually loaded
+    // (`read_plugin_file` / `add_plugin_file`), which is skipped under
+    // `--no-config-file` (`-n`). Leaving it `None` in that case preserves the
+    // existing `plugin use` error ("Plugin registry file not set") and matches
+    // pre-`nu-config` behavior.
+    //
+    // `$nu.plugin-path` still reports the resolved default via
+    // `config_dirs.plugin_file` when `plugin_path` is unset (see `create_nu_constant`).
 
-    let mut default_nu_lib_dirs_path = nushell_config_path.clone();
+    // Begin: Default NU_LIB_DIRS, NU_PLUGIN_DIRS
+    let default_nushell_completions_path = engine_state.config_dirs.data_home.join("completions");
+    let mut default_nu_lib_dirs_path = engine_state.config_dirs.config_home.clone();
     default_nu_lib_dirs_path.push("scripts");
 
     // Parse include paths from -I flag
     let include_paths = &parsed_nu_cli_args.include_path;
 
-    let mut default_nu_plugin_dirs_path = nushell_config_path;
+    let mut default_nu_plugin_dirs_path = engine_state.config_dirs.config_home.clone();
     default_nu_plugin_dirs_path.push("plugins");
     engine_state.add_env_var("NU_PLUGIN_DIRS".to_string(), Value::test_list(vec![]));
     let mut working_set = nu_protocol::engine::StateWorkingSet::new(&engine_state);
+    // No source span — this is a built-in variable defined at startup
     let var_id = working_set.add_variable(
         b"$NU_PLUGIN_DIRS".into(),
         Span::unknown(),
@@ -212,21 +284,40 @@ fn main() -> Result<()> {
     // lifetime of the program. If it's created with how MEMORY_DB is defined
     // you'll be able to access this open connection from anywhere in the program
     // by using the identical connection string.
+    //
+    // Initialize the process-wide shared in-memory SQLite connection. The static
+    // connection is the lifetime anchor for `mode=memory&cache=shared` and is the
+    // only connection used by `stor` / memdb `query db` (serialized via a mutex).
     #[cfg(feature = "sqlite")]
-    let db = nu_command::open_connection_in_memory_custom()?;
-    #[cfg(feature = "sqlite")]
-    db.last_insert_rowid();
+    nu_command::init_shared_memory_db()?;
 
+    #[cfg(feature = "lsp")]
+    let is_lsp = parsed_nu_cli_args.lsp;
+    #[cfg(not(feature = "lsp"))]
+    let is_lsp = false;
+    engine_state.is_lsp = is_lsp;
+    // Here, not in the `--dap` and `--mcp` branches at the end: `generate_nu_constant()`
+    // below bakes `$nu.is-dap` and `$nu.is-mcp`, and those branches' startup files must see them.
+    #[cfg(feature = "dap")]
+    let is_dap = parsed_nu_cli_args.dap;
+    #[cfg(not(feature = "dap"))]
+    let is_dap = false;
+    engine_state.is_dap = is_dap;
+    #[cfg(feature = "mcp")]
+    let is_mcp = parsed_nu_cli_args.mcp;
+    #[cfg(not(feature = "mcp"))]
+    let is_mcp = false;
+    engine_state.is_mcp = is_mcp;
     // keep this condition in sync with the branches at the end
     engine_state.is_interactive = parsed_nu_cli_args.interactive_shell.is_some()
-        || (parsed_nu_cli_args.testbin.is_none()
-            && parsed_nu_cli_args.commands.is_none()
+        || (parsed_nu_cli_args.commands.is_none()
             && script_name.is_empty()
-            && !parsed_nu_cli_args.lsp);
+            && !is_lsp
+            && !is_dap
+            && !is_mcp);
 
     engine_state.is_login = parsed_nu_cli_args.login_shell.is_some();
     engine_state.history_enabled = parsed_nu_cli_args.no_history.is_none();
-    engine_state.is_lsp = parsed_nu_cli_args.lsp;
 
     let use_color = engine_state
         .get_config()
@@ -234,6 +325,7 @@ fn main() -> Result<()> {
         .get(&engine_state);
 
     // Set up logger
+    start_time = nu_utils::time::Instant::now();
     let level_opt = parsed_nu_cli_args
         .log_level
         .as_ref()
@@ -263,7 +355,7 @@ fn main() -> Result<()> {
     }
 
     if let Some(level) = level_opt {
-        let level = if Level::from_str(&level).is_ok() {
+        let level = if level == "perf" || Level::from_str(&level).is_ok() {
             level
         } else {
             eprintln!(
@@ -273,8 +365,8 @@ fn main() -> Result<()> {
         };
         let target = target_opt.unwrap_or_else(|| "stderr".to_string());
 
-        let make_filters = |filters: &Option<Vec<Spanned<String>>>| {
-            filters.as_ref().map(|filters| {
+        let make_filters = |filters: Option<&[Spanned<String>]>| {
+            filters.map(|filters| {
                 filters
                     .iter()
                     .map(|filter| filter.item.clone())
@@ -282,42 +374,35 @@ fn main() -> Result<()> {
             })
         };
         let filters = logger::Filters {
-            include: make_filters(&parsed_nu_cli_args.log_include),
-            exclude: make_filters(&parsed_nu_cli_args.log_exclude),
+            include: make_filters(parsed_nu_cli_args.log_include.as_deref()),
+            exclude: make_filters(parsed_nu_cli_args.log_exclude.as_deref()),
         };
 
         // logger now expects the closure to return a `Result` so that we can surface configuration errors such as missing `--log-file` when the target is `file`.
         logger(|builder| configure(&level, &target, file_opt.as_deref(), filters, builder))?;
         // info!("start logging {}:{}:{}", file!(), line!(), column!());
         perf!("start logging", start_time, use_color);
+        // Phases that ran before the logger existed.
+        perf!(
+            "create engine state, parse args, register commands",
+            elapsed: engine_setup_elapsed,
+            use_color
+        );
     }
 
-    start_time = std::time::Instant::now();
-    set_config_path(
-        &mut engine_state,
-        init_cwd.as_ref(),
-        "config.nu",
-        "config-path",
-        parsed_nu_cli_args.config_file.as_ref(),
-    );
-
-    set_config_path(
-        &mut engine_state,
-        init_cwd.as_ref(),
-        "env.nu",
-        "env-path",
-        parsed_nu_cli_args.env_file.as_ref(),
-    );
-    perf!("set_config_path", start_time, use_color);
+    // Config paths are now resolved by `resolve_paths()` above.
+    // The old `set_config_path()` calls are no longer needed because
+    // `NushellConfigDirs` is stored directly in `engine_state.config_dirs`.
 
     #[cfg(unix)]
     {
-        start_time = std::time::Instant::now();
+        start_time = nu_utils::time::Instant::now();
         terminal::acquire(engine_state.is_interactive);
         perf!("acquire_terminal", start_time, use_color);
     }
 
-    start_time = std::time::Instant::now();
+    start_time = nu_utils::time::Instant::now();
+    // No source span — default config is synthesized at startup
     engine_state.add_env_var(
         "config".into(),
         Config::default().into_value(Span::unknown()),
@@ -329,13 +414,13 @@ fn main() -> Result<()> {
         Value::test_record(record! {}),
     );
 
-    start_time = std::time::Instant::now();
+    start_time = nu_utils::time::Instant::now();
     // First, set up env vars as strings only
     gather_parent_env_vars(&mut engine_state, init_cwd.as_ref());
     perf!("gather env vars", start_time, use_color);
 
     let mut stack = Stack::new();
-    start_time = std::time::Instant::now();
+    start_time = nu_utils::time::Instant::now();
     let config = engine_state.get_config();
     let use_color = config.use_ansi_coloring.get(&engine_state);
     // Translate environment variables from Strings to Values
@@ -345,7 +430,7 @@ fn main() -> Result<()> {
     perf!("Convert path to list", start_time, use_color);
 
     // Set up NU_LIB_DIRS: constant = defaults + env + -I, env = env + -I
-    start_time = std::time::Instant::now();
+    start_time = nu_utils::time::Instant::now();
     {
         /// Parse a string into a list of paths, splitting on the given separators.
         fn parse_path_list(value: &str, separators: &[char]) -> Vec<String> {
@@ -388,15 +473,17 @@ fn main() -> Result<()> {
                 .to_string_lossy()
                 .to_string(),
         ];
-        let all_lib_dirs: Vec<String> = default_paths.into_iter().chain(user_lib_dirs).collect();
+        let all_lib_dirs: Vec<String> = user_lib_dirs.into_iter().chain(default_paths).collect();
 
         // Convert to Value list for setting env vars and constants
+        // No source span — these are startup-computed library directory paths
         let all_lib_dir_values: Vec<Value> = all_lib_dirs
             .iter()
             .map(|s| Value::string(s.clone(), Span::unknown()))
             .collect();
 
         // Set $env.NU_LIB_DIRS to the full list (defaults + user-set)
+        // No source span — startup env var setup
         engine_state.add_env_var(
             "NU_LIB_DIRS".to_string(),
             Value::list(all_lib_dir_values.clone(), Span::unknown()),
@@ -404,11 +491,12 @@ fn main() -> Result<()> {
 
         // Set $NU_LIB_DIRS as a constant with the same full list
         let mut working_set = nu_protocol::engine::StateWorkingSet::new(&engine_state);
+        // No source span — built-in constant defined at startup
         let var_id = working_set.add_variable(
             b"$NU_LIB_DIRS".into(),
             Span::unknown(),
             Type::List(Box::new(Type::String)),
-            true, // is_const
+            false, // is_mutable
         );
         working_set
             .set_variable_const_val(var_id, Value::list(all_lib_dir_values, Span::unknown()));
@@ -416,14 +504,22 @@ fn main() -> Result<()> {
     }
     perf!("$env.NU_LIB_DIRS/$NU_LIB_DIRS setup", start_time, use_color);
 
+    // No source span — startup constant
     engine_state.add_env_var(
         "NU_VERSION".to_string(),
         Value::string(env!("CARGO_PKG_VERSION"), Span::unknown()),
     );
 
     if parsed_nu_cli_args.no_std_lib.is_none() {
+        start_time = nu_utils::time::Instant::now();
         load_standard_library(&mut engine_state)?;
+        perf!("load standard library", start_time, use_color);
     }
+
+    start_time = nu_utils::time::Instant::now();
+    // Set up the $nu constant before the IDE commands and the config files, which both read it
+    engine_state.generate_nu_constant();
+    perf!("create_nu_constant", start_time, use_color);
 
     // IDE commands
     if let Some(ide_goto_def) = parsed_nu_cli_args.ide_goto_def {
@@ -442,7 +538,7 @@ fn main() -> Result<()> {
 
         return Ok(());
     } else if let Some(max_errors) = parsed_nu_cli_args.ide_check {
-        ide::check(&mut engine_state, &script_name, &max_errors);
+        ide::check(&mut engine_state, &script_name, &max_errors)?;
 
         return Ok(());
     } else if parsed_nu_cli_args.ide_ast.is_some() {
@@ -451,32 +547,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    start_time = std::time::Instant::now();
-    if let Some(testbin) = &parsed_nu_cli_args.testbin {
-        let dispatcher = test_bins::new_testbin_dispatcher();
-        let test_bin = testbin.item.as_str();
-        match dispatcher.get(test_bin) {
-            Some(test_bin) => test_bin.run(),
-            None => {
-                if ["-h", "--help"].contains(&test_bin) {
-                    test_bins::show_help(&dispatcher);
-                } else {
-                    eprintln!("ERROR: Unknown testbin '{test_bin}'");
-                    std::process::exit(1);
-                }
-            }
-        }
-        std::process::exit(0)
-    } else {
-        // If we're not running a testbin, set the current working directory to
-        // the location of the Nushell executable. This prevents the OS from
-        // locking the directory where the user launched Nushell.
-        std::env::set_current_dir(current_exe_directory())
-            .expect("set_current_dir() should succeed");
-    }
-    perf!("run test_bins", start_time, use_color);
-
-    start_time = std::time::Instant::now();
+    start_time = nu_utils::time::Instant::now();
     let input = if let Some(redirect_stdin) = &parsed_nu_cli_args.redirect_stdin {
         trace!("redirecting stdin");
         PipelineData::byte_stream(ByteStream::stdin(redirect_stdin.span)?, None)
@@ -486,18 +557,13 @@ fn main() -> Result<()> {
     };
     perf!("redirect stdin", start_time, use_color);
 
-    start_time = std::time::Instant::now();
-    // Set up the $nu constant before evaluating config files (need to have $nu available in them)
-    engine_state.generate_nu_constant();
-    perf!("create_nu_constant", start_time, use_color);
-
     #[cfg(feature = "plugin")]
     if let Some(plugins) = &parsed_nu_cli_args.plugins {
         use nu_plugin_engine::{GetPlugin, PluginDeclaration};
         use nu_protocol::{ErrSpan, PluginIdentity, RegisteredPlugin, engine::StateWorkingSet};
 
         // Load any plugins specified with --plugins
-        start_time = std::time::Instant::now();
+        start_time = nu_utils::time::Instant::now();
 
         let mut working_set = StateWorkingSet::new(&engine_state);
         for plugin_filename in plugins {
@@ -536,64 +602,94 @@ fn main() -> Result<()> {
         perf!("load plugins specified in --plugins", start_time, use_color)
     }
 
-    start_time = std::time::Instant::now();
-
     #[cfg(feature = "mcp")]
     if parsed_nu_cli_args.mcp {
-        perf!("mcp starting", start_time, use_color);
+        start_time = nu_utils::time::Instant::now();
+        let mcp_transport_kind = parsed_nu_cli_args
+            .mcp_transport
+            .as_ref()
+            .map(|value| value.item.as_str());
+        let is_stdio_transport = !matches!(mcp_transport_kind, Some("http"));
+
         if parsed_nu_cli_args.no_config_file.is_none() {
-            let mut stack = nu_protocol::engine::Stack::new();
+            let mut stack = if is_stdio_transport {
+                // Keep MCP stdio transport clean by capturing startup stdout in stack output.
+                // This is cross-platform and avoid spilling stdout into mcp messages.
+                // The `print` command also checks for MCP/LCP before printing to stdout.
+                nu_protocol::engine::Stack::new().collect_value()
+            } else {
+                nu_protocol::engine::Stack::new()
+            };
             config_files::setup_config(
                 &mut engine_state,
                 &mut stack,
-                #[cfg(feature = "plugin")]
-                parsed_nu_cli_args.plugin_file,
-                parsed_nu_cli_args.config_file,
-                parsed_nu_cli_args.env_file,
                 parsed_nu_cli_args.login_shell.is_some(),
             );
         }
-        let transport = match parsed_nu_cli_args
-            .mcp_transport
-            .as_ref()
-            .map(|value| value.item.as_str())
-        {
-            Some("http") => {
-                let port = parsed_nu_cli_args.mcp_port.unwrap_or(8080);
-                nu_mcp::McpTransport::Http { port }
-            }
+        let transport = match mcp_transport_kind {
+            Some("http") => nu_mcp::McpTransport::http(
+                parsed_nu_cli_args.mcp_host.clone(),
+                parsed_nu_cli_args.mcp_port,
+            ),
             _ => nu_mcp::McpTransport::Stdio,
         };
+        engine_state.finish_startup();
+        perf!("mcp started", start_time, use_color);
         nu_mcp::initialize_mcp_server(engine_state, transport)?;
         return Ok(());
     }
 
-    if parsed_nu_cli_args.lsp {
-        perf!("lsp starting", start_time, use_color);
+    #[cfg(feature = "lsp")]
+    if is_lsp {
+        start_time = nu_utils::time::Instant::now();
+        return run_lsp(engine_state, parsed_nu_cli_args, use_color, start_time);
+    }
 
+    // `nu --dap`: hand the fully built engine to the Debug Adapter Protocol
+    // server. It owns process stdio from here (the DAP wire is stdout), and
+    // clones this engine for each debug run, so nothing else in `main`
+    // applies — return as soon as the DAP client disconnects.
+    #[cfg(feature = "dap")]
+    if is_dap {
+        start_time = nu_utils::time::Instant::now();
+
+        // Debugged scripts should see the same shell the user has: aliases and
+        // custom commands from config.nu, `$env` from env.nu, and `$env.config`
+        // — which also drives how the adapter renders values in the variables
+        // pane.
         if parsed_nu_cli_args.no_config_file.is_none() {
-            let mut stack = nu_protocol::engine::Stack::new();
+            let mut config_stack = Stack::new();
             config_files::setup_config(
                 &mut engine_state,
-                &mut stack,
-                #[cfg(feature = "plugin")]
-                parsed_nu_cli_args.plugin_file,
-                parsed_nu_cli_args.config_file,
-                parsed_nu_cli_args.env_file,
-                false,
+                &mut config_stack,
+                parsed_nu_cli_args.login_shell.is_some(),
             );
+            // Each debug run starts from a fresh `Stack`, so whatever the
+            // startup files left on this one has to be folded into the engine
+            // or the debuggee would never see it.
+            if let Err(err) = engine_state.merge_env(&mut config_stack) {
+                report_shell_error(Some(&config_stack), &engine_state, &err);
+            }
         }
+        perf!("dap setup_config", start_time, use_color);
 
-        LanguageServer::initialize_stdio_connection(engine_state)?.serve_requests()?
-    } else if let Some(commands) = parsed_nu_cli_args.commands.clone() {
+        engine_state.finish_startup();
+        nu_dap::run_stdio(engine_state);
+        return Ok(());
+    }
+
+    if let Some(commands) = parsed_nu_cli_args.commands.clone() {
         run_commands(
             &mut engine_state,
             stack,
-            parsed_nu_cli_args,
+            ParsedCli {
+                nu: parsed_nu_cli_args,
+                script_name,
+                args_to_script,
+            },
             use_color,
             &commands,
             input,
-            entire_start_time,
         );
 
         cleanup_exit(0, &engine_state, 0);
@@ -601,10 +697,12 @@ fn main() -> Result<()> {
         run_file(
             &mut engine_state,
             stack,
-            parsed_nu_cli_args,
+            ParsedCli {
+                nu: parsed_nu_cli_args,
+                script_name,
+                args_to_script,
+            },
             use_color,
-            script_name,
-            args_to_script,
             input,
         );
 
@@ -637,14 +735,10 @@ fn main() -> Result<()> {
             .map(|x| x.as_str().unwrap_or("0").parse::<i64>().unwrap_or(0))
             .unwrap_or(0);
         shlvl += 1;
+        // No source span — startup env var
         engine_state.add_env_var("SHLVL".to_string(), Value::int(shlvl, Span::unknown()));
 
-        run_repl(
-            &mut engine_state,
-            stack,
-            parsed_nu_cli_args,
-            entire_start_time,
-        )?;
+        run_repl(&mut engine_state, stack, parsed_nu_cli_args)?;
 
         cleanup_exit(0, &engine_state, 0);
     }

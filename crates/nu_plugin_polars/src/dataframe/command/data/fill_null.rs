@@ -42,6 +42,10 @@ impl PluginCommand for LazyFillNull {
                     PolarsPluginType::NuExpression.into(),
                     PolarsPluginType::NuExpression.into(),
                 ),
+                (
+                    PolarsPluginType::NuSelector.into(),
+                    PolarsPluginType::NuExpression.into(),
+                ),
             ])
             .category(Category::Custom("lazyframe".into()))
     }
@@ -64,6 +68,7 @@ impl PluginCommand for LazyFillNull {
                             ],
                         )],
                         None,
+                        Span::test_data(),
                     )
                     .expect("simple df for test should not fail")
                     .into_value(Span::test_data()),
@@ -88,6 +93,7 @@ impl PluginCommand for LazyFillNull {
                             ],
                         )],
                         None,
+                        Span::test_data(),
                     )
                     .expect("simple df for test should not fail")
                     .into_value(Span::test_data()),
@@ -101,10 +107,10 @@ impl PluginCommand for LazyFillNull {
         plugin: &Self::Plugin,
         engine: &EngineInterface,
         call: &EvaluatedCall,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
-        let metadata = input.metadata();
         let fill: Value = call.req(0)?;
+        let metadata = input.take_metadata();
         let value = input.into_value(call.head)?;
 
         match PolarsPluginObject::try_from_value(plugin, &value)? {
@@ -117,6 +123,7 @@ impl PluginCommand for LazyFillNull {
                     PolarsPluginType::NuDataFrame,
                     PolarsPluginType::NuLazyFrame,
                     PolarsPluginType::NuExpression,
+                    PolarsPluginType::NuSelector,
                 ],
             )),
         }

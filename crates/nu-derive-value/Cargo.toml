@@ -1,17 +1,15 @@
 [package]
-authors = ["The Nushell Project Developers"]
+authors.workspace = true
 description = "Macros implementation of #[derive(FromValue, IntoValue)]"
-edition = "2024"
-license = "MIT"
+edition.workspace = true
+license.workspace = true
 name = "nu-derive-value"
 repository = "https://github.com/nushell/nushell/tree/main/crates/nu-derive-value"
-version = "0.111.1"
+rust-version.workspace = true
+version.workspace = true
 
 [lib]
 proc-macro = true
-# we can only use exposed macros in doctests really, 
-# so we cannot test anything useful in a doctest
-doctest = false 
 
 [lints]
 workspace = true
@@ -20,5 +18,5 @@ workspace = true
 proc-macro2 = { workspace = true }
 syn = { workspace = true }
 quote = { workspace = true }
-proc-macro-error2 = { workspace = true }
+proc-macro-error3 = { workspace = true }
 heck = { workspace = true }

@@ -1,7 +1,7 @@
 use crate::{
     BlockId, DeclId, Filesize, RegId, ShellError, Span, Value, VarId,
     ast::{CellPath, Expression, Operator, Pattern, RangeInclusion},
-    engine::EngineState,
+    engine::{EngineState, ScopeBindings},
 };
 use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,26 @@ mod display;
 
 pub use call::*;
 pub use display::{FmtInstruction, FmtIrBlock};
+
+/// Instruction-index range where a nested block's local command/module bindings apply.
+///
+/// Keyword bodies (`if`/`for`/…) are IR-**inlined** into the parent block and never enter
+/// `eval_ir_block`. The compiler records these regions so `scope` can resolve locals by
+///  comparing the current program counter.
+#[derive(Clone, Debug)]
+pub struct ScopeRegion {
+    /// Inclusive start index into [`IrBlock::instructions`].
+    pub start: usize,
+    /// Exclusive end index into [`IrBlock::instructions`].
+    pub end: usize,
+    pub bindings: Arc<ScopeBindings>,
+}
+
+impl ScopeRegion {
+    pub fn contains(&self, instruction_index: usize) -> bool {
+        self.start <= instruction_index && instruction_index < self.end
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct IrBlock {
@@ -24,6 +44,10 @@ pub struct IrBlock {
     pub comments: Vec<Box<str>>,
     pub register_count: u32,
     pub file_count: u32,
+    /// Local scope regions for inlined nested blocks (see [`ScopeRegion`]).
+    /// Not serialized — only meaningful in the process that compiled the block.
+    #[serde(skip)]
+    pub scope_regions: Vec<ScopeRegion>,
 }
 
 impl fmt::Debug for IrBlock {
@@ -36,6 +60,7 @@ impl fmt::Debug for IrBlock {
             .field("comments", &self.comments)
             .field("register_count", &self.register_count)
             .field("file_count", &self.file_count)
+            .field("scope_regions", &self.scope_regions.len())
             .finish_non_exhaustive()
     }
 }
@@ -109,8 +134,14 @@ pub enum Instruction {
     Move { dst: RegId, src: RegId },
     /// Copy a register (must be a collected value). Value is still in `src` after this instruction.
     Clone { dst: RegId, src: RegId },
-    /// Collect a stream in a register to a value
+    /// Collect a stream in a register to a value.
+    /// Because it collects to a value, nushell will ignore the errors in the stream.
+    /// It's important when the stream is from an external command
     Collect { src_dst: RegId },
+    /// Collect a stream in a register to a value.
+    /// But it's different from `Collect` in that if there is an error in the stream, it will be
+    /// returned as an error instead of being ignored.
+    TryCollect { src_dst: RegId },
     /// Change the span of the contents of a register to the span of this instruction.
     Span { src_dst: RegId },
     /// Drop the value/stream in a register, without draining
@@ -124,8 +155,17 @@ pub enum Instruction {
     /// Drain the value/stream in a register and discard only if this is the last pipeline element.
     // TODO: see if it's possible to remove this
     DrainIfEnd { src: RegId },
-    /// Load the value of a variable into the `dst` register
-    LoadVariable { dst: RegId, var_id: VarId },
+    /// Load the value of a variable into the `dst` register.
+    ///
+    /// When `preserve_origin` is false (the default), the value is re-spanned to this
+    /// instruction's span so error labels point at the use site. When true, the value keeps
+    /// the span from where it was defined (used by `metadata $var`).
+    LoadVariable {
+        dst: RegId,
+        var_id: VarId,
+        #[serde(default)]
+        preserve_origin: bool,
+    },
     /// Store the value of a variable from the `src` register
     StoreVariable { var_id: VarId, src: RegId },
     /// Remove a variable from the stack, freeing up whatever resources were associated with it
@@ -219,6 +259,14 @@ pub enum Instruction {
         path: RegId,
         new_value: RegId,
     },
+    /// Update/insert a cell path directly on a variable in the stack, without cloning the
+    /// variable first. Combines LoadVariable + UpsertCellPath + StoreVariable into a single
+    /// in-place mutation. The variable must be mutable.
+    UpdateVarCellPath {
+        var_id: VarId,
+        cell_path: RegId,
+        new_value: RegId,
+    },
     /// Jump to an offset in this block
     Jump { index: usize },
     /// Branch to an offset in this block if the value of the `cond` register is a true boolean,
@@ -245,24 +293,34 @@ pub enum Instruction {
         stream: RegId,
         end_index: usize,
     },
-    /// Push an error handler, without capturing the error value
+    /// Jump to an offset in this block, unwinding through `handlers` entries of the `try`
+    /// handler stack first. This is how `break` and `continue` leave `try` expressions: any
+    /// `finally` block among those handlers runs before the jump completes.
+    UnwindJump { index: usize, handlers: usize },
+    /// Push a `catch` handler, without capturing the error value
     OnError { index: usize },
-    /// Push an error handler, capturing the error value into `dst`. If the error handler is not
+    /// Push a `catch` handler, capturing the error value into `dst`. If the error handler is not
     /// called, the register should be freed manually.
     OnErrorInto { index: usize, dst: RegId },
-    /// Push an finally handler, without capturing the error value
-    Finally { index: usize },
-    /// Push an finally handler, capturing the error value into `dst`. If the finally handler is not
-    /// called, the register should be freed manually.
+    /// Push a `finally` handler, capturing the error value into `dst`. If the handler is entered
+    /// for any other reason than an error, `dst` is set to empty instead.
     FinallyInto { index: usize, dst: RegId },
-    /// Pop an error handler. This is not necessary when control flow is directed to the error
+    /// Pop a `catch` handler. This is not necessary when control flow is directed to the error
     /// handler due to an error.
     PopErrorHandler,
-    /// Pop an finally handler.
-    PopFinallyRun,
-    /// Return early from the block, raising a `ShellError::Return` instead.
+    /// Mark the `finally` handler on top of the handler stack as running, on the way into its
+    /// block from the `try`/`catch` fall-through path. The unwinder does this itself when it
+    /// enters a `finally` block, so `index` of `finally` points just past this instruction.
+    BeginFinally,
+    /// Leave a `finally` block: pops its running marker and, if the block was entered by
+    /// unwinding (an error, `return`, `exit`, `break`, or `continue`), resumes that unwinding.
+    EndFinally,
+    /// Return early from the block with the value in the register.
     ///
-    /// Collecting the value is unavoidable.
+    /// Unlike `return`, this runs pending `finally` handlers first (collecting the value in that
+    /// case, like the `try-collect` on the fall-through path), and flags the result as an early
+    /// return. Custom command and closure calls clear that flag; only top-level file evaluation
+    /// reads it, to skip `main`.
     ReturnEarly { src: RegId },
     /// Return from the block with the value in the register
     Return { src: RegId },
@@ -292,6 +350,7 @@ impl Instruction {
             Instruction::Move { dst, .. } => Some(dst),
             Instruction::Clone { dst, .. } => Some(dst),
             Instruction::Collect { src_dst } => Some(src_dst),
+            Instruction::TryCollect { src_dst } => Some(src_dst),
             Instruction::Span { src_dst } => Some(src_dst),
             Instruction::Drop { .. } => None,
             Instruction::Drain { .. } => None,
@@ -327,18 +386,20 @@ impl Instruction {
             Instruction::FollowCellPath { src_dst, .. } => Some(src_dst),
             Instruction::CloneCellPath { dst, .. } => Some(dst),
             Instruction::UpsertCellPath { src_dst, .. } => Some(src_dst),
+            Instruction::UpdateVarCellPath { .. } => None,
             Instruction::Jump { .. } => None,
+            Instruction::UnwindJump { .. } => None,
             Instruction::BranchIf { .. } => None,
             Instruction::BranchIfEmpty { .. } => None,
             Instruction::Match { .. } => None,
             Instruction::CheckMatchGuard { .. } => None,
             Instruction::Iterate { dst, .. } => Some(dst),
             Instruction::OnError { .. } => None,
-            Instruction::Finally { .. } => None,
             Instruction::OnErrorInto { .. } => None,
             Instruction::FinallyInto { .. } => None,
             Instruction::PopErrorHandler => None,
-            Instruction::PopFinallyRun => None,
+            Instruction::BeginFinally => None,
+            Instruction::EndFinally => None,
             Instruction::ReturnEarly { .. } => None,
             Instruction::Return { .. } => None,
         }
@@ -348,6 +409,7 @@ impl Instruction {
     pub fn branch_target(&self) -> Option<usize> {
         match self {
             Instruction::Jump { index } => Some(*index),
+            Instruction::UnwindJump { index, handlers: _ } => Some(*index),
             Instruction::BranchIf { cond: _, index } => Some(*index),
             Instruction::BranchIfEmpty { src: _, index } => Some(*index),
             Instruction::Match {
@@ -363,7 +425,6 @@ impl Instruction {
             } => Some(*end_index),
             Instruction::OnError { index } => Some(*index),
             Instruction::OnErrorInto { index, dst: _ } => Some(*index),
-            Instruction::Finally { index } => Some(*index),
             Instruction::FinallyInto { index, dst: _ } => Some(*index),
             _ => None,
         }
@@ -375,6 +436,7 @@ impl Instruction {
     pub fn set_branch_target(&mut self, target_index: usize) -> Result<(), usize> {
         match self {
             Instruction::Jump { index } => *index = target_index,
+            Instruction::UnwindJump { index, handlers: _ } => *index = target_index,
             Instruction::BranchIf { cond: _, index } => *index = target_index,
             Instruction::BranchIfEmpty { src: _, index } => *index = target_index,
             Instruction::Match {
@@ -390,7 +452,6 @@ impl Instruction {
             } => *end_index = target_index,
             Instruction::OnError { index } => *index = target_index,
             Instruction::OnErrorInto { index, dst: _ } => *index = target_index,
-            Instruction::Finally { index } => *index = target_index,
             Instruction::FinallyInto { index, dst: _ } => *index = target_index,
             _ => return Err(target_index),
         }
@@ -404,9 +465,9 @@ impl Instruction {
         span: &Span,
     ) -> Result<(), ShellError> {
         match self {
-            Instruction::Jump { .. } | Instruction::Return { .. } => {
-                engine_state.signals().check(span)
-            }
+            Instruction::Jump { .. }
+            | Instruction::UnwindJump { .. }
+            | Instruction::Return { .. } => engine_state.signals().check(span),
             _ => Ok(()),
         }
     }

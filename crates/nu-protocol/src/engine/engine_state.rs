@@ -2,30 +2,34 @@ use crate::{
     BlockId, Config, DeclId, FileId, GetSpan, Handlers, HistoryConfig, JobId, Module, ModuleId,
     OverlayId, ShellError, SignalAction, Signals, Signature, Span, SpanId, Type, Value, VarId,
     VirtualPathId,
-    ast::Block,
+    ast::{Block, Expr},
     debugger::{Debugger, NoopDebugger},
     engine::{
-        CachedFile, Command, DEFAULT_OVERLAY_NAME, EnvName, EnvVars, OverlayFrame, ScopeFrame,
-        Stack, StateDelta, Variable, Visibility,
+        CachedFile, Command, DEFAULT_OVERLAY_NAME, EnvName, EnvVars, OverlayFrame, PromptState,
+        ScopeFrame, Stack, StateDelta, Variable, VisibilityStack,
         description::{Doccomments, build_desc},
+        signature_cache::SignatureCache,
     },
     eval_const::create_nu_constant,
     report_error::ReportLog,
-    shell_error::io::IoError,
+    shell_error::{generic::GenericError, io::IoError},
 };
 use fancy_regex::Regex;
 use lru::LruCache;
+use nu_config::NushellConfigDirs;
 use nu_path::AbsolutePathBuf;
+use nu_utils::time::Instant;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     num::NonZeroUsize,
     path::PathBuf,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         mpsc::Sender,
         mpsc::channel,
     },
+    time::Duration,
 };
 
 type PoisonDebuggerError<'a> = PoisonError<MutexGuard<'a, Box<dyn Debugger>>>;
@@ -35,12 +39,19 @@ use crate::{PluginRegistryFile, PluginRegistryItem, RegisteredPlugin};
 
 use super::{CurrentJob, Jobs, Mail, Mailbox, ThreadJob};
 
+/// Configure whether the current working directory may be updated when [`EngineState::merge_env`]
+/// is called.
+///
+/// During testing, this is causing issues, so this may disable it.
+pub static UPDATE_CWD: AtomicBool = AtomicBool::new(true);
+
 #[derive(Clone, Debug)]
 pub enum VirtualPath {
     File(FileId),
     Dir(Vec<VirtualPathId>),
 }
 
+#[derive(Debug, Default)]
 pub struct ReplState {
     pub buffer: String,
     // A byte position, as `EditCommand::MoveToPosition` is also a byte position
@@ -49,6 +60,7 @@ pub struct ReplState {
     pub accept: bool,
 }
 
+#[derive(Debug)]
 pub struct IsDebugging(AtomicBool);
 
 impl IsDebugging {
@@ -60,6 +72,43 @@ impl IsDebugging {
 impl Clone for IsDebugging {
     fn clone(&self) -> Self {
         IsDebugging(AtomicBool::new(self.0.load(Ordering::Relaxed)))
+    }
+}
+
+/// A file index remembered across lookups (see [`FileHint::contents`]). An `EngineState` is shared
+/// between threads, and a `StateWorkingSet` must be `Sync`, so this is an atomic; a clone starts
+/// from the same index.
+#[derive(Default)]
+pub(super) struct FileHint(AtomicUsize);
+
+impl Clone for FileHint {
+    fn clone(&self) -> Self {
+        Self(AtomicUsize::new(self.0.load(Ordering::Relaxed)))
+    }
+}
+
+impl FileHint {
+    /// The contents of `span` in the file of `files` that contains it, if any.
+    ///
+    /// The parser looks up span after span in the same file, so this checks the file the last
+    /// lookup found before scanning `files`, and remembers the file a scan finds. Only an empty
+    /// span on a boundary between files is in more than one file, and each gives the same empty
+    /// slice, so the result is always what the scan alone returns.
+    pub(super) fn contents<'a>(&self, files: &'a [CachedFile], span: Span) -> Option<&'a [u8]> {
+        let file = match files.get(self.0.load(Ordering::Relaxed)) {
+            Some(file) if file.covered_span.contains_span(span) => file,
+            _ => {
+                let (index, file) = files
+                    .iter()
+                    .enumerate()
+                    .find(|(_, file)| file.covered_span.contains_span(span))?;
+                self.0.store(index, Ordering::Relaxed);
+                file
+            }
+        };
+        let start = span.start - file.covered_span.start;
+        let end = span.end - file.covered_span.start;
+        Some(&file.content[start..end])
     }
 }
 
@@ -80,16 +129,23 @@ impl Clone for IsDebugging {
 ///
 /// Note that the runtime stack is not part of this global state. Runtime stacks are handled differently,
 /// but they also rely on using IDs rather than full definitions.
-#[derive(Clone)]
+#[derive(Clone, derive_more::Debug)]
 pub struct EngineState {
     files: Vec<CachedFile>,
+    /// The index in `files` of the file the last span lookup found (see
+    /// [`Self::try_get_file_contents`]).
+    #[debug(skip)]
+    last_file_hit: FileHint,
     pub(super) virtual_paths: Vec<(String, VirtualPath)>,
     vars: Vec<Variable>,
+    #[debug("{:?}", decls.iter().map(|c| c.name()).collect::<Vec<_>>())]
     decls: Arc<Vec<Box<dyn Command + 'static>>>,
     // The Vec is wrapped in Arc so that if we don't need to modify the list, we can just clone
     // the reference and not have to clone each individual Arc inside. These lists can be
     // especially long, so it helps
+    #[debug("{:?}", blocks.iter().map(|b| &b.signature.name))]
     pub(super) blocks: Arc<Vec<Arc<Block>>>,
+    #[debug("{:?}", modules.iter().map(|m| String::from_utf8_lossy(&m.name)))]
     pub(super) modules: Arc<Vec<Arc<Module>>>,
     pub spans: Vec<Span>,
     doccomments: Doccomments,
@@ -97,26 +153,68 @@ pub struct EngineState {
     signals: Signals,
     pub signal_handlers: Option<Handlers>,
     pub env_vars: Arc<EnvVars>,
-    pub previous_env_vars: Arc<HashMap<String, Value>>,
+    pub previous_env_vars: Arc<HashMap<EnvName, Value>>,
+    /// Live config. Replace it with [`Self::set_config`] so [`Self::config_epoch`] stays in sync.
     pub config: Arc<Config>,
+    /// Incremented when [`Self::config`] is replaced (`set_config`, `merge_env`).
+    config_epoch: u64,
     pub pipeline_externals_state: Arc<(AtomicU32, AtomicU32)>,
     pub repl_state: Arc<Mutex<ReplState>>,
+    /// Shared source of truth for the interactive prompt's rendered content. The
+    /// REPL fills it each cycle from `$env.PROMPT_COMMAND` and friends; a
+    /// background job's `commandline set-prompt` overwrites individual segments
+    /// and triggers an in-place repaint. Shared with every job that clones this
+    /// engine state.
+    pub prompt_state: Arc<PromptState>,
     pub table_decl_id: Option<DeclId>,
+    /// Signatures of [`Self::decls`], built on first use by the parser. Clones share it, so that
+    /// cloning stays cheap; a clone that appends declarations while sharing it starts over with an
+    /// empty cache of its own (see [`Self::merge_delta`]).
+    #[debug(skip)]
+    pub(super) signature_cache: Arc<SignatureCache>,
     #[cfg(feature = "plugin")]
     pub plugin_path: Option<PathBuf>,
     #[cfg(feature = "plugin")]
+    #[debug("{:?}", plugins.iter().map(|rp| rp.identity().name()).collect::<Vec<_>>())]
     plugins: Vec<Arc<dyn RegisteredPlugin>>,
-    config_path: HashMap<String, PathBuf>,
+    /// Resolved configuration directories and file paths.
+    ///
+    /// Populated once at startup by `nu_config::resolve_paths()` in `main.rs`.
+    /// All downstream code (config-file loading, `$nu` constant generation,
+    /// history backend, etc.) reads from this struct.
+    pub config_dirs: NushellConfigDirs,
+
     pub history_enabled: bool,
     pub history_session_id: i64,
+    /// Whether the startup-only `$env.config.history.*` options are locked from further
+    /// changes (currently `path`, `max_size`, `file_format`, `isolation`).
+    ///
+    /// Set to `true` once the REPL has finished initializing reedline's history backend.
+    /// After that point, changing any of these options would have no effect on the live
+    /// history, so attempts to mutate them are rejected with an error instead of being
+    /// silently ignored.
+    pub history_locked_after_startup: bool,
     // Path to the file Nushell is currently evaluating, or None if we're in an interactive session.
     pub file: Option<PathBuf>,
     pub regex_cache: Arc<Mutex<LruCache<String, Regex>>>,
     pub is_interactive: bool,
+    /// When true with [`Self::is_interactive`], REPL user-line evaluation may store `$ans`.
+    ///
+    /// Set only around true REPL command evaluation (`do_run_cmd`), not config/env/banner
+    /// startup, so startup scripts do not overwrite interactive last-result.
+    pub capture_repl_last_result: bool,
     pub is_login: bool,
     pub is_lsp: bool,
     pub is_mcp: bool,
-    startup_time: i64,
+    /// Running as the Debug Adapter Protocol server (`nu --dap`). Like
+    /// `is_lsp`/`is_mcp`, this means stdout is a protocol stream, so anything
+    /// that would print to it must go to stderr instead.
+    pub is_dap: bool,
+    /// When startup began: the top of `main` for the `nu` binary, otherwise when this engine
+    /// was created. See [`EngineState::startup_time`].
+    startup_start: Instant,
+    /// How long startup took, once [`EngineState::finish_startup`] has been called.
+    startup_time: Option<Duration>,
     is_debugging: IsDebugging,
     pub debugger: Arc<Mutex<Box<dyn Debugger>>>,
     pub report_log: Arc<Mutex<ReportLog>>,
@@ -143,7 +241,24 @@ const REGEX_CACHE_SIZE: usize = 100; // must be nonzero, otherwise will panic
 pub const NU_VARIABLE_ID: VarId = VarId::new(0);
 pub const IN_VARIABLE_ID: VarId = VarId::new(1);
 pub const ENV_VARIABLE_ID: VarId = VarId::new(2);
-// NOTE: If you add more to this list, make sure to update the > checks based on the last in the list
+/// Interactive last-result special variable.
+///
+/// The user-facing name is [`LAST_RESULT_VAR_NAME`] (e.g. `$ans`). Change that constant
+/// if the public name should differ; keep this ID stable.
+pub const LAST_VARIABLE_ID: VarId = VarId::new(3);
+/// Identifier for the last-result special variable **without** the `$` sigil.
+///
+/// Change this single constant to rename the binding site-wide (e.g. `"ans"` → `$ans`).
+/// The name is reserved (cannot be rebound with `let` / `mut` / `const`). Not user-configurable.
+///
+/// With a positive `max_last_result_size`, `$ans` is `{ last, exit_code, duration, command }`.
+/// With size `0`, `$ans` is `{ exit_code, duration, command }` (`last` omitted). `command` is
+/// the exact last REPL source (same buffer reedline stores in history). Resolved from
+/// the stack's last-result slot, not from captured locals — keep capture-discovery
+/// `>` checks in sync with this being the last special var id.
+pub const LAST_RESULT_VAR_NAME: &str = "ans";
+// NOTE: If you add more specials after LAST_VARIABLE_ID, update capture discovery
+// (`var_id > LAST_VARIABLE_ID`) and any other special-id thresholds.
 
 // The first span is unknown span
 pub const UNKNOWN_SPAN_ID: SpanId = SpanId::new(0);
@@ -154,6 +269,7 @@ impl EngineState {
 
         Self {
             files: vec![],
+            last_file_hit: FileHint::default(),
             virtual_paths: vec![],
             vars: vec![
                 Variable::new(Span::new(0, 0), Type::Any, false),
@@ -184,29 +300,36 @@ impl EngineState {
             ),
             previous_env_vars: Arc::new(HashMap::new()),
             config: Arc::new(Config::default()),
+            config_epoch: 0,
             pipeline_externals_state: Arc::new((AtomicU32::new(0), AtomicU32::new(0))),
             repl_state: Arc::new(Mutex::new(ReplState {
                 buffer: "".to_string(),
                 cursor_pos: 0,
                 accept: false,
             })),
+            prompt_state: Arc::new(PromptState::new()),
             table_decl_id: None,
+            signature_cache: Arc::default(),
             #[cfg(feature = "plugin")]
             plugin_path: None,
             #[cfg(feature = "plugin")]
             plugins: vec![],
-            config_path: HashMap::new(),
+            config_dirs: NushellConfigDirs::empty(),
             history_enabled: true,
             history_session_id: 0,
+            history_locked_after_startup: false,
             file: None,
             regex_cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(REGEX_CACHE_SIZE).expect("tried to create cache of size zero"),
             ))),
             is_interactive: false,
+            capture_repl_last_result: false,
             is_login: false,
             is_lsp: false,
             is_mcp: false,
-            startup_time: -1,
+            is_dap: false,
+            startup_start: Instant::now(),
+            startup_time: None,
             is_debugging: IsDebugging::new(false),
             debugger: Arc::new(Mutex::new(Box::new(NoopDebugger))),
             report_log: Arc::default(),
@@ -223,6 +346,25 @@ impl EngineState {
 
     pub fn signals(&self) -> &Signals {
         &self.signals
+    }
+
+    /// Return a compiled regex, reusing the process-wide LRU cache when possible.
+    ///
+    /// On lock contention (or a poisoned mutex), compiles without touching the cache.
+    pub fn get_cached_regex(&self, pattern: &str) -> Result<Regex, fancy_regex::Error> {
+        match self.regex_cache.try_lock() {
+            Ok(mut cache) => cache
+                .try_get_or_insert_ref(pattern, || Regex::new(pattern))
+                .cloned(),
+            Err(_) => Regex::new(pattern),
+        }
+    }
+
+    /// Compile `pattern` via [`Self::get_cached_regex`], mapping failures to
+    /// [`ShellError::InvalidValue`] at `span`.
+    pub fn compile_regex(&self, pattern: &str, span: Span) -> Result<Regex, ShellError> {
+        self.get_cached_regex(pattern)
+            .map_err(|err| invalid_regex_value(pattern, err, span))
     }
 
     pub fn reset_signals(&mut self) {
@@ -253,6 +395,14 @@ impl EngineState {
 
         // Avoid potentially cloning the Arcs if we aren't adding anything
         if !delta.decls.is_empty() {
+            // Clones that share the signature cache must agree on every declaration it holds, so
+            // an engine that adds declarations the other clones don't have stops sharing it. It
+            // starts over with an empty cache rather than a copy. Copying would clone every
+            // signature and remembered output type, while later parses rebuild only the entries
+            // they use.
+            if Arc::get_mut(&mut self.signature_cache).is_none() {
+                self.signature_cache = Arc::default();
+            }
             Arc::make_mut(&mut self.decls).extend(delta.decls);
         }
         if !delta.blocks.is_empty() {
@@ -360,13 +510,15 @@ impl EngineState {
             }
         }
 
-        let cwd = self.cwd(Some(stack))?;
-        std::env::set_current_dir(cwd)
-            .map_err(|err| IoError::new_internal(err, "Could not set current dir"))?;
+        if UPDATE_CWD.load(Ordering::Relaxed) {
+            let cwd = self.cwd(Some(stack))?;
+            std::env::set_current_dir(cwd)
+                .map_err(|err| IoError::new_internal(err, "Could not set current dir"))?;
+        }
 
         if let Some(config) = stack.config.take() {
             // If config was updated in the stack, replace it.
-            self.config = config;
+            self.replace_config(config);
 
             // Make plugin GC config changes take effect immediately.
             #[cfg(feature = "plugin")]
@@ -377,20 +529,31 @@ impl EngineState {
     }
 
     /// Clean up unused variables from a Stack to prevent memory leaks.
-    /// This removes variables that are no longer referenced by any overlay.
+    /// This removes variables that are no longer referenced by any overlay or alias.
     pub fn cleanup_stack_variables(&mut self, stack: &mut Stack) {
-        use std::collections::HashSet;
-
         let mut shadowed_vars = HashSet::new();
         for (_, frame) in self.scope.overlays.iter_mut() {
-            shadowed_vars.extend(frame.shadowed_vars.to_owned());
-            frame.shadowed_vars.clear();
+            shadowed_vars.extend(frame.shadowed_vars.drain(..));
         }
 
-        // Remove variables from stack that are no longer referenced
-        stack
-            .vars
-            .retain(|(var_id, _)| !shadowed_vars.contains(var_id));
+        if shadowed_vars.is_empty() {
+            return;
+        }
+
+        // Collect VarIds still referenced by alias definitions so we don't
+        // remove them — doing so would cause a VariableNotFoundAtRuntime error
+        // when the alias is invoked after the variable has been re-bound.
+        let mut alias_var_ids = HashSet::new();
+        for decl in self.decls.iter() {
+            if let Some(alias) = decl.as_alias() {
+                collect_alias_var_ids(&alias.wrapped_call, &mut alias_var_ids);
+            }
+        }
+
+        // Remove variables from stack that are shadowed and not referenced by any alias
+        stack.vars.retain(|(var_id, _)| {
+            !shadowed_vars.contains(var_id) || alias_var_ids.contains(var_id)
+        });
     }
 
     pub fn active_overlay_ids<'a, 'b>(
@@ -527,16 +690,12 @@ impl EngineState {
         // Updating the signatures plugin file with the added signatures
         use std::fs::File;
 
-        let plugin_path = self
-            .plugin_path
-            .as_ref()
-            .ok_or_else(|| ShellError::GenericError {
-                error: "Plugin file path not set".into(),
-                msg: "".into(),
-                span: None,
-                help: Some("you may be running nu with --no-config-file".into()),
-                inner: vec![],
-            })?;
+        let plugin_path = self.plugin_path.as_ref().ok_or_else(|| {
+            ShellError::Generic(
+                GenericError::new_internal("Plugin file path not set", "")
+                    .with_help("you may be running nu with --no-config-file"),
+            )
+        })?;
 
         // Read the current contents of the plugin file if it exists
         let mut contents = match File::open(plugin_path.as_path()) {
@@ -635,10 +794,10 @@ impl EngineState {
     ///
     /// Searches within active overlays, and filtering out overlays in `removed_overlays`.
     pub fn find_decl(&self, name: &[u8], removed_overlays: &[Vec<u8>]) -> Option<DeclId> {
-        let mut visibility: Visibility = Visibility::new();
+        let mut visibility = VisibilityStack::default();
 
         for overlay_frame in self.active_overlays(removed_overlays).rev() {
-            visibility.append(&overlay_frame.visibility);
+            visibility.push(&overlay_frame.visibility);
 
             if let Some(decl_id) = overlay_frame.get_decl(name)
                 && visibility.is_decl_id_visible(&decl_id)
@@ -654,10 +813,10 @@ impl EngineState {
     ///
     /// Searches within active overlays, and filtering out overlays in `removed_overlays`.
     pub fn find_decl_name(&self, decl_id: DeclId, removed_overlays: &[Vec<u8>]) -> Option<&[u8]> {
-        let mut visibility: Visibility = Visibility::new();
+        let mut visibility = VisibilityStack::default();
 
         for overlay_frame in self.active_overlays(removed_overlays).rev() {
-            visibility.append(&overlay_frame.visibility);
+            visibility.push(&overlay_frame.visibility);
 
             if visibility.is_decl_id_visible(&decl_id) {
                 for (name, id) in overlay_frame.decls.iter() {
@@ -752,15 +911,7 @@ impl EngineState {
     }
 
     pub fn try_get_file_contents(&self, span: Span) -> Option<&[u8]> {
-        self.files.iter().find_map(|file| {
-            if file.covered_span.contains_span(span) {
-                let start = span.start - file.covered_span.start;
-                let end = span.end - file.covered_span.start;
-                Some(&file.content[start..end])
-            } else {
-                None
-            }
-        })
+        self.last_file_hit.contents(&self.files, span)
     }
 
     /// If the span's content starts with the given prefix, return two subspans
@@ -795,6 +946,16 @@ impl EngineState {
         &self.config
     }
 
+    /// Identity of the current config object. Changes when `$env.config` is rewritten.
+    pub fn config_epoch(&self) -> u64 {
+        self.config_epoch
+    }
+
+    fn replace_config(&mut self, conf: Arc<Config>) {
+        self.config_epoch = self.config_epoch.wrapping_add(1);
+        self.config = conf;
+    }
+
     pub fn set_config(&mut self, conf: impl Into<Arc<Config>>) {
         let conf = conf.into();
 
@@ -804,7 +965,7 @@ impl EngineState {
             self.update_plugin_gc_configs(&conf.plugin_gc);
         }
 
-        self.config = conf;
+        self.replace_config(conf);
     }
 
     /// Fetch the configuration for a plugin
@@ -818,6 +979,15 @@ impl EngineState {
     /// Returns the configuration settings for command history or `None` if history is disabled
     pub fn history_config(&self) -> Option<HistoryConfig> {
         self.history_enabled.then(|| self.config.history.clone())
+    }
+
+    /// Resolve the history file path using the already-resolved config dirs.
+    ///
+    /// Returns `None` when history is disabled or the history path is set to
+    /// [`HistoryPath::Disabled`].
+    pub fn history_path(&self) -> Option<std::path::PathBuf> {
+        self.history_config()?
+            .file_path(&self.config_dirs.config_home)
     }
 
     pub fn get_var(&self, var_id: VarId) -> &Variable {
@@ -943,14 +1113,6 @@ impl EngineState {
         FileId::new(self.num_files() - 1)
     }
 
-    pub fn set_config_path(&mut self, key: &str, val: PathBuf) {
-        self.config_path.insert(key.to_string(), val);
-    }
-
-    pub fn get_config_path(&self, key: &str) -> Option<&PathBuf> {
-        self.config_path.get(key)
-    }
-
     pub fn build_desc(&self, spans: &[Span]) -> (String, String) {
         let comment_lines: Vec<&[u8]> = spans
             .iter()
@@ -983,13 +1145,13 @@ impl EngineState {
     pub fn cwd(&self, stack: Option<&Stack>) -> Result<AbsolutePathBuf, ShellError> {
         // Helper function to create a simple generic error.
         fn error(msg: &str, cwd: impl AsRef<nu_path::Path>) -> ShellError {
-            ShellError::GenericError {
-                error: msg.into(),
-                msg: format!("$env.PWD = {}", cwd.as_ref().display()),
-                span: None,
-                help: Some("Use `cd` to reset $env.PWD into a good state".into()),
-                inner: vec![],
-            }
+            ShellError::Generic(
+                GenericError::new_internal(
+                    msg.to_string(),
+                    format!("$env.PWD = {}", cwd.as_ref().display()),
+                )
+                .with_help("Use `cd` to reset $env.PWD into a good state"),
+            )
         }
 
         // Retrieve $env.PWD from the stack or the engine state.
@@ -1037,12 +1199,31 @@ impl EngineState {
         &self.files
     }
 
-    pub fn get_startup_time(&self) -> i64 {
+    /// How long startup took (`$nu.startup-time`), or how long it has taken so far while it is
+    /// still running, for example while the config files are being evaluated.
+    ///
+    /// Like the timers in bash and zsh, startup is measured from inside the shell, not from
+    /// process creation, so it leaves out the time the operating system spends starting the
+    /// executable, and `exec nu` does not count the program it replaced.
+    pub fn startup_time(&self) -> Duration {
         self.startup_time
+            .unwrap_or_else(|| self.startup_start.elapsed())
     }
 
-    pub fn set_startup_time(&mut self, startup_time: i64) {
-        self.startup_time = startup_time;
+    /// Sets when startup began. `nu` calls this with the time it reads at the top of `main`.
+    pub fn set_startup_start(&mut self, startup_start: Instant) {
+        self.startup_start = startup_start;
+    }
+
+    /// Ends startup: from now on [`EngineState::startup_time`] stays at the time it took, and
+    /// later calls keep the first value. Regenerates `$nu` so it shows that time, along with any
+    /// other changes made during startup. Returns the startup time.
+    pub fn finish_startup(&mut self) -> Duration {
+        let startup_time = *self
+            .startup_time
+            .get_or_insert_with(|| self.startup_start.elapsed());
+        self.generate_nu_constant();
+        startup_time
     }
 
     pub fn activate_debugger(
@@ -1086,6 +1267,29 @@ impl EngineState {
         }
     }
 
+    /// Reset mutable per-session state after cloning a shared engine template.
+    pub fn make_session_state_unique(&mut self) {
+        let (send, recv) = channel();
+
+        self.pipeline_externals_state = Arc::new((AtomicU32::new(0), AtomicU32::new(0)));
+        self.repl_state = Default::default();
+        self.report_log = Default::default();
+        self.prompt_state = Arc::new(PromptState::new());
+        self.jobs = Default::default();
+        self.current_job = CurrentJob {
+            id: JobId::new(0),
+            background_thread_job: None,
+            mailbox: Arc::new(Mutex::new(Mailbox::new(recv))),
+        };
+        self.root_job_sender = send;
+        self.exit_warning_given = Default::default();
+        self.regex_cache = Arc::new(Mutex::new(LruCache::new(
+            NonZeroUsize::new(REGEX_CACHE_SIZE).expect("tried to create cache of size zero"),
+        )));
+        self.is_debugging = IsDebugging::new(false);
+        self.debugger = Arc::new(Mutex::new(Box::new(NoopDebugger)));
+    }
+
     /// Add new span and return its ID
     pub fn add_span(&mut self, span: Span) -> SpanId {
         self.spans.push(span);
@@ -1111,6 +1315,36 @@ impl EngineState {
     }
 }
 
+/// Collect all `VarId`s referenced by `Expr::Var` nodes in `expr`.
+/// This is used by [`EngineState::cleanup_stack_variables`] to avoid removing
+/// variables that are still referenced by alias definitions.
+fn collect_alias_var_ids(expr: &crate::ast::Expression, var_ids: &mut HashSet<VarId>) {
+    let mut queue = vec![expr];
+
+    while let Some(e) = queue.pop() {
+        match &e.expr {
+            Expr::Var(id) => {
+                var_ids.insert(*id);
+            }
+            Expr::Call(call) => {
+                for arg in &call.arguments {
+                    if let Some(sub_expr) = arg.expr() {
+                        queue.push(sub_expr);
+                    }
+                }
+            }
+            Expr::ExternalCall(head, args) => {
+                queue.push(head);
+                for arg in args.iter() {
+                    queue.push(arg.expr());
+                }
+            }
+            Expr::FullCellPath(fcp) => queue.push(&fcp.head),
+            _ => {}
+        }
+    }
+}
+
 impl GetSpan for &EngineState {
     /// Get existing span
     fn get_span(&self, span_id: SpanId) -> Span {
@@ -1127,6 +1361,18 @@ impl Default for EngineState {
     }
 }
 
+/// Map a fancy-regex compile failure to [`ShellError::InvalidValue`].
+///
+/// Shared by [`EngineState::compile_regex`] and call sites that compile with
+/// options that bypass the LRU cache (for example a custom backtrack limit).
+pub fn invalid_regex_value(pattern: &str, err: fancy_regex::Error, span: Span) -> ShellError {
+    ShellError::InvalidValue {
+        valid: "a valid regular expression".into(),
+        actual: format!("'{pattern}' ({err})"),
+        span,
+    }
+}
+
 #[cfg(test)]
 mod engine_state_tests {
     use crate::engine::StateWorkingSet;
@@ -1138,9 +1384,104 @@ mod engine_state_tests {
     fn add_file_gives_id() {
         let engine_state = EngineState::new();
         let mut engine_state = StateWorkingSet::new(&engine_state);
-        let id = engine_state.add_file("test.nu".into(), &[]);
+        let id = engine_state.add_file("test.nu", &[]);
 
         assert_eq!(id, FileId::new(0));
+    }
+
+    /// An engine that appends declarations to a signature cache it shares with a clone starts
+    /// over with its own empty cache; one that doesn't share it keeps it.
+    #[test]
+    fn merging_declarations_stops_sharing_the_signature_cache() {
+        let merge_a_decl = |engine_state: &mut EngineState| {
+            let mut working_set = StateWorkingSet::new(engine_state);
+            working_set.add_decl(Signature::new("foo").predeclare());
+            let delta = working_set.render();
+            engine_state
+                .merge_delta(delta)
+                .expect("merging a declaration");
+        };
+
+        let mut engine_state = EngineState::new();
+        let clone = engine_state.clone();
+        assert!(Arc::ptr_eq(
+            &engine_state.signature_cache,
+            &clone.signature_cache
+        ));
+        merge_a_decl(&mut engine_state);
+        assert!(!Arc::ptr_eq(
+            &engine_state.signature_cache,
+            &clone.signature_cache
+        ));
+
+        let cache = Arc::as_ptr(&engine_state.signature_cache);
+        merge_a_decl(&mut engine_state);
+        assert_eq!(Arc::as_ptr(&engine_state.signature_cache), cache);
+    }
+
+    #[test]
+    fn file_contents_lookup_finds_what_a_scan_finds() {
+        let mut engine_state = EngineState::new();
+        for (index, content) in ["", "abc", "", "", "de", "f", ""].iter().enumerate() {
+            engine_state.add_file(format!("file{index}").into(), content.as_bytes().into());
+        }
+        let end = engine_state.next_span_start();
+        let scan = |span: Span| {
+            engine_state.files.iter().find_map(|file| {
+                file.covered_span.contains_span(span).then(|| {
+                    &file.content
+                        [span.start - file.covered_span.start..span.end - file.covered_span.start]
+                })
+            })
+        };
+        let spans: Vec<Span> = (0..=end + 1)
+            .flat_map(|start| (start..=end + 1).map(move |span_end| Span::new(start, span_end)))
+            .collect();
+        // Both orders, so that the remembered file is sometimes right and sometimes not.
+        for span in spans.iter().chain(spans.iter().rev()) {
+            assert_eq!(
+                engine_state.try_get_file_contents(*span),
+                scan(*span),
+                "{span:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_cached_regex_reuses_compiled_patterns() {
+        let engine_state = EngineState::new();
+        let pattern = r"[^\w]+";
+
+        let first = engine_state
+            .get_cached_regex(pattern)
+            .expect("pattern should compile");
+        assert!(first.is_match("!!!").unwrap_or(false));
+
+        {
+            let cache = engine_state.regex_cache.lock().expect("cache lock");
+            assert_eq!(cache.len(), 1);
+            assert!(cache.peek(pattern).is_some());
+        }
+
+        let second = engine_state
+            .get_cached_regex(pattern)
+            .expect("pattern should compile from cache");
+        assert!(second.is_match("!!!").unwrap_or(false));
+
+        {
+            let cache = engine_state.regex_cache.lock().expect("cache lock");
+            assert_eq!(cache.len(), 1, "second lookup should not grow the cache");
+        }
+    }
+
+    #[test]
+    fn get_cached_regex_does_not_store_invalid_patterns() {
+        let engine_state = EngineState::new();
+
+        assert!(engine_state.get_cached_regex("(").is_err());
+
+        let cache = engine_state.regex_cache.lock().expect("cache lock");
+        assert_eq!(cache.len(), 0);
     }
 
     #[test]
@@ -1149,7 +1490,7 @@ mod engine_state_tests {
         let parent_id = engine_state.add_file("test.nu".into(), Arc::new([]));
 
         let mut working_set = StateWorkingSet::new(&engine_state);
-        let working_set_id = working_set.add_file("child.nu".into(), &[]);
+        let working_set_id = working_set.add_file("child.nu", &[]);
 
         assert_eq!(parent_id, FileId::new(0));
         assert_eq!(working_set_id, FileId::new(1));
@@ -1162,7 +1503,7 @@ mod engine_state_tests {
 
         let delta = {
             let mut working_set = StateWorkingSet::new(&engine_state);
-            let _ = working_set.add_file("child.nu".into(), &[]);
+            let _ = working_set.add_file("child.nu", &[]);
             working_set.render()
         };
 

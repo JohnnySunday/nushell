@@ -1,6 +1,22 @@
+use std::borrow::Cow;
+use std::sync::OnceLock;
+
 use num_format::Locale;
 
 pub const LOCALE_OVERRIDE_ENV_VAR: &str = "NU_TEST_LOCALE_OVERRIDE";
+
+/// The system locale, read from the OS once per process.
+///
+/// `sys_locale::get_locale` is not cheap, and on macOS it goes through
+/// CoreFoundation preferences whose autoreleased objects are never collected
+/// on a plain Rust thread. Callers such as filesize formatting run per value,
+/// and a redrawing UI runs them per frame, so an uncached lookup grows memory
+/// without bound. The locale does not change while nushell runs.
+#[cfg_attr(all(test, debug_assertions), allow(dead_code))]
+fn system_locale_from_os() -> Option<String> {
+    static LOCALE: OnceLock<Option<String>> = OnceLock::new();
+    LOCALE.get_or_init(sys_locale::get_locale).clone()
+}
 
 pub fn get_system_locale() -> Locale {
     let locale_string = get_system_locale_string().unwrap_or_else(|| String::from("en-US"));
@@ -25,7 +41,7 @@ pub fn get_system_locale_string() -> Option<String> {
     std::env::var(LOCALE_OVERRIDE_ENV_VAR).ok().or_else(
         #[cfg(not(test))]
         {
-            sys_locale::get_locale
+            system_locale_from_os
         },
         #[cfg(test)]
         {
@@ -38,5 +54,47 @@ pub fn get_system_locale_string() -> Option<String> {
 
 #[cfg(not(debug_assertions))]
 pub fn get_system_locale_string() -> Option<String> {
-    sys_locale::get_locale()
+    system_locale_from_os()
+}
+
+/// Get the current locale from environment variables.
+///
+/// - Checks multiple environment variables.
+/// - Generic over how to read environment variables (can be used to read environment variables from
+///   `StateWorkingSet`, `Stack`, or from process environment variables)
+/// - Allows specifying a locale category (`LC_TIME`, `LC_NUMERIC`, etc.)
+///
+/// Priority order as documented in [`gettext` manual][1]:
+/// - NU_TEST_LOCALE_OVERRIDE
+/// - LC_ALL
+/// - `locale_category` (if provided)
+/// - LANG
+///
+/// [1]: https://www.gnu.org/software/gettext/manual/html_node/Locale-Environment-Variables.html
+pub fn get_locale_from_env_vars<'a, F, O>(
+    locale_category: Option<&str>,
+    env_getter: F,
+) -> Option<Cow<'a, str>>
+where
+    F: 'a,
+    F: Fn(&str) -> Option<O>,
+    O: Into<Cow<'a, str>>,
+{
+    let mut env_var_names = [LOCALE_OVERRIDE_ENV_VAR, "LC_ALL"]
+        .iter()
+        .copied()
+        .chain(locale_category)
+        .chain(["LANG"]);
+
+    let env_var = env_var_names.find_map(env_getter).map(Into::into);
+    env_var
+        .map(|s| match s {
+            Cow::Borrowed(s) => Cow::Borrowed(s.split('.').next().unwrap_or(s)),
+            Cow::Owned(s) => Cow::Owned(s.split('.').next().map(ToOwned::to_owned).unwrap_or(s)),
+        })
+        .or_else(|| {
+            get_system_locale_string()
+                .map(|l| l.replace('-', "_"))
+                .map(Cow::Owned)
+        })
 }

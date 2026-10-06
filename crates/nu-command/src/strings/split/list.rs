@@ -121,7 +121,7 @@ impl Command for SubCommand {
             },
             Example {
                 description: "Split a list of chars into lists based on multiple characters.",
-                example: r"[a, b, c, d, a, e, f, g] | split list --regex '(b|e)'",
+                example: "[a, b, c, d, a, e, f, g] | split list --regex '(b|e)'",
                 result: Some(Value::list(
                     vec![
                         Value::list(vec![Value::test_string("a")], Span::test_data()),
@@ -143,7 +143,7 @@ impl Command for SubCommand {
             },
             Example {
                 description: "Split a list of numbers on multiples of 3.",
-                example: r"[1 2 3 4 5 6 7 8 9 10] | split list {|e| $e mod 3 == 0 }",
+                example: "[1 2 3 4 5 6 7 8 9 10] | split list {|e| $e mod 3 == 0 }",
                 result: Some(Value::test_list(vec![
                     Value::test_list(vec![Value::test_int(1), Value::test_int(2)]),
                     Value::test_list(vec![Value::test_int(4), Value::test_int(5)]),
@@ -153,7 +153,7 @@ impl Command for SubCommand {
             },
             Example {
                 description: "Split a list of numbers into lists ending with 0.",
-                example: r"[1 2 0 3 4 5 0 6 0 0 7] | split list --split after 0",
+                example: "[1 2 0 3 4 5 0 6 0 0 7] | split list --split after 0",
                 result: Some(Value::test_list(vec![
                     Value::test_list(vec![
                         Value::test_int(1),
@@ -193,7 +193,7 @@ impl Command for SubCommand {
             Value::Closure { val, .. } => {
                 Matcher::from_closure(ClosureEval::new(engine_state, stack, *val))
             }
-            _ => Matcher::new(has_regex, separator)?,
+            _ => Matcher::new(engine_state, has_regex, separator)?,
         };
         split_list(engine_state, call, input, matcher, split)
     }
@@ -201,14 +201,15 @@ impl Command for SubCommand {
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let has_regex = call.has_flag_const(working_set, "regex")?;
-        let separator: Value = call.req_const(working_set, 0)?;
-        let split: Option<Split> = call.get_flag_const(working_set, "split")?;
+        let has_regex = call.has_flag_const(working_set, stack, "regex")?;
+        let separator: Value = call.req_const(working_set, stack, 0)?;
+        let split: Option<Split> = call.get_flag_const(working_set, stack, "split")?;
         let split = split.unwrap_or(Split::On);
-        let matcher = Matcher::new(has_regex, separator)?;
+        let matcher = Matcher::new(working_set.permanent(), has_regex, separator)?;
         split_list(working_set.permanent(), call, input, matcher, split)
     }
 }
@@ -243,20 +244,14 @@ impl FromValue for Split {
 }
 
 impl Matcher {
-    pub fn new(regex: bool, lhs: Value) -> Result<Self, ShellError> {
+    pub fn new(engine_state: &EngineState, regex: bool, lhs: Value) -> Result<Self, ShellError> {
         if regex {
-            Ok(Matcher::Regex(Regex::new(&lhs.coerce_str()?).map_err(
-                |e| ShellError::GenericError {
-                    error: "Error with regular expression".into(),
-                    msg: e.to_string(),
-                    span: match lhs {
-                        Value::Error { .. } => None,
-                        _ => Some(lhs.span()),
-                    },
-                    help: None,
-                    inner: vec![],
-                },
-            )?))
+            let pattern = lhs.coerce_str()?;
+            let span = match &lhs {
+                Value::Error { .. } => Span::unknown(),
+                _ => lhs.span(),
+            };
+            Ok(Matcher::Regex(engine_state.compile_regex(&pattern, span)?))
         } else {
             Ok(Matcher::Direct(lhs))
         }
@@ -270,7 +265,7 @@ impl Matcher {
         Ok(match self {
             Matcher::Regex(regex) => {
                 if let Ok(rhs_str) = rhs.coerce_str() {
-                    regex.is_match(&rhs_str).unwrap_or(false)
+                    regex.is_match(rhs_str.as_ref()).unwrap_or(false)
                 } else {
                     false
                 }
@@ -278,7 +273,7 @@ impl Matcher {
             Matcher::Direct(lhs) => rhs == lhs,
             Matcher::Closure(closure) => closure
                 .run_with_value(rhs.clone())
-                .and_then(|data| data.into_value(Span::unknown()))
+                .and_then(|data| data.into_value(rhs.span()))
                 .map(|value| value.is_true())
                 .unwrap_or(false),
         })
@@ -386,9 +381,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(SubCommand)
     }
 }

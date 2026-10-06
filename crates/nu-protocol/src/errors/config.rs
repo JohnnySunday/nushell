@@ -8,13 +8,15 @@ use thiserror::Error;
 #[derive(Clone, Debug, PartialEq, Error, Diagnostic)]
 pub enum ConfigError {
     #[error("Type mismatch at {path}")]
-    #[diagnostic(code(nu::shell::type_mismatch))]
+    #[diagnostic(code(nu::shell::type_mismatch), help("{help}"))]
     TypeMismatch {
         path: String,
         expected: Type,
         actual: Type,
         #[label = "expected {expected}, but got {actual}"]
         span: Span,
+        /// Optional guidance (empty string when no extra help).
+        help: String,
     },
     #[error("Invalid value for {path}")]
     #[diagnostic(code(nu::shell::invalid_value))]
@@ -51,6 +53,18 @@ pub enum ConfigError {
         #[label("deprecated")]
         span: Span,
     },
+    #[error("{path} cannot be changed after Nushell has started")]
+    #[diagnostic(
+        code(nu::shell::config_option_locked_after_startup),
+        help(
+            "set {path} in your config.nu (or via --config / the relevant env var) and restart Nushell"
+        )
+    )]
+    LockedAfterStartup {
+        path: String,
+        #[label("cannot be changed at runtime")]
+        span: Span,
+    },
     // TODO: remove this
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -69,6 +83,18 @@ pub enum ConfigWarning {
         span: Span,
         help: &'static str,
     },
+    #[error("Multiple keybindings share a name")]
+    #[diagnostic(
+        code(nu::shell::shared_keybindings_name),
+        help(
+            "all of these bindings remain in the configuration; give each a unique name to silence this warning"
+        )
+    )]
+    SharedKeybindingName {
+        names: String,
+        #[label("{names}: each names more than one keybinding")]
+        span: Span,
+    },
 }
 
 // To keep track of reported warnings
@@ -78,6 +104,9 @@ impl Hash for ConfigWarning {
             ConfigWarning::IncompatibleOptions { label, help, .. } => {
                 label.hash(state);
                 help.hash(state);
+            }
+            ConfigWarning::SharedKeybindingName { names, .. } => {
+                names.hash(state);
             }
         }
     }

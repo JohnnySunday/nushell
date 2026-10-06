@@ -2,13 +2,14 @@ use chrono::{FixedOffset, TimeZone};
 use nu_cmd_base::input_handler::{CmdArgument, operate};
 use nu_engine::command_prelude::*;
 
+use nu_heavy_utils::endian::Endian;
 use nu_utils::get_system_locale;
 
 struct Arguments {
     radix: u32,
     cell_paths: Option<Vec<CellPath>>,
     signed: bool,
-    little_endian: bool,
+    endian: Endian,
 }
 
 impl CmdArgument for Arguments {
@@ -70,13 +71,7 @@ impl Command for IntoInt {
             ])
             .allow_variants_without_examples(true)
             .named("radix", SyntaxShape::Number, "Radix of integer.", Some('r'))
-            .param(
-                Flag::new("endian")
-                    .short('e')
-                    .arg(SyntaxShape::String)
-                    .desc("Byte encode endian, available options: native(default), little, big.")
-                    .completion(Completion::new_list(&["native", "little", "big"])),
-            )
+            .param(Endian::flag())
             .switch(
                 "signed",
                 "Always treat input number as a signed number.",
@@ -128,34 +123,15 @@ impl Command for IntoInt {
             None => 10,
         };
 
-        let endian = call.get_flag::<Value>(engine_state, stack, "endian")?;
-        let little_endian = match endian {
-            Some(val) => {
-                let span = val.span();
-                match val {
-                    Value::String { val, .. } => match val.as_str() {
-                        "native" => cfg!(target_endian = "little"),
-                        "little" => true,
-                        "big" => false,
-                        _ => {
-                            return Err(ShellError::TypeMismatch {
-                                err_message: "Endian must be one of native, little, big"
-                                    .to_string(),
-                                span,
-                            });
-                        }
-                    },
-                    _ => false,
-                }
-            }
-            None => cfg!(target_endian = "little"),
-        };
+        let endian = call
+            .get_flag::<Endian>(engine_state, stack, "endian")?
+            .unwrap_or_default();
 
         let signed = call.has_flag(engine_state, stack, "signed")?;
 
         let args = Arguments {
             radix,
-            little_endian,
+            endian,
             signed,
             cell_paths,
         };
@@ -244,11 +220,11 @@ impl Command for IntoInt {
 fn action(input: &Value, args: &Arguments, head: Span) -> Value {
     let radix = args.radix;
     let signed = args.signed;
-    let little_endian = args.little_endian;
+    let endian = args.endian;
     let val_span = input.span();
 
     match input {
-        Value::Int { val: _, .. } => {
+        Value::Int { .. } => {
             if radix == 10 {
                 input.clone()
             } else {
@@ -324,7 +300,6 @@ fn action(input: &Value, args: &Arguments, head: Span) -> Value {
         Value::Binary { val, .. } => {
             use byteorder::{BigEndian, ByteOrder, LittleEndian};
 
-            let mut val = val.to_vec();
             let size = val.len();
 
             if size == 0 {
@@ -342,25 +317,23 @@ fn action(input: &Value, args: &Arguments, head: Span) -> Value {
                 );
             }
 
-            match (little_endian, signed) {
-                (true, true) => Value::int(LittleEndian::read_int(&val, size), head),
-                (false, true) => Value::int(BigEndian::read_int(&val, size), head),
-                (true, false) => {
-                    while val.len() < 8 {
-                        val.push(0);
-                    }
-                    val.resize(8, 0);
+            let val = match (endian, signed) {
+                (Endian::Little, true) => Ok(LittleEndian::read_int(val, size)),
+                (Endian::Big, true) => Ok(BigEndian::read_int(val, size)),
+                (Endian::Little, false) => i64::try_from(LittleEndian::read_uint(val, size)),
+                (Endian::Big, false) => i64::try_from(BigEndian::read_uint(val, size)),
+            };
 
-                    Value::int(LittleEndian::read_i64(&val), head)
-                }
-                (false, false) => {
-                    while val.len() < 8 {
-                        val.insert(0, 0);
-                    }
-                    val.resize(8, 0);
-
-                    Value::int(BigEndian::read_i64(&val), head)
-                }
+            match val {
+                Ok(val) => Value::int(val, head),
+                Err(_) => Value::error(
+                    ShellError::IncorrectValue {
+                        msg: "unsigned binary input is too large to convert to int".into(),
+                        val_span,
+                        call_span: head,
+                    },
+                    head,
+                ),
             }
         }
         // Propagate errors by explicitly matching them before the final case.
@@ -521,12 +494,8 @@ mod test {
 
     #[test]
     #[env(NU_TEST_LOCALE_OVERRIDE = "en_US.utf8")]
-    #[env(LANG = "en_US.UTF-8")]
-    #[env(LANGUAGE = "en")]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(IntoInt {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(IntoInt)
     }
 
     #[test]
@@ -540,7 +509,7 @@ mod test {
                 radix: 10,
                 cell_paths: None,
                 signed: false,
-                little_endian: false,
+                endian: Endian::Big,
             },
             Span::test_data(),
         );
@@ -556,7 +525,7 @@ mod test {
                 radix: 10,
                 cell_paths: None,
                 signed: false,
-                little_endian: false,
+                endian: Endian::Big,
             },
             Span::test_data(),
         );
@@ -572,7 +541,7 @@ mod test {
                 radix: 16,
                 cell_paths: None,
                 signed: false,
-                little_endian: false,
+                endian: Endian::Big,
             },
             Span::test_data(),
         );
@@ -589,7 +558,7 @@ mod test {
                 radix: 10,
                 cell_paths: None,
                 signed: false,
-                little_endian: false,
+                endian: Endian::Big,
             },
             Span::test_data(),
         );
@@ -612,7 +581,7 @@ mod test {
                 radix: 10,
                 cell_paths: None,
                 signed: false,
-                little_endian: false,
+                endian: Endian::Big,
             },
             Span::test_data(),
         );
@@ -635,7 +604,7 @@ mod test {
                 radix: 10,
                 cell_paths: None,
                 signed: false,
-                little_endian: false,
+                endian: Endian::Big,
             },
             Span::test_data(),
         );

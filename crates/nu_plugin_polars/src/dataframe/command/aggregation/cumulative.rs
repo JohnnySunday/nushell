@@ -7,7 +7,7 @@ use crate::values::{
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
 use nu_protocol::{
     Category, Example, LabeledError, PipelineData, ShellError, Signature, Span, Spanned,
-    SyntaxShape, Value,
+    SyntaxShape, Value, shell_error::generic::GenericError,
 };
 use polars::prelude::{DataType, IntoSeries, cum_max, cum_min, cum_sum};
 
@@ -23,13 +23,14 @@ impl CumulativeType {
             "min" => Ok(Self::Min),
             "max" => Ok(Self::Max),
             "sum" => Ok(Self::Sum),
-            _ => Err(ShellError::GenericError {
-                error: "Wrong operation".into(),
-                msg: "Operation not valid for cumulative".into(),
-                span: Some(span),
-                help: Some("Allowed values: max, min, sum".into()),
-                inner: vec![],
-            }),
+            _ => Err(ShellError::Generic(
+                GenericError::new(
+                    "Wrong operation",
+                    "Operation not valid for cumulative",
+                    span,
+                )
+                .with_help("Allowed values: max, min, sum"),
+            )),
         }
     }
 
@@ -77,6 +78,10 @@ impl PluginCommand for Cumulative {
                     PolarsPluginType::NuExpression.into(),
                     PolarsPluginType::NuExpression.into(),
                 ),
+                (
+                    PolarsPluginType::NuSelector.into(),
+                    PolarsPluginType::NuExpression.into(),
+                ),
             ])
             .category(Category::Custom("dataframe".into()))
     }
@@ -102,6 +107,7 @@ impl PluginCommand for Cumulative {
                             ],
                         )],
                         None,
+                        Span::test_data(),
                     )
                     .expect("simple df for test should not fail")
                     .into_value(Span::test_data()),
@@ -123,6 +129,7 @@ impl PluginCommand for Cumulative {
                             ],
                         )],
                         None,
+                        Span::test_data(),
                     )
                     .expect("simple df for test should not fail")
                     .into_value(Span::test_data()),
@@ -144,6 +151,7 @@ impl PluginCommand for Cumulative {
                             ],
                         )],
                         None,
+                        Span::test_data(),
                     )
                     .expect("simple df for test should not fail")
                     .into_value(Span::test_data()),
@@ -157,9 +165,9 @@ impl PluginCommand for Cumulative {
         plugin: &Self::Plugin,
         engine: &EngineInterface,
         call: &EvaluatedCall,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
-        let metadata = input.metadata();
+        let metadata = input.take_metadata();
         let value = input.into_value(call.head)?;
         let cum_type: Spanned<String> = call.req(0)?;
         let cum_type = CumulativeType::from_str(&cum_type.item, cum_type.span)?;
@@ -216,13 +224,11 @@ fn command_df(
     let series = df.as_series(call.head)?;
 
     if let DataType::Object(..) = series.dtype() {
-        return Err(ShellError::GenericError {
-            error: "Found object series".into(),
-            msg: "Series of type object cannot be used for cumulative operation".into(),
-            span: Some(call.head),
-            help: None,
-            inner: vec![],
-        });
+        return Err(ShellError::Generic(GenericError::new(
+            "Found object series",
+            "Series of type object cannot be used for cumulative operation",
+            call.head,
+        )));
     }
 
     let mut res = match cum_type {
@@ -230,12 +236,12 @@ fn command_df(
         CumulativeType::Min => cum_min(&series, reverse),
         CumulativeType::Sum => cum_sum(&series, reverse),
     }
-    .map_err(|e| ShellError::GenericError {
-        error: "Error creating cumulative".into(),
-        msg: e.to_string(),
-        span: Some(call.head),
-        help: None,
-        inner: vec![],
+    .map_err(|e| {
+        ShellError::Generic(GenericError::new(
+            "Error creating cumulative",
+            e.to_string(),
+            call.head,
+        ))
     })?;
 
     let name = format!("{}_{}", series.name(), cum_type.to_str());

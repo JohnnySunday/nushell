@@ -8,7 +8,10 @@ mod range;
 #[cfg(test)]
 mod test_derive;
 
+#[doc(hidden)]
+pub mod macros;
 pub mod record;
+use bstr::BStr;
 pub use custom_value::CustomValue;
 pub use duration::*;
 pub use filesize::*;
@@ -16,39 +19,63 @@ pub use from_value::FromValue;
 pub use glob::*;
 pub use into_value::{IntoValue, TryIntoValue};
 pub use nu_utils::MultiLife;
-pub use range::{FloatRange, IntRange, Range};
+pub use range::{FloatRange, IntRange, ParseRangeError, Range};
 pub use record::Record;
 
 use crate::{
-    BlockId, Config, ShellError, Signals, Span, Type,
+    BlockId, CompareTypes, Config, ShellError, Signals, Span, Type, TypeRelation,
     ast::{Bits, Boolean, CellPath, Comparison, Math, Operator, PathMember},
     did_you_mean,
     engine::{Closure, EngineState},
 };
 use chrono::{DateTime, Datelike, Duration, FixedOffset, Local, Locale, TimeZone};
 use chrono_humanize::HumanTime;
-use fancy_regex::Regex;
-use nu_utils::{
-    ObviousFloat, SharedCow, contains_emoji,
-    locale::{LOCALE_OVERRIDE_ENV_VAR, get_system_locale_string},
-};
+use nu_utils::{ObviousFloat, SharedCow, contains_emoji, get_locale_from_env_vars};
+pub use semver::Version as SemVerVersion;
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
     cmp::Ordering,
-    fmt::{Debug, Display, Write},
+    fmt::{self, Debug, Display, Write},
     ops::{Bound, ControlFlow},
     path::PathBuf,
 };
 
 /// Core structured values that pass through the pipeline in Nushell.
+///
+/// # Debug Format
+///
+/// By default, [`Value`]'s [`Debug`] implementation uses a compact format.
+/// This makes values easier to inspect by leaving out spans and avoiding heavy
+/// use of newlines and indentation.
+///
+/// Use the `-` formatting flag to show the expanded format, including spans.
+///
+/// The `-` flag is used because it is not used by [`std::fmt`], unlike `+`.
+///
+/// ```
+/// # use nu_protocol::Value;
+/// let value = Value::test_string("Ellie 🐘");
+///
+/// // compact format
+/// assert_eq!(
+///     format!("{value:?}"),
+///     r#"String("Ellie 🐘")"#,
+/// );
+///
+/// // expanded format
+/// assert_eq!(
+///     format!("{value:-?}"),
+///     r#"String { val: "Ellie 🐘", internal_span: Span(TEST) }"#,
+/// );
+/// ```
 // NOTE: Please do not reorder these enum cases without thinking through the
 // impact on the PartialOrd implementation and the global sort order
 // NOTE: All variants are marked as `non_exhaustive` to prevent them
 // from being constructed (outside of this crate) with the struct
 // expression syntax. This makes using the constructor methods the
 // only way to construct `Value`'s
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub enum Value {
     #[non_exhaustive]
     Bool {
@@ -136,7 +163,7 @@ pub enum Value {
     },
     #[non_exhaustive]
     List {
-        vals: Vec<Value>,
+        vals: SharedCow<Vec<Value>>,
         #[serde(skip)]
         signals: Option<Signals>,
         /// note: spans are being refactored out of Value
@@ -162,7 +189,7 @@ pub enum Value {
     },
     #[non_exhaustive]
     Binary {
-        val: Vec<u8>,
+        val: SharedCow<Vec<u8>>,
         /// note: spans are being refactored out of Value
         /// please use .span() instead of matching this span value
         #[serde(rename = "span")]
@@ -191,6 +218,165 @@ pub enum Value {
         #[serde(rename = "span")]
         internal_span: Span,
     },
+}
+
+fn wrap_tuple(name: &str, val: impl Debug) -> impl Debug {
+    fmt::from_fn(move |f| {
+        write!(f, "{name}(")?;
+        val.fmt(f)?;
+        write!(f, ")")
+    })
+}
+
+fn display_as_debug(val: impl Display) -> impl Debug {
+    fmt::from_fn(move |f| val.fmt(f))
+}
+
+impl Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.sign_minus() {
+            return match self {
+                Self::Bool { val, internal_span } => f
+                    .debug_struct("Bool")
+                    .field("val", val)
+                    .field("internal_span", internal_span)
+                    .finish(),
+                Self::Int { val, internal_span } => f
+                    .debug_struct("Int")
+                    .field("val", val)
+                    .field("internal_span", internal_span)
+                    .finish(),
+                Self::Float { val, internal_span } => f
+                    .debug_struct("Float")
+                    .field("val", val)
+                    .field("internal_span", internal_span)
+                    .finish(),
+                Self::String { val, internal_span } => f
+                    .debug_struct("String")
+                    .field("val", val)
+                    .field("internal_span", internal_span)
+                    .finish(),
+                Self::Glob {
+                    val,
+                    no_expand,
+                    internal_span,
+                } => f
+                    .debug_struct("Glob")
+                    .field("val", val)
+                    .field("no_expand", no_expand)
+                    .field("internal_span", internal_span)
+                    .finish(),
+                Self::Filesize { val, internal_span } => f
+                    .debug_struct("Filesize")
+                    .field("val", val)
+                    .field("internal_span", internal_span)
+                    .finish(),
+                Self::Duration { val, internal_span } => f
+                    .debug_struct("Duration")
+                    .field("val", val)
+                    .field("internal_span", internal_span)
+                    .finish(),
+                Self::Date { val, internal_span } => f
+                    .debug_struct("Date")
+                    .field("val", val)
+                    .field("internal_span", internal_span)
+                    .finish(),
+                Self::Range {
+                    val,
+                    signals,
+                    internal_span,
+                } => f
+                    .debug_struct("Range")
+                    .field("val", val)
+                    .field("signals", signals)
+                    .field("internal_span", internal_span)
+                    .finish(),
+                Self::Record { val, internal_span } => f
+                    .debug_struct("Record")
+                    .field("val", val)
+                    .field("internal_span", internal_span)
+                    .finish(),
+                Self::List {
+                    vals,
+                    signals,
+                    internal_span,
+                } => f
+                    .debug_struct("List")
+                    .field("vals", vals)
+                    .field("signals", signals)
+                    .field("internal_span", internal_span)
+                    .finish(),
+                Self::Closure { val, internal_span } => f
+                    .debug_struct("Closure")
+                    .field("val", val)
+                    .field("internal_span", internal_span)
+                    .finish(),
+                Self::Error {
+                    error,
+                    internal_span,
+                } => f
+                    .debug_struct("Error")
+                    .field("error", error)
+                    .field("internal_span", internal_span)
+                    .finish(),
+                Self::Binary { val, internal_span } => f
+                    .debug_struct("Binary")
+                    .field("val", val)
+                    .field("internal_span", internal_span)
+                    .finish(),
+                Self::CellPath { val, internal_span } => f
+                    .debug_struct("CellPath")
+                    .field("val", val)
+                    .field("internal_span", internal_span)
+                    .finish(),
+                Self::Custom { val, internal_span } => f
+                    .debug_struct("Custom")
+                    .field("val", val)
+                    .field("internal_span", internal_span)
+                    .finish(),
+                Self::Nothing { internal_span } => f
+                    .debug_struct("Nothing")
+                    .field("internal_span", internal_span)
+                    .finish(),
+            };
+        };
+
+        match self {
+            Value::Bool { val, .. } => wrap_tuple("Bool", val).fmt(f),
+            Value::Int { val, .. } => wrap_tuple("Int", val).fmt(f),
+            Value::Float { val, .. } => wrap_tuple("Float", val).fmt(f),
+            Value::String { val, .. } => wrap_tuple("String", val).fmt(f),
+            Value::Glob { val, no_expand, .. } => wrap_tuple(
+                "Glob",
+                fmt::from_fn(|f| {
+                    Debug::fmt(val, f)?;
+                    if *no_expand {
+                        write!(f, "!")?;
+                    }
+                    Ok(())
+                }),
+            )
+            .fmt(f),
+            Value::Filesize { val, .. } => wrap_tuple("Filesize", display_as_debug(val)).fmt(f),
+            Value::Duration { val, .. } => wrap_tuple(
+                "Duration",
+                display_as_debug(humantime::Duration::from(std::time::Duration::from_nanos(
+                    *val as u64,
+                ))),
+            )
+            .fmt(f),
+            Value::Date { val, .. } => wrap_tuple("Date", val).fmt(f),
+            Value::Range { val, .. } => wrap_tuple("Range", display_as_debug(val)).fmt(f),
+            Value::Record { val, .. } => wrap_tuple("Record", val).fmt(f),
+            Value::List { vals, .. } => wrap_tuple("List", vals).fmt(f),
+            Value::Closure { val, .. } => wrap_tuple("Closure", val.compact_debug()).fmt(f),
+            Value::Error { error, .. } => wrap_tuple("Error", error).fmt(f),
+            Value::Binary { val, .. } => wrap_tuple("Binary", BStr::new(val.as_slice())).fmt(f),
+            Value::CellPath { val, .. } => wrap_tuple("CellPath", display_as_debug(val)).fmt(f),
+            Value::Custom { val, .. } => wrap_tuple("Custom", val).fmt(f),
+            Value::Nothing { .. } => write!(f, "Nothing"),
+        }
+    }
 }
 
 // This is to document/enforce the size of `Value` in bytes.
@@ -276,6 +462,14 @@ impl Clone for Value {
             Value::Custom { val, internal_span } => val.clone_value(*internal_span),
         }
     }
+}
+
+/// Describes the type of mutation to perform when traversing a cell path.
+pub enum CellPathMutation {
+    Upsert,
+    Update,
+    Insert { head_span: Span },
+    Remove { member: PathMember },
 }
 
 impl Value {
@@ -527,7 +721,7 @@ impl Value {
             Value::Float { val, .. } => Ok(val.to_string()),
             Value::String { val, .. } => Ok(val),
             Value::Glob { val, .. } => Ok(val),
-            Value::Binary { val, .. } => match String::from_utf8(val) {
+            Value::Binary { val, .. } => match String::from_utf8(val.into_owned()) {
                 Ok(s) => Ok(s),
                 Err(err) => Value::binary(err.into_bytes(), span).cant_convert_to("string"),
             },
@@ -592,7 +786,7 @@ impl Value {
     /// Unwraps the inner list `Vec` or returns an error if this `Value` is not a list
     pub fn into_list(self) -> Result<Vec<Value>, ShellError> {
         if let Value::List { vals, .. } = self {
-            Ok(vals)
+            Ok(vals.into_owned())
         } else {
             self.cant_convert_to("list")
         }
@@ -628,7 +822,7 @@ impl Value {
     /// Unwraps the inner binary `Vec` or returns an error if this `Value` is not a binary value
     pub fn into_binary(self) -> Result<Vec<u8>, ShellError> {
         if let Value::Binary { val, .. } = self {
-            Ok(val)
+            Ok(val.into_owned())
         } else {
             self.cant_convert_to("binary")
         }
@@ -677,7 +871,7 @@ impl Value {
     /// ```
     pub fn coerce_into_binary(self) -> Result<Vec<u8>, ShellError> {
         match self {
-            Value::Binary { val, .. } => Ok(val),
+            Value::Binary { val, .. } => Ok(val.into_owned()),
             Value::String { val, .. } => Ok(val.into_bytes()),
             val => val.cant_convert_to("binary"),
         }
@@ -833,64 +1027,27 @@ impl Value {
         }
     }
 
-    /// Determine of the [`Value`] is a [subtype](https://en.wikipedia.org/wiki/Subtyping) of `other`
-    ///
-    /// If you have a [`Value`], this method should always be used over chaining [`Value::get_type`] with [`Type::is_subtype_of`](crate::Type::is_subtype_of).
-    ///
-    /// This method is able to leverage that information encoded in a `Value` to provide more accurate
-    /// type comparison than if one were to collect the type into [`Type`](crate::Type) value with [`Value::get_type`].
-    ///
-    /// Empty lists are considered subtypes of all `list<T>` types.
-    ///
-    /// Lists of mixed records where some column is present in all record is a subtype of `table<column>`.
-    /// For example, `[{a: 1, b: 2}, {a: 1}]` is a subtype of `table<a: int>` (but not `table<a: int, b: int>`).
-    ///
-    /// See also: [`PipelineData::is_subtype_of`](crate::PipelineData::is_subtype_of)
-    pub fn is_subtype_of(&self, other: &Type) -> bool {
-        // records are structurally typed
-        let record_compatible = |val: &Value, other: &[(String, Type)]| match val {
-            Value::Record { val, .. } => other
-                .iter()
-                .all(|(key, ty)| val.get(key).is_some_and(|inner| inner.is_subtype_of(ty))),
-            _ => false,
-        };
-
-        // All cases matched explicitly to ensure this does not accidentally allocate `Type` if any composite types are introduced in the future
-        match (self, other) {
-            (_, Type::Any) => true,
-            (val, Type::OneOf(types)) => types.iter().any(|t| val.is_subtype_of(t)),
-
-            // `Type` allocation for scalar types is trivial
-            (
-                Value::Bool { .. }
-                | Value::Int { .. }
-                | Value::Float { .. }
-                | Value::String { .. }
-                | Value::Glob { .. }
-                | Value::Filesize { .. }
-                | Value::Duration { .. }
-                | Value::Date { .. }
-                | Value::Range { .. }
-                | Value::Closure { .. }
-                | Value::Error { .. }
-                | Value::Binary { .. }
-                | Value::CellPath { .. }
-                | Value::Nothing { .. },
-                _,
-            ) => self.get_type().is_subtype_of(other),
-
-            // matching composite types
-            (val @ Value::Record { .. }, Type::Record(inner)) => record_compatible(val, inner),
-            (Value::List { vals, .. }, Type::List(inner)) => {
-                vals.iter().all(|val| val.is_subtype_of(inner))
-            }
-            (Value::List { vals, .. }, Type::Table(inner)) => {
-                vals.iter().all(|val| record_compatible(val, inner))
-            }
-            (Value::Custom { val, .. }, Type::Custom(inner)) => val.type_name() == **inner,
-
-            // non-matching composite types
-            (Value::Record { .. } | Value::List { .. } | Value::Custom { .. }, _) => false,
+    /// Get the type of the current Value, without inner type specification of lists, tables and
+    /// records
+    pub fn get_type_shallow(&self) -> Type {
+        match self {
+            Value::Bool { .. } => Type::Bool,
+            Value::Int { .. } => Type::Int,
+            Value::Float { .. } => Type::Float,
+            Value::Filesize { .. } => Type::Filesize,
+            Value::Duration { .. } => Type::Duration,
+            Value::Date { .. } => Type::Date,
+            Value::Range { .. } => Type::Range,
+            Value::String { .. } => Type::String,
+            Value::Glob { .. } => Type::Glob,
+            Value::Record { .. } => Type::record(),
+            Value::List { .. } => Type::list(Type::Any),
+            Value::Nothing { .. } => Type::Nothing,
+            Value::Closure { .. } => Type::Closure,
+            Value::Error { .. } => Type::Error,
+            Value::Binary { .. } => Type::Binary,
+            Value::CellPath { .. } => Type::CellPath,
+            Value::Custom { val, .. } => Type::Custom(val.type_name().into()),
         }
     }
 
@@ -924,20 +1081,9 @@ impl Value {
         Tz::Offset: Display,
     {
         let mut formatter_buf = String::new();
-        let locale = if let Ok(l) =
-            std::env::var(LOCALE_OVERRIDE_ENV_VAR).or_else(|_| std::env::var("LC_TIME"))
-        {
-            let locale_str = l.split('.').next().unwrap_or("en_US");
-            locale_str.try_into().unwrap_or(Locale::en_US)
-        } else {
-            // LC_ALL > LC_CTYPE > LANG else en_US
-            get_system_locale_string()
-                .map(|l| l.replace('-', "_")) // `chrono::Locale` needs something like `xx_xx`, rather than `xx-xx`
-                .unwrap_or_else(|| String::from("en_US"))
-                .as_str()
-                .try_into()
-                .unwrap_or(Locale::en_US)
-        };
+        let locale = get_locale_from_env_vars(Some("LC_TIME"), |name| std::env::var(name).ok())
+            .and_then(|s| s.as_ref().try_into().ok())
+            .unwrap_or(Locale::en_US);
         let format = date_time.format_localized(formatter, locale);
 
         match formatter_buf.write_fmt(format_args!("{format}")) {
@@ -958,7 +1104,7 @@ impl Value {
             Value::Int { val, .. } => val.to_string(),
             Value::Float { val, .. } => ObviousFloat(*val).to_string(),
             Value::Filesize { val, .. } => config.filesize.format(*val).to_string(),
-            Value::Duration { val, .. } => format_duration(*val),
+            Value::Duration { val, .. } => format_duration(*val, config.duration_max_unit),
             Value::Date { val, .. } => match &config.datetime_format.normal {
                 Some(format) => self.format_datetime(val, format),
                 None => {
@@ -1088,10 +1234,10 @@ impl Value {
                         Value::string(val.escape_unicode().to_string(), self.span())
                     )
                 } else {
-                    format!("{self:#?}")
+                    format!("{self:-#?}")
                 }
             }
-            _ => format!("{self:#?}"),
+            _ => format!("{self:-#?}"),
         }
     }
 
@@ -1234,95 +1380,7 @@ impl Value {
         cell_path: &[PathMember],
         new_val: Value,
     ) -> Result<(), ShellError> {
-        let v_span = self.span();
-        if let Some((member, path)) = cell_path.split_first() {
-            match member {
-                PathMember::String {
-                    val: col_name,
-                    span,
-                    casing,
-                    ..
-                } => match self {
-                    Value::List { vals, .. } => {
-                        if let Some(new_cell_path) = Self::try_put_int_path_member_on_top(cell_path)
-                        {
-                            self.upsert_data_at_cell_path(&new_cell_path, new_val.clone())?;
-                        } else {
-                            for val in vals.iter_mut() {
-                                match val {
-                                    Value::Record { val: record, .. } => {
-                                        let record = record.to_mut();
-                                        if let Some(val) =
-                                            record.cased_mut(*casing).get_mut(col_name)
-                                        {
-                                            val.upsert_data_at_cell_path(path, new_val.clone())?;
-                                        } else {
-                                            let new_col = Value::with_data_at_cell_path(
-                                                path,
-                                                new_val.clone(),
-                                            )?;
-                                            record.push(col_name, new_col);
-                                        }
-                                    }
-                                    Value::Error { error, .. } => return Err(*error.clone()),
-                                    v => {
-                                        return Err(ShellError::CantFindColumn {
-                                            col_name: col_name.clone(),
-                                            span: Some(*span),
-                                            src_span: v.span(),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Value::Record { val: record, .. } => {
-                        let record = record.to_mut();
-                        if let Some(val) = record.cased_mut(*casing).get_mut(col_name) {
-                            val.upsert_data_at_cell_path(path, new_val)?;
-                        } else {
-                            let new_col = Value::with_data_at_cell_path(path, new_val.clone())?;
-                            record.push(col_name, new_col);
-                        }
-                    }
-                    Value::Error { error, .. } => return Err(*error.clone()),
-                    v => {
-                        return Err(ShellError::CantFindColumn {
-                            col_name: col_name.clone(),
-                            span: Some(*span),
-                            src_span: v.span(),
-                        });
-                    }
-                },
-                PathMember::Int {
-                    val: row_num, span, ..
-                } => match self {
-                    Value::List { vals, .. } => {
-                        if let Some(v) = vals.get_mut(*row_num) {
-                            v.upsert_data_at_cell_path(path, new_val)?;
-                        } else if vals.len() != *row_num {
-                            return Err(ShellError::InsertAfterNextFreeIndex {
-                                available_idx: vals.len(),
-                                span: *span,
-                            });
-                        } else {
-                            // If the upsert is at 1 + the end of the list, it's OK.
-                            vals.push(Value::with_data_at_cell_path(path, new_val)?);
-                        }
-                    }
-                    Value::Error { error, .. } => return Err(*error.clone()),
-                    _ => {
-                        return Err(ShellError::NotAList {
-                            dst_span: *span,
-                            src_span: v_span,
-                        });
-                    }
-                },
-            }
-        } else {
-            *self = new_val;
-        }
-        Ok(())
+        self.mutate_data_at_cell_path(cell_path, new_val, &CellPathMutation::Upsert)
     }
 
     /// Follow a given cell path into the value: for example accessing select elements in a stream or list
@@ -1344,38 +1402,219 @@ impl Value {
         cell_path: &[PathMember],
         new_val: Value,
     ) -> Result<(), ShellError> {
+        self.mutate_data_at_cell_path(cell_path, new_val, &CellPathMutation::Update)
+    }
+
+    pub fn remove_data_at_cell_path(&mut self, cell_path: &[PathMember]) -> Result<(), ShellError> {
+        let Some((member, path)) = cell_path.split_last() else {
+            return Ok(());
+        };
+        self.mutate_data_at_cell_path(
+            path,
+            Value::nothing(Span::unknown()),
+            &CellPathMutation::Remove {
+                member: member.clone(),
+            },
+        )
+    }
+
+    pub fn insert_data_at_cell_path(
+        &mut self,
+        cell_path: &[PathMember],
+        new_val: Value,
+        head_span: Span,
+    ) -> Result<(), ShellError> {
+        self.mutate_data_at_cell_path(cell_path, new_val, &CellPathMutation::Insert { head_span })
+    }
+
+    /// Leaf operation for `CellPathMutation::Remove`
+    fn remove_member(&mut self, member: &PathMember) -> Result<(), ShellError> {
         let v_span = self.span();
-        if let Some((member, path)) = cell_path.split_first() {
-            match member {
-                PathMember::String {
-                    val: col_name,
-                    span,
-                    casing,
-                    optional,
-                } => match self {
-                    Value::List { vals, .. } => {
-                        if let Some(new_cell_path) = Self::try_put_int_path_member_on_top(cell_path)
-                        {
-                            self.upsert_data_at_cell_path(&new_cell_path, new_val.clone())?;
-                        } else {
-                            for val in vals.iter_mut() {
-                                let v_span = val.span();
-                                match val {
-                                    Value::Record { val: record, .. } => {
-                                        if let Some(val) =
-                                            record.to_mut().cased_mut(*casing).get_mut(col_name)
-                                        {
-                                            val.update_data_at_cell_path(path, new_val.clone())?;
-                                        } else if !*optional {
-                                            return Err(ShellError::CantFindColumn {
-                                                col_name: col_name.clone(),
-                                                span: Some(*span),
-                                                src_span: v_span,
-                                            });
-                                        }
+        match member {
+            PathMember::String {
+                val: col_name,
+                span,
+                optional,
+                casing,
+            } => match self {
+                Value::List { vals, .. } => {
+                    for val in vals.to_mut() {
+                        let v_span = val.span();
+                        match val {
+                            Value::Record { val: record, .. } => {
+                                let value = record.to_mut().cased_mut(*casing).remove(col_name);
+                                if value.is_none() && !optional {
+                                    return Err(ShellError::CantFindColumn {
+                                        col_name: col_name.clone(),
+                                        span: Some(*span),
+                                        src_span: v_span,
+                                    });
+                                }
+                            }
+                            v => {
+                                return Err(ShellError::CantFindColumn {
+                                    col_name: col_name.clone(),
+                                    span: Some(*span),
+                                    src_span: v.span(),
+                                });
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                Value::Record { val: record, .. } => {
+                    if record
+                        .to_mut()
+                        .cased_mut(*casing)
+                        .remove(col_name)
+                        .is_none()
+                        && !optional
+                    {
+                        return Err(ShellError::CantFindColumn {
+                            col_name: col_name.clone(),
+                            span: Some(*span),
+                            src_span: v_span,
+                        });
+                    }
+                    Ok(())
+                }
+                v => Err(ShellError::CantFindColumn {
+                    col_name: col_name.clone(),
+                    span: Some(*span),
+                    src_span: v.span(),
+                }),
+            },
+            PathMember::Int {
+                val: row_num,
+                span,
+                optional,
+            } => match self {
+                Value::List { vals, .. } => {
+                    if *row_num < vals.len() {
+                        vals.to_mut().remove(*row_num);
+                        Ok(())
+                    } else if *optional {
+                        Ok(())
+                    } else if vals.is_empty() {
+                        Err(ShellError::AccessEmptyContent { span: *span })
+                    } else {
+                        Err(ShellError::AccessBeyondEnd {
+                            max_idx: vals.len() - 1,
+                            span: *span,
+                        })
+                    }
+                }
+                v => Err(ShellError::NotAList {
+                    dst_span: *span,
+                    src_span: v.span(),
+                }),
+            },
+        }
+    }
+
+    fn mutate_record_at_string_member(
+        record: &mut Record,
+        member: &PathMember,
+        src_span: Span,
+        path: &[PathMember],
+        new_val: Value,
+        action: &CellPathMutation,
+    ) -> Result<(), ShellError> {
+        let PathMember::String {
+            val: col_name,
+            span,
+            casing,
+            optional,
+        } = member
+        else {
+            return Err(ShellError::NushellFailed {
+                msg: "mutate_record_at_string_member called with non-String PathMember".into(),
+            });
+        };
+        if let Some(val) = record.cased_mut(*casing).get_mut(col_name) {
+            if path.is_empty() && matches!(action, CellPathMutation::Insert { .. }) {
+                return Err(ShellError::ColumnAlreadyExists {
+                    col_name: col_name.to_owned(),
+                    span: *span,
+                    src_span,
+                });
+            }
+            val.mutate_data_at_cell_path(path, new_val, action)
+        } else {
+            match action {
+                CellPathMutation::Update | CellPathMutation::Remove { .. } => {
+                    if !optional {
+                        return Err(ShellError::CantFindColumn {
+                            col_name: col_name.to_owned(),
+                            span: Some(*span),
+                            src_span,
+                        });
+                    }
+                    Ok(())
+                }
+                _ => {
+                    let new_col = Value::with_data_at_cell_path(path, new_val)?;
+                    record.push(col_name, new_col);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    pub fn mutate_data_at_cell_path(
+        &mut self,
+        cell_path: &[PathMember],
+        new_val: Value,
+        action: &CellPathMutation,
+    ) -> Result<(), ShellError> {
+        let v_span = self.span();
+        let Some((member, path)) = cell_path.split_first() else {
+            match action {
+                CellPathMutation::Remove { member } => return self.remove_member(member),
+                _ => {
+                    *self = new_val;
+                    return Ok(());
+                }
+            }
+        };
+
+        match member {
+            PathMember::String {
+                val: col_name,
+                span,
+                optional,
+                ..
+            } => match self {
+                Value::List { vals, .. } => {
+                    if !matches!(action, CellPathMutation::Remove { .. })
+                        && let Some(new_cell_path) = Self::try_put_int_path_member_on_top(cell_path)
+                    {
+                        self.mutate_data_at_cell_path(&new_cell_path, new_val.clone(), action)?;
+                    } else {
+                        for val in vals.to_mut() {
+                            let v_span = val.span();
+                            match val {
+                                Value::Record { val: record, .. } => {
+                                    Self::mutate_record_at_string_member(
+                                        record.to_mut(),
+                                        member,
+                                        v_span,
+                                        path,
+                                        new_val.clone(),
+                                        action,
+                                    )?;
+                                }
+                                Value::Error { error, .. } => return Err(*error.clone()),
+                                v => match action {
+                                    CellPathMutation::Insert { head_span } => {
+                                        return Err(ShellError::UnsupportedInput {
+                                            msg: "expected table or record".into(),
+                                            input: format!("input type: {:?}", v.get_type()),
+                                            msg_span: *head_span,
+                                            input_span: *span,
+                                        });
                                     }
-                                    Value::Error { error, .. } => return Err(*error.clone()),
-                                    v => {
+                                    CellPathMutation::Update | CellPathMutation::Remove { .. } => {
                                         if !*optional {
                                             return Err(ShellError::CantFindColumn {
                                                 col_name: col_name.clone(),
@@ -1384,23 +1623,47 @@ impl Value {
                                             });
                                         }
                                     }
-                                }
+                                    CellPathMutation::Upsert => {
+                                        return Err(ShellError::CantFindColumn {
+                                            col_name: col_name.clone(),
+                                            span: Some(*span),
+                                            src_span: v.span(),
+                                        });
+                                    }
+                                },
                             }
                         }
                     }
-                    Value::Record { val: record, .. } => {
-                        if let Some(val) = record.to_mut().cased_mut(*casing).get_mut(col_name) {
-                            val.update_data_at_cell_path(path, new_val)?;
-                        } else if !*optional {
-                            return Err(ShellError::CantFindColumn {
-                                col_name: col_name.clone(),
-                                span: Some(*span),
-                                src_span: v_span,
-                            });
-                        }
+                }
+                Value::Record { val: record, .. } => {
+                    Self::mutate_record_at_string_member(
+                        record.to_mut(),
+                        member,
+                        v_span,
+                        path,
+                        new_val,
+                        action,
+                    )?;
+                }
+                Value::Error { error, .. } => return Err(*error.clone()),
+                Value::Custom { val, .. } => {
+                    let mut full_path = vec![member.clone()];
+                    full_path.extend(path.iter().cloned());
+                    let result =
+                        val.update_data_at_cell_path(&full_path, new_val, action, v_span)?;
+                    *self = result;
+                    return Ok(());
+                }
+                v => match action {
+                    CellPathMutation::Insert { head_span } => {
+                        return Err(ShellError::UnsupportedInput {
+                            msg: "table or record".into(),
+                            input: format!("input type: {:?}", v.get_type()),
+                            msg_span: *head_span,
+                            input_span: *span,
+                        });
                     }
-                    Value::Error { error, .. } => return Err(*error.clone()),
-                    v => {
+                    CellPathMutation::Update | CellPathMutation::Remove { .. } => {
                         if !*optional {
                             return Err(ShellError::CantFindColumn {
                                 col_name: col_name.clone(),
@@ -1409,330 +1672,72 @@ impl Value {
                             });
                         }
                     }
-                },
-                PathMember::Int {
-                    val: row_num,
-                    span,
-                    optional,
-                } => match self {
-                    Value::List { vals, .. } => {
-                        if let Some(v) = vals.get_mut(*row_num) {
-                            v.update_data_at_cell_path(path, new_val)?;
-                        } else if !*optional {
-                            if vals.is_empty() {
-                                return Err(ShellError::AccessEmptyContent { span: *span });
-                            } else {
-                                return Err(ShellError::AccessBeyondEnd {
-                                    max_idx: vals.len() - 1,
-                                    span: *span,
-                                });
-                            }
-                        }
-                    }
-                    Value::Error { error, .. } => return Err(*error.clone()),
-                    v => {
-                        return Err(ShellError::NotAList {
-                            dst_span: *span,
-                            src_span: v.span(),
-                        });
-                    }
-                },
-            }
-        } else {
-            *self = new_val;
-        }
-        Ok(())
-    }
-
-    pub fn remove_data_at_cell_path(&mut self, cell_path: &[PathMember]) -> Result<(), ShellError> {
-        match cell_path {
-            [] => Ok(()),
-            [member] => {
-                let v_span = self.span();
-                match member {
-                    PathMember::String {
-                        val: col_name,
-                        span,
-                        optional,
-                        casing,
-                    } => match self {
-                        Value::List { vals, .. } => {
-                            for val in vals.iter_mut() {
-                                let v_span = val.span();
-                                match val {
-                                    Value::Record { val: record, .. } => {
-                                        let value =
-                                            record.to_mut().cased_mut(*casing).remove(col_name);
-                                        if value.is_none() && !optional {
-                                            return Err(ShellError::CantFindColumn {
-                                                col_name: col_name.clone(),
-                                                span: Some(*span),
-                                                src_span: v_span,
-                                            });
-                                        }
-                                    }
-                                    v => {
-                                        return Err(ShellError::CantFindColumn {
-                                            col_name: col_name.clone(),
-                                            span: Some(*span),
-                                            src_span: v.span(),
-                                        });
-                                    }
-                                }
-                            }
-                            Ok(())
-                        }
-                        Value::Record { val: record, .. } => {
-                            if record
-                                .to_mut()
-                                .cased_mut(*casing)
-                                .remove(col_name)
-                                .is_none()
-                                && !optional
-                            {
-                                return Err(ShellError::CantFindColumn {
-                                    col_name: col_name.clone(),
-                                    span: Some(*span),
-                                    src_span: v_span,
-                                });
-                            }
-                            Ok(())
-                        }
-                        v => Err(ShellError::CantFindColumn {
+                    CellPathMutation::Upsert => {
+                        return Err(ShellError::CantFindColumn {
                             col_name: col_name.clone(),
                             span: Some(*span),
                             src_span: v.span(),
-                        }),
-                    },
-                    PathMember::Int {
-                        val: row_num,
-                        span,
-                        optional,
-                    } => match self {
-                        Value::List { vals, .. } => {
-                            if vals.get_mut(*row_num).is_some() {
-                                vals.remove(*row_num);
-                                Ok(())
-                            } else if *optional {
-                                Ok(())
-                            } else if vals.is_empty() {
-                                Err(ShellError::AccessEmptyContent { span: *span })
-                            } else {
-                                Err(ShellError::AccessBeyondEnd {
-                                    max_idx: vals.len() - 1,
-                                    span: *span,
-                                })
-                            }
-                        }
-                        v => Err(ShellError::NotAList {
-                            dst_span: *span,
-                            src_span: v.span(),
-                        }),
-                    },
-                }
-            }
-            [member, path @ ..] => {
-                let v_span = self.span();
-                match member {
-                    PathMember::String {
-                        val: col_name,
-                        span,
-                        optional,
-                        casing,
-                    } => match self {
-                        Value::List { vals, .. } => {
-                            for val in vals.iter_mut() {
-                                let v_span = val.span();
-                                match val {
-                                    Value::Record { val: record, .. } => {
-                                        let val =
-                                            record.to_mut().cased_mut(*casing).get_mut(col_name);
-                                        if let Some(val) = val {
-                                            val.remove_data_at_cell_path(path)?;
-                                        } else if !optional {
-                                            return Err(ShellError::CantFindColumn {
-                                                col_name: col_name.clone(),
-                                                span: Some(*span),
-                                                src_span: v_span,
-                                            });
-                                        }
-                                    }
-                                    v => {
-                                        return Err(ShellError::CantFindColumn {
-                                            col_name: col_name.clone(),
-                                            span: Some(*span),
-                                            src_span: v.span(),
-                                        });
-                                    }
-                                }
-                            }
-                            Ok(())
-                        }
-                        Value::Record { val: record, .. } => {
-                            if let Some(val) = record.to_mut().cased_mut(*casing).get_mut(col_name)
-                            {
-                                val.remove_data_at_cell_path(path)?;
-                            } else if !optional {
-                                return Err(ShellError::CantFindColumn {
-                                    col_name: col_name.clone(),
-                                    span: Some(*span),
-                                    src_span: v_span,
-                                });
-                            }
-                            Ok(())
-                        }
-                        v => Err(ShellError::CantFindColumn {
-                            col_name: col_name.clone(),
-                            span: Some(*span),
-                            src_span: v.span(),
-                        }),
-                    },
-                    PathMember::Int {
-                        val: row_num,
-                        span,
-                        optional,
-                    } => match self {
-                        Value::List { vals, .. } => {
-                            if let Some(v) = vals.get_mut(*row_num) {
-                                v.remove_data_at_cell_path(path)
-                            } else if *optional {
-                                Ok(())
-                            } else if vals.is_empty() {
-                                Err(ShellError::AccessEmptyContent { span: *span })
-                            } else {
-                                Err(ShellError::AccessBeyondEnd {
-                                    max_idx: vals.len() - 1,
-                                    span: *span,
-                                })
-                            }
-                        }
-                        v => Err(ShellError::NotAList {
-                            dst_span: *span,
-                            src_span: v.span(),
-                        }),
-                    },
-                }
-            }
-        }
-    }
-    pub fn insert_data_at_cell_path(
-        &mut self,
-        cell_path: &[PathMember],
-        new_val: Value,
-        head_span: Span,
-    ) -> Result<(), ShellError> {
-        let v_span = self.span();
-        if let Some((member, path)) = cell_path.split_first() {
-            match member {
-                PathMember::String {
-                    val: col_name,
-                    span,
-                    casing,
-                    ..
-                } => match self {
-                    Value::List { vals, .. } => {
-                        if let Some(new_cell_path) = Self::try_put_int_path_member_on_top(cell_path)
-                        {
-                            self.upsert_data_at_cell_path(&new_cell_path, new_val.clone())?;
+                        });
+                    }
+                },
+            },
+            PathMember::Int {
+                val: row_num,
+                span,
+                optional,
+            } => match self {
+                Value::List { vals, .. } => {
+                    if *row_num < vals.len() {
+                        let vals = vals.to_mut();
+                        let v = &mut vals[*row_num];
+                        if path.is_empty() && matches!(action, CellPathMutation::Insert { .. }) {
+                            vals.insert(*row_num, new_val);
                         } else {
-                            for val in vals.iter_mut() {
-                                let v_span = val.span();
-                                match val {
-                                    Value::Record { val: record, .. } => {
-                                        let record = record.to_mut();
-                                        if let Some(val) =
-                                            record.cased_mut(*casing).get_mut(col_name)
-                                        {
-                                            if path.is_empty() {
-                                                return Err(ShellError::ColumnAlreadyExists {
-                                                    col_name: col_name.clone(),
-                                                    span: *span,
-                                                    src_span: v_span,
-                                                });
-                                            } else {
-                                                val.insert_data_at_cell_path(
-                                                    path,
-                                                    new_val.clone(),
-                                                    head_span,
-                                                )?;
-                                            }
-                                        } else {
-                                            let new_col = Value::with_data_at_cell_path(
-                                                path,
-                                                new_val.clone(),
-                                            )?;
-                                            record.push(col_name, new_col);
-                                        }
-                                    }
-                                    Value::Error { error, .. } => return Err(*error.clone()),
-                                    _ => {
-                                        return Err(ShellError::UnsupportedInput {
-                                            msg: "expected table or record".into(),
-                                            input: format!("input type: {:?}", val.get_type()),
-                                            msg_span: head_span,
-                                            input_span: *span,
+                            v.mutate_data_at_cell_path(path, new_val, action)?;
+                        }
+                    } else {
+                        match action {
+                            CellPathMutation::Upsert | CellPathMutation::Insert { .. } => {
+                                if vals.len() != *row_num {
+                                    return Err(ShellError::InsertAfterNextFreeIndex {
+                                        available_idx: vals.len(),
+                                        span: *span,
+                                    });
+                                }
+                                vals.to_mut()
+                                    .push(Value::with_data_at_cell_path(path, new_val)?);
+                            }
+                            CellPathMutation::Update | CellPathMutation::Remove { .. } => {
+                                if !*optional {
+                                    if vals.is_empty() {
+                                        return Err(ShellError::AccessEmptyContent { span: *span });
+                                    } else {
+                                        return Err(ShellError::AccessBeyondEnd {
+                                            max_idx: vals.len() - 1,
+                                            span: *span,
                                         });
                                     }
                                 }
                             }
                         }
                     }
-                    Value::Record { val: record, .. } => {
-                        let record = record.to_mut();
-                        if let Some(val) = record.cased_mut(*casing).get_mut(col_name) {
-                            if path.is_empty() {
-                                return Err(ShellError::ColumnAlreadyExists {
-                                    col_name: col_name.clone(),
-                                    span: *span,
-                                    src_span: v_span,
-                                });
-                            } else {
-                                val.insert_data_at_cell_path(path, new_val, head_span)?;
-                            }
-                        } else {
-                            let new_col = Value::with_data_at_cell_path(path, new_val)?;
-                            record.push(col_name, new_col);
-                        }
-                    }
-                    other => {
-                        return Err(ShellError::UnsupportedInput {
-                            msg: "table or record".into(),
-                            input: format!("input type: {:?}", other.get_type()),
-                            msg_span: head_span,
-                            input_span: *span,
-                        });
-                    }
-                },
-                PathMember::Int {
-                    val: row_num, span, ..
-                } => match self {
-                    Value::List { vals, .. } => {
-                        if let Some(v) = vals.get_mut(*row_num) {
-                            if path.is_empty() {
-                                vals.insert(*row_num, new_val);
-                            } else {
-                                v.insert_data_at_cell_path(path, new_val, head_span)?;
-                            }
-                        } else if vals.len() != *row_num {
-                            return Err(ShellError::InsertAfterNextFreeIndex {
-                                available_idx: vals.len(),
-                                span: *span,
-                            });
-                        } else {
-                            // If the insert is at 1 + the end of the list, it's OK.
-                            vals.push(Value::with_data_at_cell_path(path, new_val)?);
-                        }
-                    }
-                    _ => {
-                        return Err(ShellError::NotAList {
-                            dst_span: *span,
-                            src_span: v_span,
-                        });
-                    }
-                },
-            }
-        } else {
-            *self = new_val;
+                }
+                Value::Error { error, .. } => return Err(*error.clone()),
+                Value::Custom { val, .. } => {
+                    let mut full_path = vec![member.clone()];
+                    full_path.extend(path.iter().cloned());
+                    let result =
+                        val.update_data_at_cell_path(&full_path, new_val, action, v_span)?;
+                    *self = result;
+                    return Ok(());
+                }
+                _ => {
+                    return Err(ShellError::NotAList {
+                        dst_span: *span,
+                        src_span: v_span,
+                    });
+                }
+            },
         }
         Ok(())
     }
@@ -1786,6 +1791,7 @@ impl Value {
                 .iter_mut()
                 .try_for_each(|(_, rec_value)| rec_value.recurse_mut(f)),
             Value::List { vals, .. } => vals
+                .to_mut()
                 .iter_mut()
                 .try_for_each(|list_value| list_value.recurse_mut(f)),
             // Closure captures are visited. Maybe these don't have to be if they are changed to
@@ -1959,6 +1965,11 @@ impl Value {
     }
 
     pub fn list(vals: Vec<Value>, span: Span) -> Value {
+        Value::list_shared(SharedCow::new(vals), span)
+    }
+
+    /// Creates a list that retains existing shared storage.
+    pub fn list_shared(vals: SharedCow<Vec<Value>>, span: Span) -> Value {
         Value::List {
             vals,
             signals: None,
@@ -1989,7 +2000,7 @@ impl Value {
 
     pub fn binary(val: impl Into<Vec<u8>>, span: Span) -> Value {
         Value::Binary {
-            val: val.into(),
+            val: SharedCow::new(val.into()),
             internal_span: span,
         }
     }
@@ -2142,6 +2153,17 @@ impl Value {
         ]
     }
 
+    /// Assert that this value is equal to another value.
+    ///
+    /// # Panic
+    /// This function is meant for testing purposes and will panic if these two values are not
+    /// equal.
+    #[track_caller]
+    pub fn assert_eq(&self, other: impl IntoValue) {
+        let other = other.into_value(Span::test_data());
+        assert_eq!(self, &other)
+    }
+
     /// inject signals from engine_state so iterating the value
     /// itself can be interrupted.
     pub fn inject_signals(&mut self, engine_state: &EngineState) {
@@ -2151,6 +2173,64 @@ impl Value {
             }
             _ => (),
         }
+    }
+}
+
+impl CompareTypes<Type> for Value {
+    fn compare_types(&self, other: &Type) -> Option<TypeRelation> {
+        match other {
+            Type::Any => return Some(TypeRelation::Subtype),
+            Type::OneOf(oneof) => {
+                return oneof
+                    .iter()
+                    .any(|ty| self.is_subtype_of(ty))
+                    .then_some(TypeRelation::Subtype);
+            }
+            _ => (),
+        }
+
+        match self {
+            Value::List { vals, .. } => match other {
+                Type::List(ty) if let Type::Any = ty.as_ref() => Some(TypeRelation::Subtype),
+                Type::List(ty) => {
+                    let ty = ty.as_ref();
+                    vals.iter()
+                        .map(|val| val.compare_types(ty))
+                        .try_fold(TypeRelation::Equal, |acc, e| acc.combine(e?))
+                }
+                Type::Table(cols) => vals
+                    .iter()
+                    .map(|val| val.as_record().ok().and_then(|rec| rec.compare_types(cols)))
+                    .try_fold(TypeRelation::Equal, |acc, e| acc.combine(e?)),
+                _ => None,
+            },
+            Value::Record { val, .. } => match other {
+                Type::Record(cols) => val.compare_types(cols),
+                _ => None,
+            },
+            val => val.get_type().compare_types(other),
+        }
+    }
+
+    /// Determine if the [`Value`] is a [subtype](https://en.wikipedia.org/wiki/Subtyping) of `other`
+    ///
+    /// If you have a [`Value`], this method should always be used over chaining [`Value::get_type`] with [`Type::is_subtype_of`].
+    ///
+    /// This method is able to leverage that information encoded in a `Value` to provide more accurate
+    /// type comparison than if one were to collect the type into [`Type`] value with [`Value::get_type`].
+    ///
+    /// Empty lists are considered subtypes of all `list<T>` types.
+    ///
+    /// Lists of mixed records where some column is present in all record is a subtype of `table<column>`.
+    /// For example, `[{a: 1, b: 2}, {a: 1}]` is a subtype of `table<a: int>` (but not `table<a: int, b: int>`).
+    ///
+    /// See also: [`PipelineData::is_subtype_of`](crate::PipelineData::is_subtype_of)
+    // This is identical to this method's default implementation. Written here to attach doccomment.
+    fn is_subtype_of(&self, other: &Type) -> bool {
+        matches!(
+            self.compare_types(other),
+            Some(TypeRelation::Subtype | TypeRelation::Equal)
+        )
     }
 }
 
@@ -3482,7 +3562,16 @@ impl Value {
     pub fn concat(&self, op: Span, rhs: &Value, span: Span) -> Result<Value, ShellError> {
         match (self, rhs) {
             (Value::List { vals: lhs, .. }, Value::List { vals: rhs, .. }) => {
-                Ok(Value::list([lhs.as_slice(), rhs.as_slice()].concat(), span))
+                if lhs.is_empty() {
+                    Ok(Value::list_shared(rhs.clone(), span))
+                } else if rhs.is_empty() {
+                    Ok(Value::list_shared(lhs.clone(), span))
+                } else {
+                    let mut new_vals = Vec::with_capacity(lhs.len() + rhs.len());
+                    new_vals.extend_from_slice(lhs);
+                    new_vals.extend_from_slice(rhs);
+                    Ok(Value::list(new_vals, span))
+                }
             }
             (Value::String { val: lhs, .. }, Value::String { val: rhs, .. }) => {
                 Ok(Value::string([lhs.as_str(), rhs.as_str()].join(""), span))
@@ -3904,33 +3993,8 @@ impl Value {
         let rhs_span = rhs.span();
         match (self, rhs) {
             (Value::String { val: lhs, .. }, Value::String { val: rhs, .. }) => {
-                let is_match = match engine_state.regex_cache.try_lock() {
-                    Ok(mut cache) => {
-                        if let Some(regex) = cache.get(rhs) {
-                            regex.is_match(lhs)
-                        } else {
-                            let regex =
-                                Regex::new(rhs).map_err(|e| ShellError::UnsupportedInput {
-                                    msg: format!("{e}"),
-                                    input: "value originated from here".into(),
-                                    msg_span: span,
-                                    input_span: rhs_span,
-                                })?;
-                            let ret = regex.is_match(lhs);
-                            cache.put(rhs.clone(), regex);
-                            ret
-                        }
-                    }
-                    Err(_) => {
-                        let regex = Regex::new(rhs).map_err(|e| ShellError::UnsupportedInput {
-                            msg: format!("{e}"),
-                            input: "value originated from here".into(),
-                            msg_span: span,
-                            input_span: rhs_span,
-                        })?;
-                        regex.is_match(lhs)
-                    }
-                };
+                let regex = engine_state.compile_regex(rhs, rhs_span)?;
+                let is_match = regex.is_match(lhs);
 
                 Ok(Value::bool(
                     if invert {
@@ -4283,11 +4347,468 @@ pub fn human_time_from_now(val: &DateTime<FixedOffset>) -> HumanTime {
 mod tests {
     use super::{Record, Value};
     use crate::record;
+    use indoc::indoc;
+
+    mod debug {
+        use super::*;
+        use crate::{
+            BlockId, CustomValue, IntRange, Range, ShellError, Span, VarId,
+            ast::{CellPath, PathMember},
+            casing::Casing,
+            engine::Closure,
+        };
+        use chrono::DateTime;
+        use pretty_assertions::assert_eq;
+        use serde::{Deserialize, Serialize};
+        use std::ops::Bound;
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct TinyCustomValue;
+
+        #[typetag::serde]
+        impl CustomValue for TinyCustomValue {
+            fn clone_value(&self, span: Span) -> Value {
+                Value::custom(Box::new(self.clone()), span)
+            }
+
+            fn type_name(&self) -> String {
+                "TinyCustomValue".into()
+            }
+
+            fn to_base_value(&self, span: Span) -> Result<Value, ShellError> {
+                Ok(Value::nothing(span))
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
+            fn as_mut_any(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+        }
+
+        struct DebugFormats {
+            value: Value,
+            expanded: &'static str,
+            expanded_alternate: &'static str,
+            compact: &'static str,
+            compact_alternate: &'static str,
+        }
+
+        impl DebugFormats {
+            #[track_caller]
+            fn assert(&self) {
+                let value = &self.value;
+                assert_eq!(format!("{value:-?}"), self.expanded);
+                assert_eq!(format!("{value:-#?}"), self.expanded_alternate);
+                assert_eq!(format!("{value:?}"), self.compact);
+                assert_eq!(format!("{value:#?}"), self.compact_alternate);
+            }
+        }
+
+        #[test]
+        fn bool() {
+            let value = Value::test_bool(true);
+            DebugFormats {
+                value,
+                expanded: "Bool { val: true, internal_span: Span(TEST) }",
+                expanded_alternate: indoc! {"
+                    Bool {
+                        val: true,
+                        internal_span: Span(TEST),
+                    }"
+                },
+                compact: "Bool(true)",
+                compact_alternate: "Bool(true)",
+            }
+            .assert();
+        }
+
+        #[test]
+        fn int() {
+            let value = Value::test_int(42);
+            DebugFormats {
+                value,
+                expanded: "Int { val: 42, internal_span: Span(TEST) }",
+                expanded_alternate: indoc! {"
+                    Int {
+                        val: 42,
+                        internal_span: Span(TEST),
+                    }"
+                },
+                compact: "Int(42)",
+                compact_alternate: "Int(42)",
+            }
+            .assert();
+        }
+
+        #[test]
+        fn float() {
+            let value = Value::test_float(4.2);
+            DebugFormats {
+                value,
+                expanded: "Float { val: 4.2, internal_span: Span(TEST) }",
+                expanded_alternate: indoc! {"
+                    Float {
+                        val: 4.2,
+                        internal_span: Span(TEST),
+                    }"
+                },
+                compact: "Float(4.2)",
+                compact_alternate: "Float(4.2)",
+            }
+            .assert();
+        }
+
+        #[test]
+        fn filesize() {
+            let value = Value::test_filesize(42);
+            DebugFormats {
+                value,
+                expanded: "Filesize { val: Filesize(42), internal_span: Span(TEST) }",
+                expanded_alternate: indoc! {"
+                    Filesize {
+                        val: Filesize(
+                            42,
+                        ),
+                        internal_span: Span(TEST),
+                    }"
+                },
+                compact: "Filesize(42 B)",
+                compact_alternate: "Filesize(42 B)",
+            }
+            .assert();
+        }
+
+        #[test]
+        fn duration() {
+            let value = Value::test_duration(42);
+            DebugFormats {
+                value,
+                expanded: "Duration { val: 42, internal_span: Span(TEST) }",
+                expanded_alternate: indoc! {"
+                    Duration {
+                        val: 42,
+                        internal_span: Span(TEST),
+                    }"
+                },
+                compact: "Duration(42ns)",
+                compact_alternate: "Duration(42ns)",
+            }
+            .assert();
+        }
+
+        #[test]
+        fn date() {
+            let value = Value::test_date(DateTime::UNIX_EPOCH.into());
+            DebugFormats {
+                value,
+                expanded: "Date { val: 1970-01-01T00:00:00+00:00, internal_span: Span(TEST) }",
+                expanded_alternate: indoc! {"
+                    Date {
+                        val: 1970-01-01T00:00:00+00:00,
+                        internal_span: Span(TEST),
+                    }"
+                },
+                compact: "Date(1970-01-01T00:00:00+00:00)",
+                compact_alternate: "Date(1970-01-01T00:00:00+00:00)",
+            }
+            .assert();
+        }
+
+        #[test]
+        fn range() {
+            let value = Value::test_range(Range::IntRange(IntRange {
+                start: 1,
+                step: 2,
+                end: Bound::Excluded(5),
+            }));
+            DebugFormats {
+                value,
+                expanded: "Range { val: IntRange(IntRange { start: 1, step: 2, end: Excluded(5) }), signals: None, internal_span: Span(TEST) }",
+                expanded_alternate: indoc! {"
+                    Range {
+                        val: IntRange(
+                            IntRange {
+                                start: 1,
+                                step: 2,
+                                end: Excluded(
+                                    5,
+                                ),
+                            },
+                        ),
+                        signals: None,
+                        internal_span: Span(TEST),
+                    }"
+                },
+                compact: "Range(1..3..<5)",
+                compact_alternate: "Range(1..3..<5)",
+            }
+            .assert();
+        }
+
+        #[test]
+        fn string() {
+            let value = Value::test_string("Ellie");
+            DebugFormats {
+                value,
+                expanded: r#"String { val: "Ellie", internal_span: Span(TEST) }"#,
+                expanded_alternate: indoc! {r#"
+                    String {
+                        val: "Ellie",
+                        internal_span: Span(TEST),
+                    }"#
+                },
+                compact: r#"String("Ellie")"#,
+                compact_alternate: r#"String("Ellie")"#,
+            }
+            .assert();
+        }
+
+        #[test]
+        fn glob() {
+            let value = Value::test_glob("*.nu");
+            DebugFormats {
+                value,
+                expanded: r#"Glob { val: "*.nu", no_expand: false, internal_span: Span(TEST) }"#,
+                expanded_alternate: indoc! {r#"
+                    Glob {
+                        val: "*.nu",
+                        no_expand: false,
+                        internal_span: Span(TEST),
+                    }"#
+                },
+                compact: r#"Glob("*.nu")"#,
+                compact_alternate: r#"Glob("*.nu")"#,
+            }
+            .assert();
+        }
+
+        #[test]
+        fn record() {
+            let value = Value::test_record(record!("name" => Value::test_string("Ellie")));
+            DebugFormats {
+                value,
+                expanded: r#"Record { val: {"name": String { val: "Ellie", internal_span: Span(TEST) }}, internal_span: Span(TEST) }"#,
+                expanded_alternate: indoc! {r#"
+                    Record {
+                        val: {
+                            "name": String {
+                                val: "Ellie",
+                                internal_span: Span(TEST),
+                            },
+                        },
+                        internal_span: Span(TEST),
+                    }"#
+                },
+                compact: r#"Record({"name": String("Ellie")})"#,
+                compact_alternate: indoc! {r#"
+                    Record({
+                        "name": String("Ellie"),
+                    })"#
+                },
+            }
+            .assert();
+        }
+
+        #[test]
+        fn list() {
+            let value = Value::test_list(vec![Value::test_int(42), Value::test_string("Ellie")]);
+            DebugFormats {
+                value,
+                expanded: r#"List { vals: [Int { val: 42, internal_span: Span(TEST) }, String { val: "Ellie", internal_span: Span(TEST) }], signals: None, internal_span: Span(TEST) }"#,
+                expanded_alternate: indoc! {r#"
+                    List {
+                        vals: [
+                            Int {
+                                val: 42,
+                                internal_span: Span(TEST),
+                            },
+                            String {
+                                val: "Ellie",
+                                internal_span: Span(TEST),
+                            },
+                        ],
+                        signals: None,
+                        internal_span: Span(TEST),
+                    }"#
+                },
+                compact: r#"List([Int(42), String("Ellie")])"#,
+                compact_alternate: indoc! {r#"
+                    List([
+                        Int(42),
+                        String("Ellie"),
+                    ])"#
+                },
+            }
+            .assert();
+        }
+
+        #[test]
+        fn closure() {
+            let value = Value::test_closure(Closure {
+                block_id: BlockId::new(42),
+                captures: vec![(VarId::new(7), Value::test_int(1))],
+            });
+            DebugFormats {
+                value,
+                expanded: "Closure { val: Closure { block_id: BlockId(42), captures: {VarId(7): Int { val: 1, internal_span: Span(TEST) }} }, internal_span: Span(TEST) }",
+                expanded_alternate: indoc! {"
+                    Closure {
+                        val: Closure {
+                            block_id: BlockId(42),
+                            captures: {
+                                VarId(7): Int {
+                                    val: 1,
+                                    internal_span: Span(TEST),
+                                },
+                            },
+                        },
+                        internal_span: Span(TEST),
+                    }"
+                },
+                compact: "Closure(BlockId(42): {VarId(7): Int(1)})",
+                compact_alternate: indoc! {"
+                    Closure(BlockId(42): {
+                        VarId(7): Int(1),
+                    })"
+                },
+            }
+            .assert();
+        }
+
+        #[test]
+        fn error() {
+            let value = Value::error(
+                ShellError::NushellFailed { msg: "oops".into() },
+                Span::test_data(),
+            );
+            DebugFormats {
+                value,
+                expanded: r#"Error { error: NushellFailed { msg: "oops" }, internal_span: Span(TEST) }"#,
+                expanded_alternate: indoc! {r#"
+                    Error {
+                        error: NushellFailed {
+                            msg: "oops",
+                        },
+                        internal_span: Span(TEST),
+                    }"#
+                },
+                compact: r#"Error(NushellFailed { msg: "oops" })"#,
+                compact_alternate: indoc! {r#"
+                    Error(NushellFailed {
+                        msg: "oops",
+                    })"#
+                },
+            }
+            .assert();
+        }
+
+        #[test]
+        fn binary() {
+            let mut bytes = b"Ellie".to_vec();
+            bytes.extend([0xFF]);
+            let value = Value::test_binary(bytes);
+            DebugFormats {
+                value,
+                expanded: "Binary { val: [69, 108, 108, 105, 101, 255], internal_span: Span(TEST) }",
+                expanded_alternate: indoc! {"
+                    Binary {
+                        val: [
+                            69,
+                            108,
+                            108,
+                            105,
+                            101,
+                            255,
+                        ],
+                        internal_span: Span(TEST),
+                    }"
+                },
+                compact: r#"Binary("Ellie\xff")"#,
+                compact_alternate: r#"Binary("Ellie\xff")"#,
+            }
+            .assert();
+        }
+
+        #[test]
+        fn cell_path() {
+            let value = Value::test_cell_path(CellPath {
+                members: vec![
+                    PathMember::test_string("name", false, Casing::Sensitive),
+                    PathMember::test_int(1, true),
+                ],
+            });
+            DebugFormats {
+                value,
+                expanded: r#"CellPath { val: CellPath { members: [String { val: "name", span: Span(TEST), optional: false, casing: Sensitive }, Int { val: 1, span: Span(TEST), optional: true }] }, internal_span: Span(TEST) }"#,
+                expanded_alternate: indoc! {r#"
+                    CellPath {
+                        val: CellPath {
+                            members: [
+                                String {
+                                    val: "name",
+                                    span: Span(TEST),
+                                    optional: false,
+                                    casing: Sensitive,
+                                },
+                                Int {
+                                    val: 1,
+                                    span: Span(TEST),
+                                    optional: true,
+                                },
+                            ],
+                        },
+                        internal_span: Span(TEST),
+                    }"#
+                },
+                compact: "CellPath($.name.1?)",
+                compact_alternate: "CellPath($.name.1?)",
+            }
+            .assert();
+        }
+
+        #[test]
+        fn nothing() {
+            let value = Value::test_nothing();
+            DebugFormats {
+                value,
+                expanded: "Nothing { internal_span: Span(TEST) }",
+                expanded_alternate: indoc! {"
+                    Nothing {
+                        internal_span: Span(TEST),
+                    }"
+                },
+                compact: "Nothing",
+                compact_alternate: "Nothing",
+            }
+            .assert();
+        }
+
+        #[test]
+        fn custom() {
+            let value = Value::test_custom_value(Box::new(TinyCustomValue));
+            DebugFormats {
+                value,
+                expanded: "Custom { val: TinyCustomValue, internal_span: Span(TEST) }",
+                expanded_alternate: indoc! {"
+                    Custom {
+                        val: TinyCustomValue,
+                        internal_span: Span(TEST),
+                    }"
+                },
+                compact: "Custom(TinyCustomValue)",
+                compact_alternate: "Custom(TinyCustomValue)",
+            }
+            .assert();
+        }
+    }
 
     mod at_cell_path {
         use crate::casing::Casing;
 
-        use crate::{IntoValue, Span};
+        use crate::{IntoValue, ShellError, Span};
 
         use super::super::PathMember;
         use super::*;
@@ -4439,6 +4960,378 @@ mod tests {
                 .into_value(span)
             );
         }
+
+        #[test]
+        fn update_existing_record_field() {
+            let span = Span::test_data();
+            let mut val = record!("a" => Value::test_int(1)).into_value(span);
+            let res = val.update_data_at_cell_path(
+                &[PathMember::test_string("a", false, Casing::Sensitive)],
+                Value::test_int(2),
+            );
+            assert_eq!(res, Ok(()));
+            assert_eq!(val, record!("a" => Value::test_int(2)).into_value(span));
+        }
+
+        #[test]
+        fn update_existing_list_element() {
+            let mut val = Value::test_list(vec![Value::test_int(10), Value::test_int(20)]);
+            let res = val
+                .update_data_at_cell_path(&[PathMember::test_int(1, false)], Value::test_int(99));
+            assert_eq!(res, Ok(()));
+            assert_eq!(
+                val,
+                Value::test_list(vec![Value::test_int(10), Value::test_int(99)])
+            );
+        }
+
+        #[test]
+        fn update_missing_record_field_errors() {
+            let span = Span::test_data();
+            let mut val = record!("a" => Value::test_int(1)).into_value(span);
+            let res = val.update_data_at_cell_path(
+                &[PathMember::test_string("b", false, Casing::Sensitive)],
+                Value::test_int(2),
+            );
+            assert!(matches!(res, Err(ShellError::CantFindColumn { .. })));
+        }
+
+        #[test]
+        fn update_out_of_bounds_list_errors() {
+            let mut val = Value::test_list(vec![Value::test_int(1)]);
+            let res =
+                val.update_data_at_cell_path(&[PathMember::test_int(5, false)], Value::test_int(2));
+            assert!(matches!(res, Err(ShellError::AccessBeyondEnd { .. })));
+        }
+
+        #[test]
+        fn update_empty_list_errors() {
+            let mut val = Value::test_list(vec![]);
+            let res =
+                val.update_data_at_cell_path(&[PathMember::test_int(0, false)], Value::test_int(2));
+            assert!(matches!(res, Err(ShellError::AccessEmptyContent { .. })));
+        }
+
+        #[test]
+        fn update_optional_missing_field_ok() {
+            let span = Span::test_data();
+            let mut val = record!("a" => Value::test_int(1)).into_value(span);
+            let res = val.update_data_at_cell_path(
+                &[PathMember::test_string("z", true, Casing::Sensitive)],
+                Value::test_int(2),
+            );
+            assert_eq!(res, Ok(()));
+            assert_eq!(val, record!("a" => Value::test_int(1)).into_value(span));
+        }
+
+        #[test]
+        fn update_optional_out_of_bounds_ok() {
+            let mut val = Value::test_list(vec![Value::test_int(1)]);
+            let res =
+                val.update_data_at_cell_path(&[PathMember::test_int(5, true)], Value::test_int(2));
+            assert_eq!(res, Ok(()));
+            assert_eq!(val, Value::test_list(vec![Value::test_int(1)]));
+        }
+
+        #[test]
+        fn update_nested_record_field() {
+            let span = Span::test_data();
+            let mut val = record!(
+                "a" => record!("b" => Value::test_int(1)).into_value(span)
+            )
+            .into_value(span);
+            let res = val.update_data_at_cell_path(
+                &[
+                    PathMember::test_string("a", false, Casing::Sensitive),
+                    PathMember::test_string("b", false, Casing::Sensitive),
+                ],
+                Value::test_int(99),
+            );
+            assert_eq!(res, Ok(()));
+            assert_eq!(
+                val,
+                record!(
+                    "a" => record!("b" => Value::test_int(99)).into_value(span)
+                )
+                .into_value(span)
+            );
+        }
+
+        #[test]
+        fn update_in_table() {
+            let span = Span::test_data();
+            let mut val = Value::test_list(vec![
+                record!("x" => Value::test_int(1)).into_value(span),
+                record!("x" => Value::test_int(2)).into_value(span),
+            ]);
+            let res = val.update_data_at_cell_path(
+                &[PathMember::test_string("x", false, Casing::Sensitive)],
+                Value::test_int(0),
+            );
+            assert_eq!(res, Ok(()));
+            assert_eq!(
+                val,
+                Value::test_list(vec![
+                    record!("x" => Value::test_int(0)).into_value(span),
+                    record!("x" => Value::test_int(0)).into_value(span),
+                ])
+            );
+        }
+
+        #[test]
+        fn remove_record_column() {
+            let span = Span::test_data();
+            let mut val =
+                record!("a" => Value::test_int(1), "b" => Value::test_int(2)).into_value(span);
+            let res = val.remove_data_at_cell_path(&[PathMember::test_string(
+                "a",
+                false,
+                Casing::Sensitive,
+            )]);
+            assert_eq!(res, Ok(()));
+            assert_eq!(val, record!("b" => Value::test_int(2)).into_value(span));
+        }
+
+        #[test]
+        fn remove_list_element() {
+            let mut val = Value::test_list(vec![
+                Value::test_int(10),
+                Value::test_int(20),
+                Value::test_int(30),
+            ]);
+            let res = val.remove_data_at_cell_path(&[PathMember::test_int(1, false)]);
+            assert_eq!(res, Ok(()));
+            assert_eq!(
+                val,
+                Value::test_list(vec![Value::test_int(10), Value::test_int(30)])
+            );
+        }
+
+        #[test]
+        fn remove_nested_field() {
+            let span = Span::test_data();
+            let mut val = record!(
+                "a" => record!("b" => Value::test_int(1), "c" => Value::test_int(2)).into_value(span)
+            )
+            .into_value(span);
+            let res = val.remove_data_at_cell_path(&[
+                PathMember::test_string("a", false, Casing::Sensitive),
+                PathMember::test_string("b", false, Casing::Sensitive),
+            ]);
+            assert_eq!(res, Ok(()));
+            assert_eq!(
+                val,
+                record!(
+                    "a" => record!("c" => Value::test_int(2)).into_value(span)
+                )
+                .into_value(span)
+            );
+        }
+
+        #[test]
+        fn remove_column_from_table() {
+            let span = Span::test_data();
+            let mut val = Value::test_list(vec![
+                record!("x" => Value::test_int(1), "y" => Value::test_int(2)).into_value(span),
+                record!("x" => Value::test_int(3), "y" => Value::test_int(4)).into_value(span),
+            ]);
+            let res = val.remove_data_at_cell_path(&[PathMember::test_string(
+                "x",
+                false,
+                Casing::Sensitive,
+            )]);
+            assert_eq!(res, Ok(()));
+            assert_eq!(
+                val,
+                Value::test_list(vec![
+                    record!("y" => Value::test_int(2)).into_value(span),
+                    record!("y" => Value::test_int(4)).into_value(span),
+                ])
+            );
+        }
+
+        #[test]
+        fn upsert_overwrite_existing_record_field() {
+            let span = Span::test_data();
+            let mut val = record!("a" => Value::test_int(1)).into_value(span);
+            let res = val.upsert_data_at_cell_path(
+                &[PathMember::test_string("a", false, Casing::Sensitive)],
+                Value::test_int(99),
+            );
+            assert_eq!(res, Ok(()));
+            assert_eq!(val, record!("a" => Value::test_int(99)).into_value(span));
+        }
+
+        #[test]
+        fn upsert_overwrite_existing_list_element() {
+            let mut val = Value::test_list(vec![Value::test_int(10), Value::test_int(20)]);
+            let res = val
+                .upsert_data_at_cell_path(&[PathMember::test_int(0, false)], Value::test_int(99));
+            assert_eq!(res, Ok(()));
+            assert_eq!(
+                val,
+                Value::test_list(vec![Value::test_int(99), Value::test_int(20)])
+            );
+        }
+
+        #[test]
+        fn upsert_creates_new_record_field() {
+            let span = Span::test_data();
+            let mut val = record!("a" => Value::test_int(1)).into_value(span);
+            let res = val.upsert_data_at_cell_path(
+                &[PathMember::test_string("b", false, Casing::Sensitive)],
+                Value::test_int(2),
+            );
+            assert_eq!(res, Ok(()));
+            assert_eq!(
+                val,
+                record!("a" => Value::test_int(1), "b" => Value::test_int(2)).into_value(span)
+            );
+        }
+
+        #[test]
+        fn upsert_appends_to_list() {
+            let mut val = Value::test_list(vec![Value::test_int(1)]);
+            let res =
+                val.upsert_data_at_cell_path(&[PathMember::test_int(1, false)], Value::test_int(2));
+            assert_eq!(res, Ok(()));
+            assert_eq!(
+                val,
+                Value::test_list(vec![Value::test_int(1), Value::test_int(2)])
+            );
+        }
+
+        #[test]
+        fn upsert_in_table() {
+            let span = Span::test_data();
+            let mut val = Value::test_list(vec![
+                record!("x" => Value::test_int(1)).into_value(span),
+                record!("x" => Value::test_int(2)).into_value(span),
+            ]);
+            let res = val.upsert_data_at_cell_path(
+                &[PathMember::test_string("x", false, Casing::Sensitive)],
+                Value::test_int(0),
+            );
+            assert_eq!(res, Ok(()));
+            assert_eq!(
+                val,
+                Value::test_list(vec![
+                    record!("x" => Value::test_int(0)).into_value(span),
+                    record!("x" => Value::test_int(0)).into_value(span),
+                ])
+            );
+        }
+
+        #[test]
+        fn insert_new_record_field() {
+            let span = Span::test_data();
+            let mut val = record!("a" => Value::test_int(1)).into_value(span);
+            let res = val.insert_data_at_cell_path(
+                &[PathMember::test_string("b", false, Casing::Sensitive)],
+                Value::test_int(2),
+                span,
+            );
+            assert_eq!(res, Ok(()));
+            assert_eq!(
+                val,
+                record!("a" => Value::test_int(1), "b" => Value::test_int(2)).into_value(span)
+            );
+        }
+
+        #[test]
+        fn insert_existing_record_field_errors() {
+            let span = Span::test_data();
+            let mut val = record!("a" => Value::test_int(1)).into_value(span);
+            let res = val.insert_data_at_cell_path(
+                &[PathMember::test_string("a", false, Casing::Sensitive)],
+                Value::test_int(2),
+                span,
+            );
+            assert!(matches!(res, Err(ShellError::ColumnAlreadyExists { .. })));
+        }
+
+        #[test]
+        fn insert_at_existing_list_index_shifts() {
+            let mut val = Value::test_list(vec![Value::test_int(1), Value::test_int(2)]);
+            let span = Span::test_data();
+            let res = val.insert_data_at_cell_path(
+                &[PathMember::test_int(0, false)],
+                Value::test_int(99),
+                span,
+            );
+            assert_eq!(res, Ok(()));
+            assert_eq!(
+                val,
+                Value::test_list(vec![
+                    Value::test_int(99),
+                    Value::test_int(1),
+                    Value::test_int(2),
+                ])
+            );
+        }
+
+        #[test]
+        fn insert_appends_at_end_of_list() {
+            let mut val = Value::test_list(vec![Value::test_int(1)]);
+            let span = Span::test_data();
+            let res = val.insert_data_at_cell_path(
+                &[PathMember::test_int(1, false)],
+                Value::test_int(2),
+                span,
+            );
+            assert_eq!(res, Ok(()));
+            assert_eq!(
+                val,
+                Value::test_list(vec![Value::test_int(1), Value::test_int(2)])
+            );
+        }
+
+        #[test]
+        fn insert_beyond_end_errors() {
+            let mut val = Value::test_list(vec![Value::test_int(1)]);
+            let span = Span::test_data();
+            let res = val.insert_data_at_cell_path(
+                &[PathMember::test_int(5, false)],
+                Value::test_int(2),
+                span,
+            );
+            assert!(matches!(
+                res,
+                Err(ShellError::InsertAfterNextFreeIndex { .. })
+            ));
+        }
+
+        #[test]
+        fn insert_existing_column_in_table_errors() {
+            let span = Span::test_data();
+            let mut val =
+                Value::test_list(vec![record!("x" => Value::test_int(1)).into_value(span)]);
+            let res = val.insert_data_at_cell_path(
+                &[PathMember::test_string("x", false, Casing::Sensitive)],
+                Value::test_int(0),
+                span,
+            );
+            assert!(matches!(res, Err(ShellError::ColumnAlreadyExists { .. })));
+        }
+
+        #[test]
+        fn insert_new_column_in_table() {
+            let span = Span::test_data();
+            let mut val =
+                Value::test_list(vec![record!("x" => Value::test_int(1)).into_value(span)]);
+            let res = val.insert_data_at_cell_path(
+                &[PathMember::test_string("y", false, Casing::Sensitive)],
+                Value::test_int(2),
+                span,
+            );
+            assert_eq!(res, Ok(()));
+            assert_eq!(
+                val,
+                Value::test_list(vec![
+                    record!("x" => Value::test_int(1), "y" => Value::test_int(2)).into_value(span),
+                ])
+            );
+        }
     }
 
     mod is_empty {
@@ -4504,9 +5397,7 @@ mod tests {
             assert_eq!(list_of_floats.get_type(), Type::List(Box::new(Type::Float)));
             assert_eq!(
                 list_of_ints_and_floats_and_bools.get_type(),
-                Type::List(Box::new(Type::OneOf(
-                    vec![Type::Number, Type::Bool].into_boxed_slice()
-                )))
+                Type::List(Box::new(Type::one_of([Type::Number, Type::Bool])))
             );
             assert_eq!(
                 list_of_ints_and_floats.get_type(),
@@ -4516,10 +5407,11 @@ mod tests {
     }
 
     mod is_subtype {
-        use crate::Type;
+        use crate::{CompareTypes, Type};
 
         use super::*;
 
+        #[track_caller]
         fn assert_subtype_equivalent(value: &Value, ty: &Type) {
             assert_eq!(value.is_subtype_of(ty), value.get_type().is_subtype_of(ty));
         }
@@ -4556,11 +5448,16 @@ mod tests {
             assert_subtype_equivalent(&list, &ty_list_list_int);
 
             // The type of an empty lists is a subtype of any list or table type
-            let ty_table = Type::Table(Box::new([
-                ("a".into(), Type::Int),
-                ("b".into(), Type::Int),
-                ("c".into(), Type::Int),
-            ]));
+            let ty_table = {
+                Type::Table(
+                    vec![
+                        ("a".into(), Type::Int),
+                        ("b".into(), Type::Int),
+                        ("c".into(), Type::Int),
+                    ]
+                    .into(),
+                )
+            };
             let empty = Value::test_list(vec![]);
 
             assert_subtype_equivalent(&empty, &ty_any_list);
@@ -4570,13 +5467,18 @@ mod tests {
 
         #[test]
         fn test_record() {
-            let ty_abc = Type::Record(Box::new([
-                ("a".into(), Type::Int),
-                ("b".into(), Type::Int),
-                ("c".into(), Type::Int),
-            ]));
-            let ty_ab = Type::Record(Box::new([("a".into(), Type::Int), ("b".into(), Type::Int)]));
-            let ty_inner = Type::Record(Box::new([("inner".into(), ty_abc.clone())]));
+            let ty_abc = {
+                Type::Record(
+                    vec![
+                        ("a".into(), Type::Int),
+                        ("b".into(), Type::Int),
+                        ("c".into(), Type::Int),
+                    ]
+                    .into(),
+                )
+            };
+            let ty_ab = Type::Record(vec![("a".into(), Type::Int), ("b".into(), Type::Int)].into());
+            let ty_inner = Type::Record(vec![("inner".into(), ty_abc.clone())].into());
 
             let record_abc = Value::test_record(record! {
                 "a" => Value::test_int(1),
@@ -4601,12 +5503,15 @@ mod tests {
 
         #[test]
         fn test_table() {
-            let ty_abc = Type::Table(Box::new([
-                ("a".into(), Type::Int),
-                ("b".into(), Type::Int),
-                ("c".into(), Type::Int),
-            ]));
-            let ty_ab = Type::Table(Box::new([("a".into(), Type::Int), ("b".into(), Type::Int)]));
+            let ty_abc = Type::Table(
+                vec![
+                    ("a".into(), Type::Int),
+                    ("b".into(), Type::Int),
+                    ("c".into(), Type::Int),
+                ]
+                .into(),
+            );
+            let ty_ab = Type::Table(vec![("a".into(), Type::Int), ("b".into(), Type::Int)].into());
             let ty_list_any = Type::list(Type::Any);
 
             let record_abc = Value::test_record(record! {
@@ -4632,7 +5537,7 @@ mod tests {
             assert_subtype_equivalent(&table_mixed, &ty_abc);
             assert!(table_mixed.is_subtype_of(&ty_ab));
 
-            let ty_a = Type::Table(Box::new([("a".into(), Type::Any)]));
+            let ty_a = Type::Table(vec![("a".into(), Type::Any)].into());
             let table_mixed_types = Value::test_list(vec![
                 Value::test_record(record! {
                     "a" => Value::test_int(1),
@@ -4717,6 +5622,112 @@ mod tests {
         assert!(Value::test_glob("*.rs").coerce_bool().is_err());
         assert!(Value::test_binary(vec![1, 2, 3]).coerce_bool().is_err());
         assert!(Value::test_duration(3600).coerce_bool().is_err());
+    }
+
+    mod list {
+        use super::*;
+        use crate::ast::PathMember;
+        use nu_utils::SharedCow;
+
+        #[test]
+        fn clone_shares_data() {
+            let value = Value::test_list(vec![Value::test_int(1), Value::test_int(2)]);
+            let clone = value.clone();
+
+            let (
+                Value::List { vals, .. },
+                Value::List {
+                    vals: cloned_vals, ..
+                },
+            ) = (&value, &clone)
+            else {
+                unreachable!();
+            };
+
+            assert_eq!(SharedCow::ref_count(vals), 2);
+            assert!(std::ptr::eq(vals.as_ptr(), cloned_vals.as_ptr()));
+        }
+
+        #[test]
+        fn mutation_is_copy_on_write() {
+            let value = Value::test_list(vec![Value::test_int(1), Value::test_int(2)]);
+            let mut clone = value.clone();
+
+            clone
+                .upsert_data_at_cell_path(&[PathMember::test_int(0, false)], Value::test_int(3))
+                .unwrap();
+
+            assert_eq!(
+                value.as_list(),
+                Ok([Value::test_int(1), Value::test_int(2)].as_slice())
+            );
+            assert_eq!(
+                clone.as_list(),
+                Ok([Value::test_int(3), Value::test_int(2)].as_slice())
+            );
+        }
+
+        #[test]
+        fn into_list_preserves_shared_value() {
+            let value = Value::test_list(vec![Value::test_int(1), Value::test_int(2)]);
+            let clone = value.clone();
+
+            assert_eq!(
+                clone.into_list(),
+                Ok(vec![Value::test_int(1), Value::test_int(2)])
+            );
+            assert_eq!(
+                value.as_list(),
+                Ok([Value::test_int(1), Value::test_int(2)].as_slice())
+            );
+        }
+    }
+
+    mod binary {
+        use super::*;
+        use nu_utils::SharedCow;
+
+        #[test]
+        fn clone_shares_data() {
+            let value = Value::test_binary(vec![1, 2, 3]);
+            let clone = value.clone();
+
+            let (
+                Value::Binary { val, .. },
+                Value::Binary {
+                    val: cloned_val, ..
+                },
+            ) = (&value, &clone)
+            else {
+                unreachable!();
+            };
+
+            assert_eq!(SharedCow::ref_count(val), 2);
+            assert!(std::ptr::eq(val.as_ptr(), cloned_val.as_ptr()));
+        }
+
+        #[test]
+        fn mutation_is_copy_on_write() {
+            let value = Value::test_binary(vec![1, 2, 3]);
+            let mut clone = value.clone();
+
+            let Value::Binary { val, .. } = &mut clone else {
+                unreachable!();
+            };
+            val.to_mut()[0] = 4;
+
+            assert_eq!(value.as_binary(), Ok([1, 2, 3].as_slice()));
+            assert_eq!(clone.as_binary(), Ok([4, 2, 3].as_slice()));
+        }
+
+        #[test]
+        fn into_binary_preserves_shared_value() {
+            let value = Value::test_binary(vec![1, 2, 3]);
+            let clone = value.clone();
+
+            assert_eq!(clone.into_binary(), Ok(vec![1, 2, 3]));
+            assert_eq!(value.as_binary(), Ok([1, 2, 3].as_slice()));
+        }
     }
 
     mod memory_size {
@@ -4810,6 +5821,54 @@ mod tests {
             // Verify it's larger than a simple list
             let simple_list = Value::test_list(vec![Value::test_int(1)]);
             assert!(record_size > simple_list.memory_size());
+        }
+    }
+
+    mod concat {
+        use super::*;
+        use crate::Span;
+        use pretty_assertions::assert_eq;
+
+        #[test]
+        fn empty_lhs_clones_rhs() {
+            let empty = Value::test_list(vec![]);
+            let rhs = Value::test_list(vec![Value::test_int(1), Value::test_int(2)]);
+            let out = empty
+                .concat(Span::test_data(), &rhs, Span::test_data())
+                .expect("concat");
+            assert_eq!(out, rhs.with_span(Span::test_data()));
+        }
+
+        #[test]
+        fn empty_rhs_clones_lhs() {
+            let lhs = Value::test_list(vec![Value::test_int(1), Value::test_int(2)]);
+            let empty = Value::test_list(vec![]);
+            let out = lhs
+                .concat(Span::test_data(), &empty, Span::test_data())
+                .expect("concat");
+            assert_eq!(out, lhs.with_span(Span::test_data()));
+        }
+
+        #[test]
+        fn both_nonempty_appends() {
+            let lhs = Value::test_list(vec![Value::test_int(1)]);
+            let rhs = Value::test_list(vec![Value::test_int(2)]);
+            let out = lhs
+                .concat(Span::test_data(), &rhs, Span::test_data())
+                .expect("concat");
+            assert_eq!(
+                out,
+                Value::test_list(vec![Value::test_int(1), Value::test_int(2)])
+            );
+        }
+
+        #[test]
+        fn both_empty() {
+            let empty = Value::test_list(vec![]);
+            let out = empty
+                .concat(Span::test_data(), &empty, Span::test_data())
+                .expect("concat");
+            assert_eq!(out, Value::test_list(vec![]));
         }
     }
 }

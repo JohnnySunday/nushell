@@ -2,9 +2,9 @@ use nu_test_support::prelude::*;
 
 #[test]
 fn formatter_not_valid() -> Result {
-    let code = r#"
+    let code = "
         date now | format date '%N'
-        "#;
+        ";
 
     let err = test().run(code).expect_shell_error()?;
     assert!(matches!(err, ShellError::TypeMismatch { .. }));
@@ -22,9 +22,9 @@ fn test_j_q_format_specifiers() -> Result {
 
 #[test]
 fn test_j_q_format_specifiers_current_time() -> Result {
-    let code = r#"
+    let code = "
         date now | format date '%J_%Q' | str length
-        "#;
+        ";
 
     // Should be exactly 15 characters: YYYYMMDD_HHMMSS
     test().run(code).expect_value_eq(15)
@@ -113,4 +113,16 @@ fn locale_with_different_format_specifiers() -> Result {
     let actual: String = test().locale("nl_NL").run(code)?;
     assert_contains("26-10-23 22:52:14", actual);
     Ok(())
+}
+
+#[test]
+fn format_date_list_of_strings() -> Result {
+    let code = r#"["2021-10-22 20:00:12 +01:00", "2021-10-23 20:00:12 +01:00"] | format date "%Y-%m-%d" | str join ",""#;
+    test().run(code).expect_value_eq("2021-10-22,2021-10-23")
+}
+
+#[test]
+fn format_date_list_of_datetimes() -> Result {
+    let code = "[2021-10-22T20:00:12+01:00, 2021-10-23T20:00:12+01:00] | format date \"%Y-%m-%d\" | str join \",\"";
+    test().run(code).expect_value_eq("2021-10-22,2021-10-23")
 }

@@ -14,8 +14,8 @@ impl Command for All {
             .input_output_types(vec![(Type::List(Box::new(Type::Any)), Type::Bool)])
             .required(
                 "predicate",
-                SyntaxShape::Closure(Some(vec![SyntaxShape::Any])),
-                "A closure that must evaluate to a boolean.",
+                SyntaxShape::RowCondition,
+                "Row condition or closure that evaluates to a boolean.",
             )
             .category(Category::Filters)
     }
@@ -42,7 +42,7 @@ impl Command for All {
             },
             Example {
                 description: "Check that each item is a string.",
-                example: "[foo bar 2 baz] | all {|| ($in | describe) == 'string' }",
+                example: "[foo bar 2 baz] | all ($it | describe) == 'string'",
                 result: Some(Value::test_bool(false)),
             },
             Example {
@@ -74,9 +74,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(All)
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(All)
     }
 }

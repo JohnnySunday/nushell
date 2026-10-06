@@ -1,4 +1,5 @@
 use nu_engine::command_prelude::*;
+use nu_protocol::shell_error::generic::GenericError;
 use nu_protocol::{Value, record};
 use uucore::{localized_help_template, translate};
 
@@ -12,7 +13,20 @@ impl Command for UName {
 
     fn signature(&self) -> Signature {
         Signature::build("uname")
-            .input_output_types(vec![(Type::Nothing, Type::table())])
+            .input_output_types(vec![(
+                Type::Nothing,
+                Type::Record(
+                    vec![
+                        ("kernel-name".into(), Type::String),
+                        ("nodename".into(), Type::String),
+                        ("kernel-release".into(), Type::String),
+                        ("kernel-version".into(), Type::String),
+                        ("machine".into(), Type::String),
+                        ("operating-system".into(), Type::String),
+                    ]
+                    .into(),
+                ),
+            )])
             .category(Category::System)
     }
 
@@ -21,8 +35,7 @@ impl Command for UName {
     }
 
     fn search_terms(&self) -> Vec<&str> {
-        // add other terms?
-        vec!["system", "coreutils"]
+        vec!["system", "coreutils", "systeminfo"]
     }
 
     fn is_const(&self) -> bool {
@@ -42,6 +55,7 @@ impl Command for UName {
     fn run_const(
         &self,
         _working_set: &StateWorkingSet,
+        _stack: &mut Stack,
         call: &Call,
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
@@ -65,6 +79,7 @@ fn run_uname(call: &Call) -> Result<PipelineData, ShellError> {
     // Simulate `uname -all` is called every time
     let opts = uu_uname::Options {
         all: true,
+        all_labeled: true,
         kernel_name: false,
         nodename: false,
         kernel_release: false,
@@ -74,12 +89,12 @@ fn run_uname(call: &Call) -> Result<PipelineData, ShellError> {
         hardware_platform: false,
         os: false,
     };
-    let output = uu_uname::UNameOutput::new(&opts).map_err(|e| ShellError::GenericError {
-        error: format!("{e}"),
-        msg: translate!(&e.to_string()),
-        span: None,
-        help: None,
-        inner: Vec::new(),
+    let output = uu_uname::UNameOutput::new(&opts).map_err(|e| {
+        ShellError::Generic(GenericError::new(
+            format!("{e}"),
+            translate!(&e.to_string()),
+            span,
+        ))
     })?;
     let outputs = [
         output.kernel_name,

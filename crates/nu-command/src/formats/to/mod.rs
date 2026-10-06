@@ -2,6 +2,7 @@ mod command;
 mod csv;
 mod delimited;
 mod json;
+mod kdl;
 mod md;
 mod msgpack;
 mod msgpackz;
@@ -16,13 +17,16 @@ pub use self::csv::ToCsv;
 pub use self::toml::ToToml;
 pub use command::To;
 pub use json::ToJson;
+pub use kdl::ToKdl;
 pub use md::ToMd;
 pub use msgpack::ToMsgpack;
 pub use msgpackz::ToMsgpackz;
 pub use nuon::ToNuon;
-pub use text::ToText;
+pub use text::{TO_TEXT, TO_TXT, ToTextLike};
 pub use tsv::ToTsv;
 pub use xml::ToXml;
 pub use yaml::{TO_YAML, TO_YML, ToYamlLike};
 
+#[cfg_attr(not(feature = "network"), expect(unused))]
 pub(crate) use json::value_to_json_value;
+pub(crate) use toml::nu_value_to_toml_value;

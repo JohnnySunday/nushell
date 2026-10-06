@@ -1,17 +1,346 @@
-use crate::eval_ir::eval_ir_block;
 #[allow(deprecated)]
 use crate::get_full_help;
+use crate::named_flags::{
+    expand_flag_record, flag_type_accepts_nothing, list_spread_before_required_error,
+};
+use crate::{EvalBlockWithEarlyReturnFn, eval_ir::eval_ir_block};
 use nu_protocol::{
-    BlockId, Config, ENV_VARIABLE_ID, IntoPipelineData, PipelineData, PipelineExecutionData,
-    ShellError, Span, Value, VarId,
-    ast::{Assignment, Block, Call, Expr, Expression, ExternalArgument, PathMember},
-    debugger::DebugContext,
-    engine::{Closure, EngineState, Stack},
+    BlockId, CompareTypes, Config, ENV_VARIABLE_ID, IntoPipelineData, PipelineData,
+    PipelineExecutionData, ShellError, Signature, Span, Value, VarId,
+    ast::{
+        Argument as AstArgument, Assignment, Block, Call, Expr, Expression, ExternalArgument,
+        PathMember,
+    },
+    debugger::{DebugContext, WithDebug, WithoutDebug},
+    engine::{Argument as EngineArgument, Closure, EngineState, EnvName, EnvVars, Stack},
     eval_base::Eval,
+    shell_error::generic::GenericError,
 };
 use nu_utils::IgnoreCaseExt;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// [`CallEval`] is used to evaluate a command or closure call.
+///
+/// It is intended as an internal interface in the engine, to make sure
+/// command and closure calls behave the same.
+/// If you want to evaluate a closure in a command, use [`ClosureEval`] or
+/// [`ClosureEvalOnce`]. If you want to call a command, use [`eval_call`].
+///
+/// [`CallEval`] has a builder API.
+/// It is first created vial [`CallEval::new`],
+/// then has arguments added via [`CallEval::add_positional`] and [`CallEval::add_named`],
+/// and then can be run using [`CallEval::run`].
+#[derive(Clone)]
+pub struct CallEval {
+    callee_stack: Stack,
+    head_span: Span,
+    callee_span: Span,
+    arg_index: usize,
+    named_args: Vec<String>,
+    rest_args: Vec<Value>,
+    /// After a list/null rest spread, further positionals go to rest (matches IR `always_spread`).
+    always_spread: bool,
+    eval: EvalBlockWithEarlyReturnFn,
+}
+
+impl CallEval {
+    /// Create a new [`CallEval`] context
+    pub fn new(
+        callee_stack: Stack,
+        call_head: Span,
+        callee_span: Span,
+        eval: EvalBlockWithEarlyReturnFn,
+    ) -> Self {
+        Self {
+            callee_stack,
+            head_span: call_head,
+            callee_span,
+            arg_index: 0,
+            named_args: Vec::new(),
+            rest_args: Vec::new(),
+            always_spread: false,
+            eval,
+        }
+    }
+
+    /// Add a positional argument to the call stack.
+    ///
+    /// Returns an error if the given `value` does not match the type of
+    /// the argument according to the signature (see [`CallEval::new`]).
+    pub fn add_positional(
+        &mut self,
+        signature: &Signature,
+        value: Cow<Value>,
+    ) -> Result<&mut Self, ShellError> {
+        // After a rest spread, further positionals always go to rest (IR parity).
+        if self.always_spread {
+            return self.push_rest(signature, value);
+        }
+
+        let maybe_param = match self
+            .arg_index
+            .checked_sub(signature.required_positional.len())
+        {
+            // arg_index < required_len
+            None => signature.required_positional.get(self.arg_index),
+            // required_len <= arg_index < (required_len + optional_len)
+            Some(opt_idx) if opt_idx < signature.optional_positional.len() => {
+                signature.optional_positional.get(opt_idx)
+            }
+            // (required_len + optional_len) <= arg_index
+            _ => None,
+        };
+
+        if let Some(param) = maybe_param {
+            let param_type = param.shape.to_type();
+            if !value.is_subtype_of(&param_type) {
+                return Err(ShellError::CantConvert {
+                    to_type: param_type.to_string(),
+                    from_type: value.get_type().to_string(),
+                    span: value.span(),
+                    help: None,
+                });
+            }
+
+            let var_id = param
+                .var_id
+                .expect("internal error: all custom parameters must have var_ids");
+            self.callee_stack.add_var(var_id, value.into_owned());
+            self.arg_index += 1;
+            Ok(self)
+        } else {
+            self.push_rest(signature, value)
+        }
+    }
+
+    fn push_rest(
+        &mut self,
+        signature: &Signature,
+        value: Cow<Value>,
+    ) -> Result<&mut Self, ShellError> {
+        let Some(rest_positional) = &signature.rest_positional else {
+            // We do not consider it an error if more arguments
+            // are added than the closure takes. This makes it possible
+            // to omit any unused arguments in the closure definition.
+            return Ok(self);
+        };
+
+        let param_type = rest_positional.shape.to_type();
+        if !value.is_subtype_of(&param_type) {
+            return Err(ShellError::CantConvert {
+                to_type: param_type.to_string(),
+                from_type: value.get_type().to_string(),
+                span: value.span(),
+                help: None,
+            });
+        }
+
+        self.rest_args.push(value.into_owned());
+        Ok(self)
+    }
+
+    /// Spread a list into rest (IR parity). Errors if required positionals remain unbound.
+    pub fn add_list_spread(
+        &mut self,
+        signature: &Signature,
+        vals: Vec<Value>,
+        spread_span: Span,
+    ) -> Result<&mut Self, ShellError> {
+        if self.arg_index < signature.required_positional.len() && !self.always_spread {
+            return Err(list_spread_before_required_error(spread_span));
+        }
+        for v in vals {
+            self.push_rest(signature, Cow::Owned(v))?;
+        }
+        self.always_spread = true;
+        Ok(self)
+    }
+
+    /// Null rest-mode spread (IR parity). Errors if required positionals remain unbound.
+    pub fn add_null_spread(
+        &mut self,
+        signature: &Signature,
+        spread_span: Span,
+    ) -> Result<&mut Self, ShellError> {
+        if self.arg_index < signature.required_positional.len() && !self.always_spread {
+            return Err(list_spread_before_required_error(spread_span));
+        }
+        self.always_spread = true;
+        Ok(self)
+    }
+
+    /// Add a named parameter to the call stack.
+    pub fn add_named(
+        &mut self,
+        signature: &Signature,
+        long: &str,
+        short: Option<String>,
+        value: Option<Cow<Value>>,
+    ) -> Result<&mut Self, ShellError> {
+        let named = signature.named.iter().find(|named| {
+            long == named.long
+                || short
+                    .as_deref()
+                    .zip(named.short)
+                    .is_some_and(|(arg, param)| {
+                        let mut buf = [0; 4];
+                        param.encode_utf8(&mut buf) == arg
+                    })
+        });
+
+        if let Some(named) = named {
+            let var_id = named
+                .var_id
+                .expect("internal error: all custom parameters must have var_ids");
+
+            let value = value
+                .or_else(|| named.default_value.as_ref().map(Cow::Borrowed))
+                .unwrap_or_else(|| Cow::Owned(Value::bool(true, self.head_span)));
+
+            self.callee_stack.add_var(var_id, value.into_owned());
+            self.named_args.push(long.to_string());
+        }
+
+        Ok(self)
+    }
+
+    /// Sets the environment variables for the call.
+    pub fn with_env(
+        &mut self,
+        env_vars: &[Arc<EnvVars>],
+        env_hidden: &Arc<HashMap<String, HashSet<EnvName>>>,
+    ) -> &mut Self {
+        self.callee_stack.with_env(env_vars, env_hidden);
+        self
+    }
+
+    /// Sets whether to enable debugging when evaluating the closure.
+    pub fn debug(&mut self, debug: bool) -> &mut Self {
+        if debug {
+            self.eval = eval_block_with_early_return::<WithDebug>
+        } else {
+            self.eval = eval_block_with_early_return::<WithoutDebug>
+        };
+        self
+    }
+
+    /// Run the given block.
+    pub fn run(
+        &mut self,
+        engine_state: &EngineState,
+        block: &Block,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        self.finalize_arguments(&block.signature)?;
+        self.arg_index = 0;
+        self.rest_args.clear();
+        (self.eval)(engine_state, &mut self.callee_stack, block, input).map(|p| p.body)
+    }
+
+    /// Finalize missing/default/rest arguments without evaluating the block yet.
+    ///
+    /// This is useful for callers that need to bind arguments against one signature and then
+    /// evaluate a modified copy of the block without re-running the argument finalization step.
+    pub fn finalize_for_signature(
+        &mut self,
+        signature: &Signature,
+    ) -> Result<&mut Self, ShellError> {
+        self.finalize_arguments(signature)?;
+        Ok(self)
+    }
+
+    /// Run a block after arguments have already been fully bound onto the callee stack.
+    pub fn run_prebound(
+        &mut self,
+        engine_state: &EngineState,
+        block: &Block,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        self.arg_index = 0;
+        self.rest_args.clear();
+        (self.eval)(engine_state, &mut self.callee_stack, block, input).map(|p| p.body)
+    }
+
+    /// Export the modified environment from callee to the caller.
+    pub fn redirect_env(&self, engine_state: &EngineState, stack: &mut Stack) {
+        redirect_env(engine_state, stack, &self.callee_stack);
+    }
+
+    /// Add default and rest values to the stack, raise error on
+    /// missing parameters.
+    fn finalize_arguments(&mut self, signature: &Signature) -> Result<(), ShellError> {
+        let remaining_positionals = signature
+            .required_positional
+            .iter()
+            .map(|p| (p, true))
+            .chain(signature.optional_positional.iter().map(|p| (p, false)))
+            // skip positional args added with add_positional
+            .skip(self.arg_index);
+
+        for (param, required) in remaining_positionals {
+            let var_id = param
+                .var_id
+                .expect("internal error: all custom parameters must have var_ids");
+
+            let maybe_value = param
+                .default_value
+                .clone()
+                .or((!required).then_some(Value::nothing(self.callee_span)));
+
+            if let Some(value) = maybe_value {
+                self.callee_stack.add_var(var_id, value);
+            } else {
+                return Err(ShellError::MissingParameter {
+                    param_name: param.name.to_string(),
+                    span: self.callee_span,
+                });
+            }
+        }
+
+        if let Some(rest_positional) = &signature.rest_positional {
+            let span = self
+                .rest_args
+                .first()
+                .map(|x| x.span())
+                .unwrap_or(self.callee_span);
+
+            self.callee_stack.add_var(
+                rest_positional
+                    .var_id
+                    .expect("Internal error: rest positional parameter lackes var_id"),
+                Value::list(self.rest_args.to_owned(), span),
+            );
+        }
+
+        let remaining_flags = signature
+            .named
+            .iter()
+            // Skip provided flags
+            .filter(|flag| !self.named_args.contains(&flag.long))
+            // Ignore named arguments without var_id.
+            // There is some code in nu_cli::completions that relies on this behavior of `eval_call`.
+            .filter_map(|flag| Some((flag.var_id?, flag)));
+
+        for (var_id, flag) in remaining_flags {
+            if flag.arg.is_none() {
+                self.callee_stack
+                    .add_var(var_id, Value::bool(false, self.head_span));
+            } else {
+                let value = flag
+                    .default_value
+                    .clone()
+                    .unwrap_or(Value::nothing(self.head_span));
+                self.callee_stack.add_var(var_id, value);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Evaluate a call to a command (builtin, custom or external)
 pub fn eval_call<D: DebugContext>(
     engine_state: &EngineState,
     caller_stack: &mut Stack,
@@ -22,11 +351,11 @@ pub fn eval_call<D: DebugContext>(
     let decl = engine_state.get_decl(call.decl_id);
 
     if !decl.is_known_external() && call.named_iter().any(|(flag, _, _)| flag.item == "help") {
-        let help = get_full_help(decl, engine_state, caller_stack);
+        let help = get_full_help(decl, engine_state, caller_stack, call.head);
         Ok(Value::string(help, call.head).into_pipeline_data())
     } else if let Some(block_id) = decl.block_id() {
+        // call is a custom command
         let block = engine_state.get_block(block_id);
-
         let mut callee_stack = caller_stack.gather_captures(engine_state, &block.captures);
 
         // Rust does not check recursion limits outside of const evaluation.
@@ -44,123 +373,115 @@ pub fn eval_call<D: DebugContext>(
             });
         }
 
-        for (param_idx, (param, required)) in decl
-            .signature()
-            .required_positional
-            .iter()
-            .map(|p| (p, true))
-            .chain(
-                decl.signature()
-                    .optional_positional
-                    .iter()
-                    .map(|p| (p, false)),
-            )
-            .enumerate()
-        {
-            let var_id = param
-                .var_id
-                .expect("internal error: all custom parameters must have var_ids");
-
-            if let Some(arg) = call.positional_nth(param_idx) {
-                let result = eval_expression::<D>(engine_state, caller_stack, arg)?;
-                let param_type = param.shape.to_type();
-                if required && !result.is_subtype_of(&param_type) {
-                    return Err(ShellError::CantConvert {
-                        to_type: param.shape.to_type().to_string(),
-                        from_type: result.get_type().to_string(),
-                        span: result.span(),
-                        help: None,
-                    });
+        let mut call_eval = CallEval::new(
+            callee_stack,
+            call.head,
+            block.span.unwrap_or(Span::unknown()),
+            eval_block_with_early_return::<D>,
+        );
+        let signature = decl.signature();
+        // Walk all arguments in order so record/list spreads interleave with positionals/flags
+        // the same way the IR path does after normalize_call_arguments.
+        for arg in &call.arguments {
+            match arg {
+                AstArgument::Positional(expr) | AstArgument::Unknown(expr) => {
+                    let result = eval_expression::<D>(engine_state, caller_stack, expr)?;
+                    call_eval.add_positional(&signature, Cow::Owned(result))?;
                 }
-                callee_stack.add_var(var_id, result);
-            } else if let Some(value) = &param.default_value {
-                callee_stack.add_var(var_id, value.to_owned());
-            } else {
-                callee_stack.add_var(var_id, Value::nothing(call.head));
-            }
-        }
-
-        if let Some(rest_positional) = decl.signature().rest_positional {
-            let mut rest_items = vec![];
-
-            for result in call.rest_iter_flattened(
-                decl.signature().required_positional.len()
-                    + decl.signature().optional_positional.len(),
-                |expr| eval_expression::<D>(engine_state, caller_stack, expr),
-            )? {
-                rest_items.push(result);
-            }
-
-            let span = if let Some(rest_item) = rest_items.first() {
-                rest_item.span()
-            } else {
-                call.head
-            };
-
-            callee_stack.add_var(
-                rest_positional
-                    .var_id
-                    .expect("Internal error: rest positional parameter lacks var_id"),
-                Value::list(rest_items, span),
-            )
-        }
-
-        for named in decl.signature().named {
-            if let Some(var_id) = named.var_id {
-                let mut found = false;
-                for call_named in call.named_iter() {
-                    if let (Some(spanned), Some(short)) = (&call_named.1, named.short) {
-                        if spanned.item == short.to_string() {
-                            if let Some(arg) = &call_named.2 {
-                                let result = eval_expression::<D>(engine_state, caller_stack, arg)?;
-
-                                callee_stack.add_var(var_id, result);
-                            } else if let Some(value) = &named.default_value {
-                                callee_stack.add_var(var_id, value.to_owned());
-                            } else {
-                                callee_stack.add_var(var_id, Value::bool(true, call.head))
+                AstArgument::Named((long, short, maybe_expr)) => {
+                    let result: Option<Cow<Value>> = if let Some(expr) = maybe_expr {
+                        let value = eval_expression::<D>(engine_state, caller_stack, expr)?;
+                        if value.is_nothing() {
+                            let accepts_nothing = signature
+                                .get_long_flag(&long.item)
+                                .or_else(|| {
+                                    short
+                                        .as_ref()
+                                        .and_then(|s| s.item.chars().next())
+                                        .and_then(|c| signature.get_short_flag(c))
+                                })
+                                .is_some_and(|flag| flag_type_accepts_nothing(&flag));
+                            if !accepts_nothing {
+                                continue;
                             }
-                            found = true;
                         }
-                    } else if call_named.0.item == named.long {
-                        if let Some(arg) = &call_named.2 {
-                            let result = eval_expression::<D>(engine_state, caller_stack, arg)?;
-
-                            callee_stack.add_var(var_id, result);
-                        } else if let Some(value) = &named.default_value {
-                            callee_stack.add_var(var_id, value.to_owned());
-                        } else {
-                            callee_stack.add_var(var_id, Value::bool(true, call.head))
-                        }
-                        found = true;
-                    }
-                }
-
-                if !found {
-                    if named.arg.is_none() {
-                        callee_stack.add_var(var_id, Value::bool(false, call.head))
-                    } else if let Some(value) = named.default_value {
-                        callee_stack.add_var(var_id, value);
+                        Some(Cow::Owned(value))
                     } else {
-                        callee_stack.add_var(var_id, Value::nothing(call.head))
+                        None
+                    };
+                    call_eval.add_named(
+                        &signature,
+                        &long.item,
+                        short.as_ref().map(|s| s.item.clone()),
+                        result,
+                    )?;
+                }
+                // Light AST path: keep custom-command spreads aligned with IR gather/normalize
+                // semantics. Normal scripts use IR (`eval_block` → IR); this path still matters
+                // for residual AST `eval_call` consumers.
+                AstArgument::Spread(expr) => {
+                    let val = eval_expression::<D>(engine_state, caller_stack, expr)?;
+                    match val {
+                        Value::Record { val, .. } => {
+                            for engine_arg in
+                                expand_flag_record(&signature, val.into_owned(), expr.span)?
+                            {
+                                match engine_arg {
+                                    EngineArgument::Flag { data, name, .. } => {
+                                        let long =
+                                            std::str::from_utf8(&data[name]).unwrap_or_default();
+                                        call_eval.add_named(&signature, long, None, None)?;
+                                    }
+                                    EngineArgument::Named {
+                                        data, name, val, ..
+                                    } => {
+                                        let long =
+                                            std::str::from_utf8(&data[name]).unwrap_or_default();
+                                        call_eval.add_named(
+                                            &signature,
+                                            long,
+                                            None,
+                                            Some(Cow::Owned(val)),
+                                        )?;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Value::List { vals, .. } => {
+                            if signature.rest_positional.is_none() && !signature.allows_unknown_args
+                            {
+                                return Err(ShellError::Generic(GenericError::new(
+                                    "Cannot spread a list into this command",
+                                    "This command has no ...rest parameter to receive a list spread. Use a record to spread named flags, e.g. ...{flag: value}",
+                                    expr.span,
+                                )));
+                            }
+                            call_eval.add_list_spread(&signature, vals.into_owned(), expr.span)?;
+                        }
+                        Value::Nothing { .. } => {
+                            call_eval.add_null_spread(&signature, expr.span)?;
+                        }
+                        Value::Error { error, .. } => return Err(*error),
+                        other => {
+                            return Err(ShellError::CannotSpreadAsList { span: other.span() });
+                        }
                     }
                 }
             }
         }
 
-        let result =
-            eval_block_with_early_return::<D>(engine_state, &mut callee_stack, block, input)
-                .map(|p| p.body);
+        let result = call_eval.run(engine_state, block, input);
 
         if block.redirect_env {
-            redirect_env(engine_state, caller_stack, &callee_stack);
+            call_eval.redirect_env(engine_state, caller_stack);
         }
 
         result
     } else {
-        // We pass caller_stack here with the knowledge that internal commands
-        // are going to be specifically looking for global state in the stack
-        // rather than any local state.
+        // Builtin/plugin/external: normal scripts evaluate via IR, which runs
+        // `normalize_engine_arguments` for null omit and record flag spreads. This AST
+        // `eval_call` branch does not re-implement that path (IR-first).
         decl.run(engine_state, caller_stack, &call.into(), input)
     }
 }
@@ -174,7 +495,7 @@ pub fn redirect_env(engine_state: &EngineState, caller_stack: &mut Stack, callee
     // (the callee hid them)
     for var in caller_env_vars.iter() {
         if !callee_stack.has_env_var(engine_state, var) {
-            caller_stack.remove_env_var(engine_state, var);
+            caller_stack.hide_env_var(engine_state, var);
         }
     }
 
@@ -307,28 +628,38 @@ pub fn eval_block<D: DebugContext>(
     input: PipelineData,
 ) -> Result<PipelineExecutionData, ShellError> {
     let result = eval_ir_block::<D>(engine_state, stack, block, input);
-    if let Err(ShellError::Exit { code }) = &result {
-        std::process::exit(*code)
-    }
     if let Err(err) = &result {
         stack.set_last_error(err);
     }
     result
 }
 
+/// Evaluate a block as an early return boundary.
+///
+/// A `return` is meant to end the command or closure it appears in and go no further. The
+/// "boundary" is the point where such a `return` stops propagating outward and becomes the
+/// block's normal result, instead of escaping to whatever called the command. This function is
+/// that point: an early `return` inside the block produces the block's result here, exactly like
+/// a value in tail position.
+///
+/// Concretely, [`eval_block`] runs the block and sets
+/// [`early_return`](PipelineExecutionData::early_return) to mark a result that came from a
+/// `return`; this function clears that flag, which is what "absorbs" the `return` so callers see
+/// an ordinary result.
+///
+/// This is used for blocks that `return` should not escape from, such as custom command bodies
+/// and closures: clearing the flag keeps an early `return` from leaking into the calling block.
+/// In contrast, [`eval_block`] leaves the flag intact, so its one consumer (top-level file
+/// evaluation) can see a top-level `return` and skip running `main`.
 pub fn eval_block_with_early_return<D: DebugContext>(
     engine_state: &EngineState,
     stack: &mut Stack,
     block: &Block,
     input: PipelineData,
 ) -> Result<PipelineExecutionData, ShellError> {
-    match eval_block::<D>(engine_state, stack, block, input) {
-        Err(ShellError::Return { span: _, value }) => Ok(PipelineExecutionData::from(
-            PipelineData::value(*value, None),
-        )),
-        Err(ShellError::Exit { code }) => std::process::exit(code),
-        x => x,
-    }
+    let mut result = eval_block::<D>(engine_state, stack, block, input)?;
+    result.early_return = false;
+    Ok(result)
 }
 
 pub fn eval_collect<D: DebugContext>(
@@ -336,12 +667,12 @@ pub fn eval_collect<D: DebugContext>(
     stack: &mut Stack,
     var_id: VarId,
     expr: &Expression,
-    input: PipelineData,
+    mut input: PipelineData,
 ) -> Result<PipelineData, ShellError> {
     // Evaluate the expression with the variable set to the collected input
-    let span = input.span().unwrap_or(Span::unknown());
+    let span = input.span().unwrap_or(expr.span);
 
-    let metadata = input.metadata().and_then(|m| m.for_collect());
+    let metadata = input.take_metadata().and_then(|m| m.for_collect());
 
     let input = input.into_value(span)?;
 
@@ -398,6 +729,12 @@ pub fn eval_variable(
             pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
             Ok(Value::record(pairs.into_iter().collect(), span))
+        }
+        // interactive last-result (e.g. `$ans`)
+        // Truncation warning is deferred until after print so data is visible first.
+        id if id == nu_protocol::LAST_VARIABLE_ID => {
+            stack.defer_last_result_truncation_warning();
+            stack.get_var(var_id, span)
         }
         var_id => stack.get_var(var_id, span),
     }
@@ -533,9 +870,10 @@ impl Eval for EvalRuntime {
                         // As such, give it special treatment here.
                         let is_env = var_id == &ENV_VARIABLE_ID;
                         if is_env || engine_state.get_var(*var_id).mutable {
-                            let mut lhs =
-                                eval_expression::<D>(engine_state, stack, &cell_path.head)?;
                             if is_env {
+                                let mut lhs =
+                                    eval_expression::<D>(engine_state, stack, &cell_path.head)?;
+
                                 // Reject attempts to assign to the entire $env
                                 if cell_path.tail.is_empty() {
                                     return Err(ShellError::CannotReplaceEnv {
@@ -586,8 +924,14 @@ impl Eval for EvalRuntime {
                                     stack.update_config(engine_state)?;
                                 }
                             } else {
-                                lhs.upsert_data_at_cell_path(&cell_path.tail, rhs)?;
-                                stack.add_var(*var_id, lhs);
+                                // Optimized: mutate the variable in-place on the stack,
+                                // avoiding the clone from lookup_var and the move-back from add_var.
+                                stack.upsert_var_cell_path(
+                                    *var_id,
+                                    &cell_path.tail,
+                                    rhs,
+                                    cell_path.head.span(&engine_state),
+                                )?;
                             }
                             Ok(Value::nothing(cell_path.head.span(&engine_state)))
                         } else {

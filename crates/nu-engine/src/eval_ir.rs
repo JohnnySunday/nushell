@@ -1,27 +1,49 @@
 use std::{borrow::Cow, fs::File, sync::Arc};
 
-use nu_path::{expand_path, expand_path_with};
+use nu_path::{dots::expand_ndots_safe, expand_path, expand_path_with, expand_tilde};
 #[cfg(feature = "os")]
 use nu_protocol::process::check_exit_status_future;
 use nu_protocol::{
-    DeclId, ENV_VARIABLE_ID, Flag, IntoPipelineData, IntoSpanned, ListStream, OutDest,
-    PipelineData, PipelineExecutionData, PositionalArg, Range, Record, RegId, ShellError, Signals,
-    Signature, Span, Spanned, Type, Value, VarId,
+    CompareTypes, DeclId, ENV_VARIABLE_ID, Flag, IntoPipelineData, IntoSpanned, LabeledError,
+    ListStream, OutDest, PipelineData, PipelineExecutionData, PositionalArg, Range, Record, RegId,
+    ShellError, Signals, Signature, Span, Spanned, Type, Value, VarId,
     ast::{Bits, Block, Boolean, CellPath, Comparison, Math, Operator},
     combined_type_string,
     debugger::DebugContext,
     engine::{
         Argument, Closure, EngineState, EnvName, ErrorHandler, Matcher, Redirection, Stack,
-        StateWorkingSet,
+        StateWorkingSet, TryHandler,
     },
     ir::{Call, DataSlice, Instruction, IrAstRef, IrBlock, Literal, RedirectMode},
-    shell_error::io::IoError,
+    shell_error::{generic::GenericError, io::IoError},
 };
 use nu_utils::IgnoreCaseExt;
 
 use crate::{
     ENV_CONVERSIONS, convert_env_vars, eval::is_automatic_env_var, eval_block_with_early_return,
+    named_flags::normalize_engine_arguments,
 };
+
+/// For `def --wrapped` and `known extern` rest params (`SyntaxShape::ExternalArgument`), convert
+/// non-glob `Value::Glob` values to `Value::String`, expanding tilde and ndots in the process.
+/// This mirrors what `run-external` does in `eval_external_arguments`, so that `$args | to nuon`
+/// returns expanded paths instead of the raw `~` / `...` tokens, while also ensuring that plain
+/// bare-word strings (e.g. `test`) are reported as strings rather than globs.
+fn expand_external_glob_arg(val: Value) -> Value {
+    if let Value::Glob {
+        val: ref s,
+        no_expand,
+        internal_span,
+        ..
+    } = val
+        && !no_expand
+        && !nu_glob::is_glob(s)
+    {
+        let expanded = expand_ndots_safe(expand_tilde(s.as_str()));
+        return Value::string(expanded.to_string_lossy().into_owned(), internal_span);
+    }
+    val
+}
 
 pub fn eval_ir_block<D: DebugContext>(
     engine_state: &EngineState,
@@ -41,12 +63,43 @@ pub fn eval_ir_block<D: DebugContext>(
         });
     }
 
+    // Whole-block locals (closures / custom commands / top-level script).
+    let pushed_scope = if let Some(bindings) = &block.scope_bindings {
+        stack.push_scope_bindings(bindings.clone());
+        true
+    } else {
+        false
+    };
+
+    // Install this IR block's inlined-scope regions; restore any outer IR state on leave
+    // so nested `eval_ir_block` (e.g. custom command call) does not clobber the caller.
+    let saved_regions = std::mem::take(&mut stack.ir_scope_regions);
+    let saved_pc = stack.ir_instruction_index.take();
+
+    let result = eval_ir_block_inner::<D>(engine_state, stack, block, input);
+
+    stack.ir_scope_regions = saved_regions;
+    stack.ir_instruction_index = saved_pc;
+    if pushed_scope {
+        stack.pop_scope_bindings();
+    }
+    result
+}
+
+fn eval_ir_block_inner<D: DebugContext>(
+    engine_state: &EngineState,
+    stack: &mut Stack,
+    block: &Block,
+    input: PipelineData,
+) -> Result<PipelineExecutionData, ShellError> {
     if let Some(ir_block) = &block.ir_block {
         D::enter_block(engine_state, block);
 
+        stack.ir_scope_regions = ir_block.scope_regions.clone();
+        stack.ir_instruction_index = None;
+
         let args_base = stack.arguments.get_base();
         let error_handler_base = stack.error_handlers.get_base();
-        let finally_handler_base = stack.finally_run_handlers.get_base();
 
         // Allocate and initialize registers. I've found that it's not really worth trying to avoid
         // the heap allocation here by reusing buffers - our allocator is fast enough
@@ -66,7 +119,7 @@ pub fn eval_ir_block<D: DebugContext>(
                 block_span: &block.span,
                 args_base,
                 error_handler_base,
-                finally_handler_base,
+                finally_resumes: vec![],
                 redirect_out: None,
                 redirect_err: None,
                 matches: vec![],
@@ -78,21 +131,33 @@ pub fn eval_ir_block<D: DebugContext>(
         );
 
         stack.error_handlers.leave_frame(error_handler_base);
-        stack.finally_run_handlers.leave_frame(finally_handler_base);
         stack.arguments.leave_frame(args_base);
+        stack.ir_instruction_index = None;
 
         D::leave_block(engine_state, block);
 
         result
     } else {
         // FIXME blocks having IR should not be optional
-        Err(ShellError::GenericError {
-            error: "Can't evaluate block in IR mode".into(),
-            msg: "block is missing compiled representation".into(),
-            span: block.span,
-            help: Some("the IrBlock is probably missing due to a compilation error".into()),
-            inner: vec![],
-        })
+        let error = if let Some(span) = block.span {
+            ShellError::Generic(
+                GenericError::new(
+                    "Can't evaluate block in IR mode",
+                    "block is missing compiled representation",
+                    span,
+                )
+                .with_help("the IrBlock is probably missing due to a compilation error"),
+            )
+        } else {
+            ShellError::Generic(
+                GenericError::new_internal(
+                    "Can't evaluate block in IR mode",
+                    "block is missing compiled representation",
+                )
+                .with_help("the IrBlock is probably missing due to a compilation error"),
+            )
+        };
+        Err(error)
     }
 }
 
@@ -107,8 +172,11 @@ struct EvalContext<'a> {
     args_base: usize,
     /// Base index on the error handler stack to reset to after a call
     error_handler_base: usize,
-    /// Base index on the finally handler stack to reset to after a call
-    finally_handler_base: usize,
+    /// One entry per `finally` block that is currently running in this frame (innermost last):
+    /// the control flow it interrupted and has to resume at `end-finally`, or `None` if it was
+    /// entered by falling through from `try`/`catch`. Mirrors the [`TryHandler::RunningFinally`]
+    /// markers on the handler stack.
+    finally_resumes: Vec<Option<Unwind>>,
     /// State set by redirect-out
     redirect_out: Option<Redirection>,
     /// State set by redirect-err
@@ -170,18 +238,21 @@ impl<'a> EvalContext<'a> {
     }
 
     /// Take and implicitly collect a register to a value
+    ///
+    /// It doesn't check exit status when collecting.
     fn collect_reg(&mut self, reg_id: RegId, fallback_span: Span) -> Result<Value, ShellError> {
-        // NOTE: in collect, it maybe good to pick the inner PipelineData
-        // directly, and drop the ExitStatus queue.
-        let data = self.take_reg(reg_id);
-        let body = data.body;
-        let span = body.span().unwrap_or(fallback_span);
-        let result = body.into_value(span);
+        // NOTE: collect_reg is used to collect the reg to a variable.
+        // So it's good to pick the inner PipelineData directly, and drop the ExitStatus queue.
         #[cfg(feature = "os")]
-        if nu_experimental::PIPE_FAIL.get() {
-            check_exit_status_future(data.exit)?
-        }
-        result
+        let body = {
+            let mut data = self.take_reg(reg_id);
+            data.exit.clear();
+            data.body
+        };
+        #[cfg(not(feature = "os"))]
+        let body = self.take_reg(reg_id).body;
+        let span = body.span().unwrap_or(fallback_span);
+        body.into_value(span)
     }
 
     /// Get a string from data or produce evaluation error if it's invalid UTF-8
@@ -206,74 +277,88 @@ fn eval_ir_block_impl<D: DebugContext>(
     // Program counter, starts at zero.
     let mut pc = 0;
     let need_backtrace = ctx.engine_state.get_env_var("NU_BACKTRACE").is_some();
-    let mut ret_val = None;
 
     while pc < ir_block.instructions.len() {
         let instruction = &ir_block.instructions[pc];
         let span = &ir_block.spans[pc];
         let ast = &ir_block.ast[pc];
 
-        D::enter_instruction(ctx.engine_state, ir_block, pc, ctx.registers);
+        // So `scope` can match inlined keyword-body bindings via ScopeRegion.
+        ctx.stack.ir_instruction_index = Some(pc);
+
+        D::enter_instruction(ctx.engine_state, ctx.stack, ir_block, pc, ctx.registers);
 
         let result = eval_instruction::<D>(ctx, instruction, span, ast, need_backtrace);
 
         D::leave_instruction(
             ctx.engine_state,
+            ctx.stack,
             ir_block,
             pc,
             ctx.registers,
             result.as_ref().err(),
         );
 
-        match result {
+        // Control flow that leaves the current `try` body goes through `unwind`, which runs the
+        // handlers in order and either lands on one of them or leaves the block.
+        let unwind = match result {
             Ok(InstructionResult::Continue) => {
                 pc += 1;
+                continue;
             }
             Ok(InstructionResult::Branch(next_pc)) => {
                 pc = next_pc;
+                continue;
             }
-            Ok(InstructionResult::Return(reg_id)) => {
-                // need to check if the return value is set by
-                // `Shell::Return` first. If so, we need to respect that value.
-                match ret_val {
-                    Some(err) => return Err(err),
-                    None => return Ok(ctx.take_reg(reg_id)),
+            Ok(InstructionResult::Return(reg_id)) => return Ok(ctx.take_reg(reg_id)),
+            Ok(InstructionResult::ReturnEarly(reg_id)) => {
+                // The data is flagged as an early return. The nearest custom command or closure
+                // call clears that flag; top-level file evaluation reads it to skip `main`.
+                Unwind::Return(ctx.take_reg(reg_id).with_early_return())
+            }
+            Ok(InstructionResult::UnwindJump { index, handlers }) => {
+                Unwind::Jump { index, handlers }
+            }
+            Ok(InstructionResult::EndFinally) => {
+                match ctx.stack.error_handlers.pop(ctx.error_handler_base) {
+                    Some(TryHandler::RunningFinally) => {}
+                    handler => {
+                        return Err(ShellError::IrEvalError {
+                            msg: format!(
+                                "end-finally expected a running finally handler, found {handler:?}"
+                            ),
+                            span: Some(*span),
+                        });
+                    }
+                }
+                match ctx.finally_resumes.pop() {
+                    // Entered from `try`/`catch` normally: carry on after the block.
+                    Some(None) => {
+                        pc += 1;
+                        continue;
+                    }
+                    // Entered by unwinding: pick up where that left off.
+                    Some(Some(unwind)) => unwind,
+                    None => {
+                        return Err(ShellError::IrEvalError {
+                            msg: "end-finally without a matching begin-finally".into(),
+                            span: Some(*span),
+                        });
+                    }
                 }
             }
+            // These block control related errors should be passed through
             Err(err @ (ShellError::Continue { .. } | ShellError::Break { .. })) => {
                 return Err(err);
             }
-            Err(err @ (ShellError::Return { .. } | ShellError::Exit { .. })) => {
-                if let Some(always_run_handler) =
-                    ctx.stack.finally_run_handlers.pop(ctx.finally_handler_base)
-                {
-                    // need to run finally block before return.
-                    // and record the return value firstly.
-                    prepare_error_handler(ctx, always_run_handler, None);
-                    pc = always_run_handler.handler_index;
-                    ret_val = Some(err);
-                } else {
-                    // These block control related errors should be passed through
-                    return Err(err);
-                }
-            }
-            Err(err) => {
-                if let Some(error_handler) = ctx.stack.error_handlers.pop(ctx.error_handler_base) {
-                    // If an error handler is set, branch there
-                    prepare_error_handler(ctx, error_handler, Some(err.into_spanned(*span)));
-                    pc = error_handler.handler_index;
-                } else if let Some(always_run_handler) =
-                    ctx.stack.finally_run_handlers.pop(ctx.finally_handler_base)
-                {
-                    prepare_error_handler(ctx, always_run_handler, Some(err.into_spanned(*span)));
-                    pc = always_run_handler.handler_index;
-                } else if need_backtrace {
-                    let err = ShellError::into_chained(err, *span);
-                    return Err(err);
-                } else {
-                    return Err(err);
-                }
-            }
+            // `exit --abort` leaves immediately, without running `finally` blocks
+            Err(err @ ShellError::Exit { abort: true, .. }) => return Err(err),
+            Err(err) => Unwind::Error(err.into_spanned(*span)),
+        };
+
+        match unwind_through_handlers(ctx, unwind, *span, need_backtrace) {
+            Unwound::Branch(next_pc) => pc = next_pc,
+            Unwound::Return(result) => return *result,
         }
     }
 
@@ -285,6 +370,125 @@ fn eval_ir_block_impl<D: DebugContext>(
         ),
         span: *ctx.block_span,
     })
+}
+
+/// Control flow that is leaving a `try` body and has to pass through its handlers first.
+#[derive(Debug)]
+enum Unwind {
+    /// An error propagating outward, with the span of the instruction that raised it. This
+    /// includes `exit`, which only `finally` handlers get to see.
+    Error(Spanned<ShellError>),
+    /// A `return`, carrying its (early-return flagged) value.
+    Return(PipelineExecutionData),
+    /// A `break` or `continue`: jump to `index` once `handlers` more entries have been unwound.
+    Jump { index: usize, handlers: usize },
+}
+
+/// Where evaluation continues after [`unwind_through_handlers`].
+enum Unwound {
+    /// Continue at this instruction: a handler took over, or a jump reached its target.
+    Branch(usize),
+    /// No handler is left in this frame: leave the block with this result.
+    Return(Box<Result<PipelineExecutionData, ShellError>>),
+}
+
+/// Pop handlers off the `try` handler stack until one takes over the unwinding control flow,
+/// or until there are none left in this frame.
+///
+/// A `catch` handler takes over errors (but not `exit`). A `finally` handler takes over
+/// everything: the pending control flow is stashed in `finally_resumes` and picked up again
+/// by `end-finally`. Unwinding out of a `finally` block that is itself running abandons what
+/// that block was going to resume, so e.g. `return` inside `finally` wins over the error that
+/// led there.
+fn unwind_through_handlers(
+    ctx: &mut EvalContext<'_>,
+    mut unwind: Unwind,
+    span: Span,
+    need_backtrace: bool,
+) -> Unwound {
+    loop {
+        if let Unwind::Jump { index, handlers: 0 } = unwind {
+            return Unwound::Branch(index);
+        }
+
+        let Some(handler) = ctx.stack.error_handlers.pop(ctx.error_handler_base) else {
+            return Unwound::Return(Box::new(match unwind {
+                Unwind::Error(err) if need_backtrace => {
+                    Err(ShellError::into_chained(err.item, err.span))
+                }
+                Unwind::Error(err) => Err(err.item),
+                Unwind::Return(data) => Ok(data),
+                Unwind::Jump { .. } => Err(ShellError::IrEvalError {
+                    msg: "unwind-jump ran out of handlers before reaching its target".into(),
+                    span: Some(span),
+                }),
+            }));
+        };
+
+        if let Unwind::Jump { handlers, .. } = &mut unwind {
+            *handlers -= 1;
+        }
+
+        match handler {
+            TryHandler::Catch(handler) => match unwind {
+                // `exit` is not something `catch` can handle; only `finally` runs for it.
+                Unwind::Error(err) if !matches!(err.item, ShellError::Exit { .. }) => {
+                    reset_signals_if_interrupted(ctx, &err.item);
+                    prepare_error_handler(ctx, handler, Some(err));
+                    return Unwound::Branch(handler.handler_index);
+                }
+                // Anything else just discards the `catch` handler on its way out.
+                _ => {}
+            },
+            TryHandler::Finally(handler) => {
+                // `finally` must not start until the value being returned has been fully
+                // produced: collect it first, like `try-collect` does on the fall-through path.
+                if let Unwind::Return(data) = unwind {
+                    #[cfg(feature = "os")]
+                    let collected = collect(data, span, false);
+                    #[cfg(not(feature = "os"))]
+                    let collected = collect(data, span);
+                    unwind = match collected {
+                        Ok(body) => {
+                            Unwind::Return(PipelineExecutionData::from(body).with_early_return())
+                        }
+                        Err(err) => Unwind::Error(err.into_spanned(span)),
+                    };
+                }
+                // The block gets to see the error that led to it (but not `exit`), otherwise
+                // its register is set to empty.
+                let error = match &unwind {
+                    Unwind::Error(err) if !matches!(err.item, ShellError::Exit { .. }) => {
+                        reset_signals_if_interrupted(ctx, &err.item);
+                        Some(err.clone())
+                    }
+                    _ => None,
+                };
+                prepare_error_handler(ctx, handler, error);
+                ctx.stack.error_handlers.push(TryHandler::RunningFinally);
+                ctx.finally_resumes.push(Some(unwind));
+                return Unwound::Branch(handler.handler_index);
+            }
+            TryHandler::RunningFinally => {
+                // Leaving a running `finally` block: whatever it was going to resume is replaced
+                // by this unwinding.
+                ctx.finally_resumes.pop();
+            }
+        }
+    }
+}
+
+/// An interrupt (ctrl-c) that is about to be handled by `catch` or `finally` must not keep
+/// interrupting the handler block itself.
+fn reset_signals_if_interrupted(ctx: &EvalContext<'_>, err: &ShellError) {
+    #[cfg(unix)]
+    let is_terminated_by_signal = matches!(err, ShellError::TerminatedBySignal { .. });
+    #[cfg(not(unix))]
+    let is_terminated_by_signal = false;
+
+    if matches!(err, ShellError::Interrupted { .. }) || is_terminated_by_signal {
+        ctx.engine_state.signals().reset();
+    }
 }
 
 /// Prepare the context for an error handler
@@ -324,9 +528,24 @@ enum InstructionResult {
     Continue,
     Branch(usize),
     Return(RegId),
+    /// Return from the block before reaching the end, carrying the full register contents.
+    ///
+    /// Unlike `Return`, this runs any pending `finally` handlers before the value leaves the
+    /// block, and flags the resulting data as an early return. The flag exists for one consumer:
+    /// top-level file evaluation, which reads it to skip `main`. Custom command calls and closure
+    /// invocations clear the flag instead, so a `return` in a nested call can't leak out and be
+    /// mistaken for a `return` at the current level.
+    ReturnEarly(RegId),
+    /// Jump to `index` after unwinding `handlers` entries of the `try` handler stack, running
+    /// any `finally` blocks among them.
+    UnwindJump {
+        index: usize,
+        handlers: usize,
+    },
+    /// Leave a `finally` block, resuming whatever control flow led into it.
+    EndFinally,
 }
 
-/// Perform an instruction
 fn eval_instruction<D: DebugContext>(
     ctx: &mut EvalContext<'_>,
     instruction: &Instruction,
@@ -366,6 +585,18 @@ fn eval_instruction<D: DebugContext>(
         }
         Instruction::Collect { src_dst } => {
             let data = ctx.take_reg(*src_dst);
+            #[cfg(feature = "os")]
+            let value = collect(data, *span, true)?;
+            #[cfg(not(feature = "os"))]
+            let value = collect(data, *span)?;
+            ctx.put_reg(*src_dst, PipelineExecutionData::from(value));
+            Ok(Continue)
+        }
+        Instruction::TryCollect { src_dst } => {
+            let data = ctx.take_reg(*src_dst);
+            #[cfg(feature = "os")]
+            let value = collect(data, *span, false)?;
+            #[cfg(not(feature = "os"))]
             let value = collect(data, *span)?;
             ctx.put_reg(*src_dst, PipelineExecutionData::from(value));
             Ok(Continue)
@@ -390,12 +621,34 @@ fn eval_instruction<D: DebugContext>(
             ctx.put_reg(*src, PipelineExecutionData::from(res));
             Ok(Continue)
         }
-        Instruction::LoadVariable { dst, var_id } => {
-            let value = get_var(ctx, *var_id, *span)?;
-            ctx.put_reg(
-                *dst,
-                PipelineExecutionData::from(value.into_pipeline_data()),
-            );
+        Instruction::LoadVariable {
+            dst,
+            var_id,
+            preserve_origin,
+        } => {
+            // Restore pipeline metadata for `$ans` (e.g. ls path_columns / colors on `.last`).
+            // Truncation warning is deferred until after print so data is visible first.
+            let data = if *var_id == nu_protocol::LAST_VARIABLE_ID {
+                ctx.stack.defer_last_result_truncation_warning();
+                ctx.stack.last_result_pipeline_data(*span)
+            } else if *preserve_origin {
+                // Keep definition span (e.g. `metadata $x`).
+                let value = ctx
+                    .stack
+                    .get_var_with_origin(*var_id, *span)
+                    .or_else(|err| {
+                        if let Some(const_val) = ctx.engine_state.get_constant(*var_id).cloned() {
+                            Ok(const_val)
+                        } else {
+                            Err(err)
+                        }
+                    })?;
+                value.into_pipeline_data()
+            } else {
+                let value = get_var(ctx, *var_id, *span)?;
+                value.into_pipeline_data()
+            };
+            ctx.put_reg(*dst, PipelineExecutionData::from(data));
             Ok(Continue)
         }
         Instruction::StoreVariable { var_id, src } => {
@@ -403,7 +656,7 @@ fn eval_instruction<D: DebugContext>(
             // Perform runtime type checking and conversion for variable assignment
             if nu_experimental::ENFORCE_RUNTIME_ANNOTATIONS.get() {
                 let variable = ctx.engine_state.get_var(*var_id);
-                let converted_value = check_assignment_type(value, &variable.ty)?;
+                let converted_value = check_assignment_type(value, &variable.ty, *span)?;
                 ctx.stack.add_var(*var_id, converted_value);
             } else {
                 ctx.stack.add_var(*var_id, value);
@@ -468,7 +721,9 @@ fn eval_instruction<D: DebugContext>(
             }
         }
         Instruction::PushPositional { src } => {
-            let val = ctx.collect_reg(*src, *span)?.with_span(*span);
+            // Keep the value's own span (e.g. definition span from load-variable-origin for
+            // `metadata $var`). Argument::span still records where the arg appears in the call.
+            let val = ctx.collect_reg(*src, *span)?;
             ctx.stack.arguments.push(Argument::Positional {
                 span: *span,
                 val,
@@ -477,7 +732,7 @@ fn eval_instruction<D: DebugContext>(
             Ok(Continue)
         }
         Instruction::AppendRest { src } => {
-            let vals = ctx.collect_reg(*src, *span)?.with_span(*span);
+            let vals = ctx.collect_reg(*src, *span)?;
             ctx.stack.arguments.push(Argument::Spread {
                 span: *span,
                 vals,
@@ -506,6 +761,8 @@ fn eval_instruction<D: DebugContext>(
             Ok(Continue)
         }
         Instruction::PushNamed { name, src } => {
+            // Null may be omitted or passed through depending on the target flag's type;
+            // that decision is made in `normalize_call_arguments` once the signature is known.
             let val = ctx.collect_reg(*src, *span)?.with_span(*span);
             let data = ctx.data.clone();
             ctx.stack.arguments.push(Argument::Named {
@@ -555,13 +812,11 @@ fn eval_instruction<D: DebugContext>(
             {
                 Ok(Continue)
             }
-            _ => Err(ShellError::GenericError {
-                error: "Can't redirect stderr of internal command output".into(),
-                msg: "piping stderr only works on external commands".into(),
-                span: Some(*span),
-                help: None,
-                inner: vec![],
-            }),
+            _ => Err(ShellError::Generic(GenericError::new(
+                "Can't redirect stderr of internal command output",
+                "piping stderr only works on external commands",
+                *span,
+            ))),
         },
         Instruction::OpenFile {
             file_num,
@@ -641,11 +896,18 @@ fn eval_instruction<D: DebugContext>(
                     PipelineExecutionData {
                         body: result,
                         exit: original_exit,
+                        early_return: false,
                     },
                 );
             }
             #[cfg(not(feature = "os"))]
-            ctx.put_reg(*src_dst, PipelineExecutionData { body: result });
+            ctx.put_reg(
+                *src_dst,
+                PipelineExecutionData {
+                    body: result,
+                    early_return: false,
+                },
+            );
             Ok(Continue)
         }
         Instruction::StringAppend { src_dst, val } => {
@@ -703,7 +965,7 @@ fn eval_instruction<D: DebugContext>(
             let list_span = list_value.span();
             let items_span = items.span();
             let items = match items {
-                Value::List { vals, .. } => vals,
+                Value::List { vals, .. } => vals.into_owned(),
                 Value::Nothing { .. } => Vec::new(),
                 _ => return Err(ShellError::CannotSpreadAsList { span: items_span }),
             };
@@ -782,10 +1044,36 @@ fn eval_instruction<D: DebugContext>(
             let data = ctx.take_reg(*src_dst);
             let path = ctx.take_reg(*path);
             if let PipelineData::Value(Value::CellPath { val: path, .. }, _) = path.body {
+                // Reattach `$ans` pipeline metadata when following only `.last`, so
+                // `$ans.last` keeps ls path_columns / colors like the original payload.
+                // Only for pipeline data marked by `last_result_pipeline_data`, not every
+                // record field named `last`.
+                let from_ans = data.body.metadata_ref().is_some_and(|m| {
+                    m.custom
+                        .get(nu_protocol::engine::Stack::ANS_LAST_RESULT_METADATA_KEY)
+                        .is_some()
+                });
+                let is_ans_last = from_ans
+                    && path.members.len() == 1
+                    && matches!(
+                        &path.members[0],
+                        nu_protocol::ast::PathMember::String { val, .. } if val == "last"
+                    );
+                let src_meta = data.body.metadata_ref().cloned();
                 let value = data.body.follow_cell_path(&path.members, *span)?;
+                let metadata = if is_ans_last {
+                    // Drop the ans marker; keep path_columns / content_type for display.
+                    src_meta.map(|mut m| {
+                        m.custom
+                            .remove(nu_protocol::engine::Stack::ANS_LAST_RESULT_METADATA_KEY);
+                        m
+                    })
+                } else {
+                    None
+                };
                 ctx.put_reg(
                     *src_dst,
-                    PipelineExecutionData::from(value.into_pipeline_data()),
+                    PipelineExecutionData::from(PipelineData::value(value, metadata)),
                 );
                 Ok(Continue)
             } else if let PipelineData::Value(Value::Error { error, .. }, _) = path.body {
@@ -821,10 +1109,10 @@ fn eval_instruction<D: DebugContext>(
             path,
             new_value,
         } => {
-            let data = ctx.take_reg(*src_dst);
-            let metadata = data.metadata();
+            let mut data = ctx.take_reg(*src_dst).body;
+            let metadata = data.take_metadata();
             // Change the span because we're modifying it
-            let mut value = data.body.into_value(*span)?;
+            let mut value = data.into_value(*span)?;
             let path = ctx.take_reg(*path);
             let new_value = ctx.collect_reg(*new_value, *span)?;
             if let PipelineData::Value(Value::CellPath { val: path, .. }, _) = path.body {
@@ -833,6 +1121,37 @@ fn eval_instruction<D: DebugContext>(
                     *src_dst,
                     PipelineExecutionData::from(value.into_pipeline_data_with_metadata(metadata)),
                 );
+                Ok(Continue)
+            } else if let PipelineData::Value(Value::Error { error, .. }, _) = path.body {
+                Err(*error)
+            } else {
+                Err(ShellError::TypeMismatch {
+                    err_message: "expected cell path".into(),
+                    span: path.span().unwrap_or(*span),
+                })
+            }
+        }
+        Instruction::UpdateVarCellPath {
+            var_id,
+            cell_path,
+            new_value,
+        } => {
+            let new_val = ctx.collect_reg(*new_value, *span)?;
+            let path = ctx.take_reg(*cell_path);
+            if let PipelineData::Value(Value::CellPath { val: path, .. }, _) = path.body {
+                let new_val = if nu_experimental::ENFORCE_RUNTIME_ANNOTATIONS.get() {
+                    let variable = ctx.engine_state.get_var(*var_id);
+                    let expected_ty = variable.ty.follow_cell_path(&path.members);
+                    if let Some(expected_ty) = expected_ty {
+                        check_assignment_type(new_val, &expected_ty, *span)?
+                    } else {
+                        new_val
+                    }
+                } else {
+                    new_val
+                };
+                ctx.stack
+                    .upsert_var_cell_path(*var_id, &path.members, new_val, *span)?;
                 Ok(Continue)
             } else if let PipelineData::Value(Value::Error { error, .. }, _) = path.body {
                 Err(*error)
@@ -910,50 +1229,64 @@ fn eval_instruction<D: DebugContext>(
             dst,
             stream,
             end_index,
-        } => eval_iterate(ctx, *dst, *stream, *end_index),
+        } => eval_iterate(ctx, *dst, *stream, *end_index, *span),
+        Instruction::UnwindJump { index, handlers } => Ok(InstructionResult::UnwindJump {
+            index: *index,
+            handlers: *handlers,
+        }),
         Instruction::OnError { index } => {
-            ctx.stack.error_handlers.push(ErrorHandler {
-                handler_index: *index,
-                error_register: None,
-            });
+            ctx.stack
+                .error_handlers
+                .push(TryHandler::Catch(ErrorHandler {
+                    handler_index: *index,
+                    error_register: None,
+                }));
             Ok(Continue)
         }
         Instruction::OnErrorInto { index, dst } => {
-            ctx.stack.error_handlers.push(ErrorHandler {
-                handler_index: *index,
-                error_register: Some(*dst),
-            });
-            Ok(Continue)
-        }
-        Instruction::Finally { index } => {
-            ctx.stack.finally_run_handlers.push(ErrorHandler {
-                handler_index: *index,
-                error_register: None,
-            });
+            ctx.stack
+                .error_handlers
+                .push(TryHandler::Catch(ErrorHandler {
+                    handler_index: *index,
+                    error_register: Some(*dst),
+                }));
             Ok(Continue)
         }
         Instruction::FinallyInto { index, dst } => {
-            ctx.stack.finally_run_handlers.push(ErrorHandler {
-                handler_index: *index,
-                error_register: Some(*dst),
-            });
+            ctx.stack
+                .error_handlers
+                .push(TryHandler::Finally(ErrorHandler {
+                    handler_index: *index,
+                    error_register: Some(*dst),
+                }));
             Ok(Continue)
         }
         Instruction::PopErrorHandler => {
-            ctx.stack.error_handlers.pop(ctx.error_handler_base);
-            Ok(Continue)
+            match ctx.stack.error_handlers.pop(ctx.error_handler_base) {
+                Some(TryHandler::Catch(_)) => Ok(Continue),
+                handler => Err(ShellError::IrEvalError {
+                    msg: format!("pop-error-handler expected a catch handler, found {handler:?}"),
+                    span: Some(*span),
+                }),
+            }
         }
-        Instruction::PopFinallyRun => {
-            ctx.stack.finally_run_handlers.pop(ctx.finally_handler_base);
-            Ok(Continue)
+        Instruction::BeginFinally => {
+            // Fall-through entry into a `finally` block: swap the handler for a running marker
+            // with nothing to resume afterwards. Unwinding entries do this swap themselves.
+            match ctx.stack.error_handlers.pop(ctx.error_handler_base) {
+                Some(TryHandler::Finally(_)) => {
+                    ctx.stack.error_handlers.push(TryHandler::RunningFinally);
+                    ctx.finally_resumes.push(None);
+                    Ok(Continue)
+                }
+                handler => Err(ShellError::IrEvalError {
+                    msg: format!("begin-finally expected a finally handler, found {handler:?}"),
+                    span: Some(*span),
+                }),
+            }
         }
-        Instruction::ReturnEarly { src } => {
-            let val = ctx.collect_reg(*src, *span)?;
-            Err(ShellError::Return {
-                span: *span,
-                value: Box::new(val),
-            })
-        }
+        Instruction::EndFinally => Ok(InstructionResult::EndFinally),
+        Instruction::ReturnEarly { src } => Ok(InstructionResult::ReturnEarly(*src)),
         Instruction::Return { src } => Ok(Return(*src)),
     }
 }
@@ -1163,6 +1496,12 @@ fn eval_call<D: DebugContext>(
 
     let args_len = caller_stack.arguments.get_len(*args_base);
     let decl = engine_state.get_decl(decl_id);
+    // Commands such as `ignore --stderr` need errors as pipeline values so they can decide
+    // whether to suppress or rethrow.
+    let stderr_pipe_separate = matches!(
+        redirect_err.as_ref(),
+        Some(Redirection::Pipe(OutDest::PipeSeparate))
+    );
 
     // Set up redirect modes
     let mut caller_stack = caller_stack.push_redirection(redirect_out.take(), redirect_err.take());
@@ -1174,6 +1513,14 @@ fn eval_call<D: DebugContext>(
 
             // check types after acquiring block to avoid unnecessarily cloning Signature
             check_input_types(&input, &block.signature, head)?;
+
+            // Expand record spreads into named flags; drop null named values.
+            let args_len = normalize_call_arguments(
+                &block.signature,
+                &mut caller_stack,
+                *args_base,
+                args_len,
+            )?;
 
             // Set up a callee stack with the captures and move arguments from the stack into variables
             let mut callee_stack = caller_stack.gather_captures(engine_state, &block.captures);
@@ -1187,6 +1534,13 @@ fn eval_call<D: DebugContext>(
                 args_len,
                 head,
             )?;
+
+            // Snapshot the call's return destination onto the callee stack. Intermediate
+            // expressions in the body may temporarily set OutDest::Value (e.g. `if (…)`);
+            // Stack::is_stdout_redirected / `is-redirected` read this frame instead.
+            // See Stack::with_invocation_stdout for details.
+            let mut callee_stack =
+                callee_stack.with_invocation_stdout(caller_stack.stdout().clone());
 
             // Add one to the recursion count, so we don't recurse too deep. Stack overflows are not
             // recoverable in Rust.
@@ -1203,7 +1557,25 @@ fn eval_call<D: DebugContext>(
 
             result
         } else {
-            check_input_types(&input, &decl.signature(), head)?;
+            // `ignore` intentionally handles upstream error values at command level.
+            // Skip early input-error propagation for the built-in `ignore` command so
+            // `run()` can apply `--stderr`/`--show-errors` semantics.
+            let allow_error_input = matches!(input, PipelineData::Value(Value::Error { .. }, ..))
+                && engine_state
+                    .find_decl(b"ignore", &[])
+                    .is_some_and(|ignore_decl_id| ignore_decl_id == decl_id);
+            if !allow_error_input {
+                check_input_types(&input, &decl.signature(), head)?;
+            }
+
+            // Expand record spreads into named flags; drop null named values.
+            let args_len = normalize_call_arguments(
+                &decl.signature(),
+                &mut caller_stack,
+                *args_base,
+                args_len,
+            )?;
+
             // FIXME: precalculate this and save it somewhere
             let span = Span::merge_many(
                 std::iter::once(head).chain(
@@ -1240,7 +1612,10 @@ fn eval_call<D: DebugContext>(
     ctx.redirect_out = None;
     ctx.redirect_err = None;
 
-    result
+    match result {
+        Err(err) if stderr_pipe_separate => Ok(PipelineData::Value(Value::error(err, head), None)),
+        result => result,
+    }
 }
 
 fn find_named_var_id(
@@ -1251,14 +1626,11 @@ fn find_named_var_id(
 ) -> Result<VarId, ShellError> {
     sig.named
         .iter()
-        .find(|n| {
-            if !n.long.is_empty() {
-                n.long.as_bytes() == name
-            } else {
-                // It's possible to only have a short name and no long name
-                n.short
-                    .is_some_and(|s| s.encode_utf8(&mut [0; 4]).as_bytes() == short)
-            }
+        .find(|n| match (n.long_name(), n.short) {
+            (Some(long), _) => long.as_bytes() == name,
+            // Short-only flag: match on the short character
+            (None, Some(s)) => s.encode_utf8(&mut [0; 4]).as_bytes() == short,
+            (None, None) => false,
         })
         .ok_or_else(|| ShellError::IrEvalError {
             msg: format!(
@@ -1290,6 +1662,25 @@ fn expect_positional_var_id(arg: &PositionalArg, span: Span) -> Result<VarId, Sh
     })
 }
 
+/// Normalize call arguments: expand record spreads into named flags; drop null
+/// named values unless the flag type accepts `nothing`.
+///
+/// Returns the new argument list length after rewriting the frame starting at `args_base`.
+fn normalize_call_arguments(
+    signature: &Signature,
+    stack: &mut Stack,
+    args_base: usize,
+    args_len: usize,
+) -> Result<usize, ShellError> {
+    let raw: Vec<Argument> = stack.arguments.drain_args(args_base, args_len).collect();
+    let expanded = normalize_engine_arguments(signature, raw)?;
+    let new_len = expanded.len();
+    for arg in expanded {
+        stack.arguments.push(arg);
+    }
+    Ok(new_len)
+}
+
 /// Move arguments from the stack into variables for a custom command
 fn gather_arguments(
     engine_state: &EngineState,
@@ -1317,8 +1708,17 @@ fn gather_arguments(
     let mut rest = vec![];
     let mut rest_span: Option<Span> = None;
 
+    // If the rest param uses ExternalArgument shape (untyped `def --wrapped` or `known extern`),
+    // tilde and ndots in bare glob values should be expanded, matching `run-external` behavior so
+    // that `$args | to nuon` shows expanded paths (e.g. `/home/user`) rather than `~`.
+    // We detect this via `allows_unknown_args`, which is set for all `def --wrapped` and
+    // `known extern` commands, and only affects `Value::Glob` values (explicit `[...rest: string]`
+    // produces `Value::String`, not `Value::Glob`, so those are unaffected).
+    let expand_glob_args = block.signature.allows_unknown_args;
+
     // If we encounter a spread, all further positionals should go to rest
     let mut always_spread = false;
+    let mut remaining_required = block.signature.required_positional.len();
 
     for arg in caller_stack.arguments.drain_args(args_base, args_len) {
         match arg {
@@ -1332,10 +1732,18 @@ fn gather_arguments(
                         // SyntaxShape here, we might be able to save some allocations and effort
                         let variable = engine_state.get_var(var_id);
                         check_type(&val, &variable.ty)?;
+                        remaining_required = remaining_required.saturating_sub(1);
                     }
                     callee_stack.add_var(var_id, val);
                 } else {
-                    rest_span = Some(rest_span.map_or(val.span(), |s| s.append(val.span())));
+                    // Use the argument's call-site span (not val.span()) so rest spans stay in
+                    // source order. Values may keep definition/origin spans (e.g. metadata).
+                    rest_span = Some(rest_span.map_or(span, |s| s.append(span)));
+                    let val = if expand_glob_args {
+                        expand_external_glob_arg(val)
+                    } else {
+                        val
+                    };
                     rest.push(val);
                 }
             }
@@ -1345,13 +1753,34 @@ fn gather_arguments(
                 ..
             } => match vals {
                 Value::List { vals, .. } => {
+                    // Dual-purpose `...$x`: a list before unfilled required positionals would
+                    // leave them unbound (list items go only to rest).
+                    if remaining_required > 0 && !always_spread {
+                        return Err(crate::named_flags::list_spread_before_required_error(
+                            spread_span,
+                        ));
+                    }
                     rest.extend(vals);
                     rest_span = Some(rest_span.map_or(spread_span, |s| s.append(spread_span)));
                     always_spread = true;
                 }
                 Value::Nothing { .. } => {
+                    // Same rule as list spreads: null rest-mode before required positionals
+                    // would leave them unbound.
+                    if remaining_required > 0 && !always_spread {
+                        return Err(crate::named_flags::list_spread_before_required_error(
+                            spread_span,
+                        ));
+                    }
                     rest_span = Some(rest_span.map_or(spread_span, |s| s.append(spread_span)));
                     always_spread = true;
+                }
+                // Record spreads should already be expanded by `normalize_call_arguments`.
+                Value::Record { .. } => {
+                    return Err(ShellError::IrEvalError {
+                        msg: "internal error: unexpanded record spread in gather_arguments".into(),
+                        span: Some(spread_span),
+                    });
                 }
                 Value::Error { error, .. } => return Err(*error),
                 _ => return Err(ShellError::CannotSpreadAsList { span: vals.span() }),
@@ -1373,6 +1802,8 @@ fn gather_arguments(
                 val,
                 ..
             } => {
+                // Null should already have been dropped in `normalize_call_arguments`
+                // when the flag type does not accept nothing. If still present, bind it.
                 let var_id = find_named_var_id(&block.signature, &data[name], &data[short], span)?;
                 callee_stack.add_var(var_id, val)
             }
@@ -1424,7 +1855,7 @@ fn gather_arguments(
 fn check_type(val: &Value, ty: &Type) -> Result<(), ShellError> {
     match val {
         Value::Error { error, .. } => Err(*error.clone()),
-        _ if val.is_subtype_of(ty) => Ok(()),
+        _ if val.is_assignable_to(ty) => Ok(()),
         _ => Err(ShellError::CantConvert {
             to_type: ty.to_string(),
             from_type: val.get_type().to_string(),
@@ -1435,16 +1866,35 @@ fn check_type(val: &Value, ty: &Type) -> Result<(), ShellError> {
 }
 
 /// Type check and convert value for assignment.
-fn check_assignment_type(val: Value, target_ty: &Type) -> Result<Value, ShellError> {
+fn check_assignment_type(
+    val: Value,
+    target_ty: &Type,
+    assignment_span: Span,
+) -> Result<Value, ShellError> {
     match val {
         Value::Error { error, .. } => Err(*error),
-        _ if val.is_subtype_of(target_ty) => Ok(val), // No conversion needed, but compatible
-        _ => Err(ShellError::CantConvert {
-            to_type: target_ty.to_string(),
-            from_type: val.get_type().to_string(),
-            span: val.span(),
-            help: None,
-        }),
+        _ if val.is_assignable_to(target_ty) => Ok(val), // No conversion needed, but compatible
+        _ => {
+            let expected = target_ty.to_string();
+            let actual = val.get_type().to_string();
+
+            let mut err = LabeledError::new("Type mismatch.");
+            err = err.with_code("nu::shell::type_mismatch");
+
+            // Some values, like `$env.CMD_DURATION_MS`, are generated internally and don't have
+            // spans that are relevant to users.
+            // We avoid incorrect error labels by checking for that here.
+            if !(val.span() == Span::unknown() || val.span() == Span::test_data()) {
+                err = err.with_label(format!("the value is a {actual}"), val.span());
+            }
+
+            err = err.with_label(
+                format!("expected {expected}, got {actual}"),
+                assignment_span,
+            );
+
+            Err(ShellError::LabeledError(err.into()))
+        }
     }
 }
 
@@ -1477,7 +1927,7 @@ fn check_input_types(
     // Check if the input type is compatible with *any* of the command's possible input types
     if io_types
         .iter()
-        .any(|(command_type, _)| input.is_subtype_of(command_type))
+        .any(|(command_type, _)| input.is_assignable_to(command_type))
     {
         return Ok(());
     }
@@ -1491,7 +1941,7 @@ fn check_input_types(
             exp_input_type: expected_string,
             wrong_type: input.get_type().to_string(),
             dst_span: head,
-            src_span: input.span().unwrap_or(Span::unknown()),
+            src_span: input.span().unwrap_or(head),
         }),
         // expected_string didn't generate properly, so we can't show the proper error
         (_, None) => Err(ShellError::NushellFailed {
@@ -1501,7 +1951,7 @@ fn check_input_types(
 }
 
 /// Get variable from [`Stack`] or [`EngineState`]
-fn get_var(ctx: &EvalContext<'_>, var_id: VarId, span: Span) -> Result<Value, ShellError> {
+fn get_var(ctx: &mut EvalContext<'_>, var_id: VarId, span: Span) -> Result<Value, ShellError> {
     match var_id {
         // $env
         ENV_VARIABLE_ID => {
@@ -1517,6 +1967,11 @@ fn get_var(ctx: &EvalContext<'_>, var_id: VarId, span: Span) -> Result<Value, Sh
             pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
             Ok(Value::record(pairs.into_iter().collect(), span))
+        }
+        id if id == nu_protocol::LAST_VARIABLE_ID => {
+            // Truncation warning is deferred until after print (see evaluate_source).
+            ctx.stack.defer_last_result_truncation_warning();
+            ctx.stack.get_var(var_id, span)
         }
         _ => ctx.stack.get_var(var_id, span).or_else(|err| {
             // $nu is handled by getting constant
@@ -1598,15 +2053,39 @@ fn get_env_var_name<'a>(ctx: &mut EvalContext<'_>, key: &'a str) -> Cow<'a, str>
 /// Helper to collect values into [`PipelineData`], preserving original span and metadata
 ///
 /// The metadata is removed if it is the file data source, as that's just meant to mark streams.
-fn collect(pipe: PipelineExecutionData, fallback_span: Span) -> Result<PipelineData, ShellError> {
-    let data = pipe.body;
+///
+/// It doesn't check pipefail if `ignore_error` is true.
+fn collect(
+    pipe: PipelineExecutionData,
+    fallback_span: Span,
+    #[cfg(feature = "os")] ignore_error: bool,
+) -> Result<PipelineData, ShellError> {
+    let mut data = pipe.body;
     let span = data.span().unwrap_or(fallback_span);
-    let metadata = data.metadata().and_then(|m| m.for_collect());
-    let value = data.into_value(span)?;
+    let metadata = data.take_metadata().and_then(|m| m.for_collect());
     #[cfg(feature = "os")]
-    if nu_experimental::PIPE_FAIL.get() {
-        check_exit_status_future(pipe.exit)?
+    if nu_experimental::PIPE_FAIL.get() && !ignore_error {
+        check_exit_status_future(pipe.exit)?;
     }
+    // A child stream without captured stdout carries no data: the external already wrote
+    // its output to the inherited stdout or a redirection target. Collecting it into a
+    // value would fabricate an empty string, which prints as a stray blank line when the
+    // collected output is displayed (#18765). Wait for the child instead, so a failure
+    // still surfaces as an error, and collect to Empty like a drained stream.
+    #[cfg(feature = "os")]
+    {
+        use nu_protocol::ByteStreamSource;
+        let stdout_uncaptured = matches!(
+            &data,
+            PipelineData::ByteStream(stream, ..)
+                if matches!(stream.source(), ByteStreamSource::Child(child) if child.stdout.is_none())
+        );
+        if stdout_uncaptured {
+            data.drain()?;
+            return Ok(PipelineData::empty());
+        }
+    }
+    let value = data.into_value(span)?;
     Ok(PipelineData::value(value, metadata))
 }
 
@@ -1752,6 +2231,7 @@ fn eval_iterate(
     dst: RegId,
     stream: RegId,
     end_index: usize,
+    span: Span,
 ) -> Result<InstructionResult, ShellError> {
     let mut data = ctx.take_reg(stream);
     if let PipelineData::ListStream(list_stream, _) = &mut data.body {
@@ -1767,8 +2247,8 @@ fn eval_iterate(
     } else {
         // Convert the PipelineData to an iterator, and wrap it in a ListStream so it can be
         // iterated on
-        let metadata = data.metadata();
-        let span = data.span().unwrap_or(Span::unknown());
+        let metadata = data.body.take_metadata();
+        let span = data.span().unwrap_or(span);
         ctx.put_reg(
             stream,
             PipelineExecutionData::from(PipelineData::list_stream(
@@ -1776,7 +2256,7 @@ fn eval_iterate(
                 metadata,
             )),
         );
-        eval_iterate(ctx, dst, stream, end_index)
+        eval_iterate(ctx, dst, stream, end_index, span)
     }
 }
 
@@ -1790,7 +2270,7 @@ fn redirect_env(engine_state: &EngineState, caller_stack: &mut Stack, callee_sta
     // (the callee hid them)
     for var in caller_env_vars.iter() {
         if !callee_stack.has_env_var(engine_state, var) {
-            caller_stack.remove_env_var(engine_state, var);
+            caller_stack.hide_env_var(engine_state, var);
         }
     }
 

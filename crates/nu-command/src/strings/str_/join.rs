@@ -53,10 +53,11 @@ impl Command for StrJoin {
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let separator: Option<String> = call.opt_const(working_set, 0)?;
+        let separator: Option<String> = call.opt_const(working_set, stack, 0)?;
         run(working_set.permanent(), call, input, separator)
     }
 
@@ -79,14 +80,14 @@ impl Command for StrJoin {
 fn run(
     engine_state: &EngineState,
     call: &Call,
-    input: PipelineData,
+    mut input: PipelineData,
     separator: Option<String>,
 ) -> Result<PipelineData, ShellError> {
     let config = engine_state.config.clone();
 
     let span = call.head;
 
-    let metadata = input.metadata();
+    let metadata = input.take_metadata();
     let mut iter = input.into_iter();
     let mut first = true;
 
@@ -135,9 +136,7 @@ fn run(
 mod tests {
     use super::*;
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(StrJoin {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(StrJoin)
     }
 }

@@ -21,11 +21,17 @@ impl Command for SourceEnv {
     fn signature(&self) -> Signature {
         Signature::build("source-env")
             .input_output_types(vec![(Type::Any, Type::Any)])
-            .required(
-                "filename",
-                SyntaxShape::OneOf(vec![SyntaxShape::String, SyntaxShape::Nothing]), // type is string to avoid automatically canonicalizing the path
-                "The filepath to the script file to source the environment from (`null` for no-op).",
-            )
+            .param(Parameter::Required(
+                PositionalArg::new(
+                    "filename",
+                    // type is string to avoid automatically canonicalizing the path
+                    SyntaxShape::OneOf(vec![SyntaxShape::String, SyntaxShape::Nothing]),
+                )
+                .desc("The filepath to the script file to source the environment from (`null` for no-op).")
+                .completion(Completion::Builtin(BuiltinCompletion::NuFile {
+                    std_virtual_path: false,
+                })),
+            ))
             .category(Category::Core)
     }
 
@@ -34,8 +40,8 @@ impl Command for SourceEnv {
     }
 
     fn extra_description(&self) -> &str {
-        r#"This command is a parser keyword. For details, check:
-  https://www.nushell.sh/book/thinking_in_nu.html"#
+        "This command is a parser keyword. For details, check:
+  https://www.nushell.sh/book/thinking_in_nu.html"
     }
 
     fn command_type(&self) -> CommandType {
@@ -112,12 +118,12 @@ impl Command for SourceEnv {
         vec![
             Example {
                 description: "Sources the environment from foo.nu in the current context.",
-                example: r#"source-env foo.nu"#,
+                example: "source-env foo.nu",
                 result: None,
             },
             Example {
                 description: "Sourcing `null` is a no-op.",
-                example: r#"source-env null"#,
+                example: "source-env null",
                 result: None,
             },
         ]

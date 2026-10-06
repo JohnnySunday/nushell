@@ -1,5 +1,6 @@
 use nu_cmd_base::input_handler::{CmdArgument, operate};
 use nu_engine::command_prelude::*;
+use nu_protocol::shell_error::generic::GenericError;
 
 #[derive(Clone)]
 pub struct StrTrim;
@@ -99,13 +100,14 @@ impl Command for StrTrim {
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let character = call.get_flag_const::<Spanned<String>>(working_set, "char")?;
-        let cell_paths: Vec<CellPath> = call.rest_const(working_set, 0)?;
-        let left = call.has_flag_const(working_set, "left")?;
-        let right = call.has_flag_const(working_set, "right")?;
+        let character = call.get_flag_const::<Spanned<String>>(working_set, stack, "char")?;
+        let cell_paths: Vec<CellPath> = call.rest_const(working_set, stack, 0)?;
+        let left = call.has_flag_const(working_set, stack, "left")?;
+        let right = call.has_flag_const(working_set, stack, "right")?;
         run(
             character,
             cell_paths,
@@ -158,13 +160,11 @@ fn run(
     let to_trim = match character.as_ref() {
         Some(v) => {
             if v.item.chars().count() > 1 {
-                return Err(ShellError::GenericError {
-                    error: "Trim only works with single character".into(),
-                    msg: "needs single character".into(),
-                    span: Some(v.span),
-                    help: None,
-                    inner: vec![],
-                });
+                return Err(ShellError::Generic(GenericError::new(
+                    "Trim only works with single character",
+                    "needs single character",
+                    v.span,
+                )));
             }
             v.item.chars().next()
         }
@@ -269,10 +269,8 @@ mod tests {
     use nu_protocol::{Span, Value};
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(StrTrim {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(StrTrim)
     }
 
     fn make_record(cols: Vec<&str>, vals: Vec<&str>) -> Value {

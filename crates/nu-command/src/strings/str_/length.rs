@@ -90,17 +90,18 @@ impl Command for StrLength {
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let cell_paths: Vec<CellPath> = call.rest_const(working_set, 0)?;
-        let chars = call.has_flag_const(working_set, "chars")?;
+        let cell_paths: Vec<CellPath> = call.rest_const(working_set, stack, 0)?;
+        let chars = call.has_flag_const(working_set, stack, "chars")?;
         run(
             cell_paths,
             working_set.permanent(),
             call,
             input,
-            grapheme_flags_const(working_set, call)?,
+            grapheme_flags_const(working_set, stack, call)?,
             chars,
         )
     }
@@ -194,9 +195,7 @@ mod test {
     }
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(StrLength {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(StrLength)
     }
 }

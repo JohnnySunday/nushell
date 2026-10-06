@@ -1,11 +1,12 @@
 use crate::{
     BlockId, Category, CompileError, Config, DeclId, FileId, GetSpan, Module, ModuleId, OverlayId,
-    ParseError, ParseWarning, ResolvedImportPattern, Signature, Span, SpanId, Type, Value, VarId,
-    VirtualPathId,
+    ParseError, ParseWarning, ResolvedImportPattern, ResolvedSpan, Signature, Span, SpanId, Type,
+    TypeSet, Value, VarId, VirtualPathId,
     ast::Block,
     engine::{
-        CachedFile, Command, CommandType, EngineState, OverlayFrame, StateDelta, Variable,
-        VirtualPath, Visibility, description::build_desc,
+        BracketTable, CachedFile, Command, CommandType, EngineState, OverlayFrame, ScopeBindings,
+        StateDelta, Variable, VirtualPath, Visibility, VisibilityStack, description::build_desc,
+        engine_state::FileHint, signature_cache::SignatureCache,
     },
 };
 use core::panic;
@@ -29,9 +30,31 @@ pub struct StateWorkingSet<'a> {
     pub files: FileStack,
     /// Whether or not predeclarations are searched when looking up a command (used with aliases)
     pub search_predecls: bool,
+    /// When true, `use` / `export use` / `overlay use` / `module <file>` parse as
+    /// syntax only and do not load modules from disk or the virtual filesystem.
+    /// The REPL highlighter sets this so typing `use std` does not parse-time-load
+    /// the standard library on every keystroke.
+    pub skip_module_load: bool,
     pub parse_errors: Vec<ParseError>,
     pub parse_warnings: Vec<ParseWarning>,
     pub compile_errors: Vec<CompileError>,
+    /// Whether the lexer records and uses [`bracket_tables`](Self::bracket_tables) to skip over
+    /// nested groups. Always on; it only changes how fast the lexer is, never what it produces,
+    /// so tests turn it off to show that a parse comes out the same both ways.
+    pub lex_once: bool,
+    /// Bracket tables of the files being parsed, innermost last, when [`lex_once`](Self::lex_once)
+    /// is on. nu-parser's lexer records one when it lexes a whole file of 1 KiB to 16 MiB (a parsed
+    /// script or a module file), later lexes of parts of that file use it, and nu-parser drops it
+    /// when it finishes parsing the file. Files nest only through `use` and `source`, so this is a
+    /// short list.
+    pub bracket_tables: Vec<BracketTable>,
+    /// The span of the body of the `def` being parsed. `parse_def` compiles the body itself once it
+    /// has closed the body's scope, so the closure parser leaves the closure with this span
+    /// uncompiled instead of compiling it a first time.
+    pub def_body_span: Option<Span>,
+    /// The index in `delta.files` of the file the last span lookup found (see
+    /// [`Self::get_span_contents`]).
+    last_file_hit: FileHint,
 }
 
 impl<'a> StateWorkingSet<'a> {
@@ -48,9 +71,14 @@ impl<'a> StateWorkingSet<'a> {
             permanent_state,
             files,
             search_predecls: true,
+            skip_module_load: false,
             parse_errors: vec![],
             parse_warnings: vec![],
             compile_errors: vec![],
+            lex_once: true,
+            bracket_tables: vec![],
+            def_body_span: None,
+            last_file_hit: FileHint::default(),
         }
     }
 
@@ -143,13 +171,8 @@ impl<'a> StateWorkingSet<'a> {
     }
 
     pub fn use_variables(&mut self, variables: Vec<(Vec<u8>, VarId)>) {
-        let overlay_frame = self.last_overlay_mut();
-
-        for (mut name, var_id) in variables {
-            if !name.starts_with(b"$") {
-                name.insert(0, b'$');
-            }
-            overlay_frame.insert_variable(name, var_id);
+        for (name, var_id) in variables {
+            self.insert_variable_into_scope(name, var_id);
         }
     }
 
@@ -205,6 +228,13 @@ impl<'a> StateWorkingSet<'a> {
         }
 
         None
+    }
+
+    /// Drop the predeclaration of `name` without defining it, wherever [`Self::merge_predecl`]
+    /// would find it, so that later calls to `name` don't resolve to a declaration without a body.
+    pub fn remove_predecl(&mut self, name: &[u8]) -> Option<DeclId> {
+        self.move_one_predecl_to_overlay(name);
+        self.last_overlay_mut().predecls.remove(name)
     }
 
     fn move_one_predecl_to_overlay(&mut self, name: &[u8]) {
@@ -314,7 +344,7 @@ impl<'a> StateWorkingSet<'a> {
         }
     }
 
-    pub fn files(&self) -> impl Iterator<Item = &CachedFile> {
+    pub fn files(&self) -> impl DoubleEndedIterator<Item = &CachedFile> {
         self.permanent_state.files().chain(self.delta.files.iter())
     }
 
@@ -336,10 +366,10 @@ impl<'a> StateWorkingSet<'a> {
     }
 
     #[must_use]
-    pub fn add_file(&mut self, filename: String, contents: &[u8]) -> FileId {
+    pub fn add_file(&mut self, filename: &str, contents: &[u8]) -> FileId {
         // First, look for the file to see if we already have it
         for (idx, cached_file) in self.files().enumerate() {
-            if *cached_file.name == filename && &*cached_file.content == contents {
+            if &*cached_file.name == filename && &*cached_file.content == contents {
                 return FileId::new(idx);
             }
         }
@@ -393,15 +423,13 @@ impl<'a> StateWorkingSet<'a> {
         result.covered_span
     }
 
+    #[inline]
     pub fn get_span_contents(&self, span: Span) -> &[u8] {
         let permanent_end = self.permanent_state.next_span_start();
-        if permanent_end <= span.start {
-            for cached_file in &self.delta.files {
-                if cached_file.covered_span.contains_span(span) {
-                    return &cached_file.content[span.start - cached_file.covered_span.start
-                        ..span.end - cached_file.covered_span.start];
-                }
-            }
+        if permanent_end <= span.start
+            && let Some(contents) = self.last_file_hit.contents(&self.delta.files, span)
+        {
+            return contents;
         }
 
         // if no files with span were found, fall back on permanent ones
@@ -443,7 +471,7 @@ impl<'a> StateWorkingSet<'a> {
     pub fn find_decl(&self, name: &[u8]) -> Option<DeclId> {
         let mut removed_overlays = vec![];
 
-        let mut visibility: Visibility = Visibility::new();
+        let mut visibility = VisibilityStack::default();
 
         for scope_frame in self.delta.scope.iter().rev() {
             if self.search_predecls
@@ -455,7 +483,7 @@ impl<'a> StateWorkingSet<'a> {
 
             // check overlay in delta
             for overlay_frame in scope_frame.active_overlays(&mut removed_overlays).rev() {
-                visibility.append(&overlay_frame.visibility);
+                visibility.push(&overlay_frame.visibility);
 
                 if self.search_predecls
                     && let Some(decl_id) = overlay_frame.predecls.get(name)
@@ -483,7 +511,7 @@ impl<'a> StateWorkingSet<'a> {
     pub fn find_decl_name(&self, decl_id: DeclId) -> Option<&[u8]> {
         let mut removed_overlays = vec![];
 
-        let mut visibility: Visibility = Visibility::new();
+        let mut visibility = VisibilityStack::default();
 
         for scope_frame in self.delta.scope.iter().rev() {
             if self.search_predecls {
@@ -496,7 +524,7 @@ impl<'a> StateWorkingSet<'a> {
 
             // check overlay in delta
             for overlay_frame in scope_frame.active_overlays(&mut removed_overlays).rev() {
-                visibility.append(&overlay_frame.visibility);
+                visibility.push(&overlay_frame.visibility);
 
                 if self.search_predecls {
                     for (name, id) in overlay_frame.predecls.iter() {
@@ -636,6 +664,12 @@ impl<'a> StateWorkingSet<'a> {
         if !name.starts_with(b"$") {
             name.insert(0, b'$');
         }
+        // Record the name on delta variables so `scope variables` can list stack locals
+        // that never enter permanent overlays. Permanent vars keep `name: None` here;
+        // their names remain available through permanent overlay maps.
+        if let Some(var) = self.get_variable_mut(var_id) {
+            var.name = Some(name.clone());
+        }
         self.last_overlay_mut().insert_variable(name, var_id);
     }
 
@@ -693,12 +727,48 @@ impl<'a> StateWorkingSet<'a> {
         }
     }
 
+    /// Mutable access to a variable that still lives in the working-set delta.
+    ///
+    /// Returns `None` for variables that already belong to the permanent engine state.
+    pub fn get_variable_mut(&mut self, var_id: VarId) -> Option<&mut Variable> {
+        let num_permanent_vars = self.permanent_state.num_vars();
+        if var_id.get() < num_permanent_vars {
+            None
+        } else {
+            self.delta.vars.get_mut(var_id.get() - num_permanent_vars)
+        }
+    }
+
     pub fn get_variable_if_possible(&self, var_id: VarId) -> Option<&Variable> {
         let num_permanent_vars = self.permanent_state.num_vars();
         if var_id.get() < num_permanent_vars {
             Some(self.permanent_state.get_var(var_id))
         } else {
             self.delta.vars.get(var_id.get() - num_permanent_vars)
+        }
+    }
+
+    /// Snapshot command/module bindings from the **innermost** scope frame.
+    ///
+    /// # Invariant
+    ///
+    /// Must run on the scope frame that owns the block's locals, **immediately before** the
+    /// matching `exit_scope` (which discards that frame). Call sites:
+    /// `parse_block_expression`, `parse_closure_expression`, and scoped `parse_block`.
+    /// Keep those three call sites explicit so a new scoped construct is forced to opt in.
+    pub fn snapshot_scope_bindings(&self) -> Option<Arc<ScopeBindings>> {
+        let frame = self.delta.last_scope_frame();
+        let mut bindings = ScopeBindings::default();
+        let mut removed_overlays = vec![];
+
+        for overlay in frame.active_overlays(&mut removed_overlays) {
+            bindings.extend_from_overlay(overlay);
+        }
+
+        if bindings.is_empty() {
+            None
+        } else {
+            Some(Arc::new(bindings))
         }
     }
 
@@ -746,6 +816,98 @@ impl<'a> StateWorkingSet<'a> {
         } else {
             decl.signature()
         }
+    }
+
+    /// Shared version of [`StateWorkingSet::get_signature`] for the declaration `decl_id`.
+    ///
+    /// Permanent declarations are built once and then returned from a cache on the
+    /// [`EngineState`]; declarations in the delta are rebuilt on every call, exactly like
+    /// `get_signature`, because `def` replaces a predeclaration's signature in place while parsing.
+    pub fn get_signature_shared(&self, decl_id: DeclId) -> Arc<Signature> {
+        if decl_id.get() >= self.permanent_state.num_decls() {
+            return Arc::new(self.get_signature(self.get_decl(decl_id)));
+        }
+        let mut cache = SignatureCache::lock(&self.permanent_state.signature_cache.effective);
+        Arc::clone(
+            cache
+                .entry(decl_id)
+                .or_insert_with(|| Arc::new(self.get_signature(self.get_decl(decl_id)))),
+        )
+    }
+
+    /// Shared version of `Command::signature()` for the declaration `decl_id`, i.e. the
+    /// declaration's own signature rather than the one on its block.
+    ///
+    /// Cached for permanent declarations, rebuilt on every call for delta declarations. A
+    /// declaration without a block has no other signature, so this shares the one
+    /// [`StateWorkingSet::get_signature_shared`] returns instead of building and caching a copy.
+    pub fn get_decl_signature_shared(&self, decl_id: DeclId) -> Arc<Signature> {
+        if self.get_decl(decl_id).block_id().is_none() {
+            return self.get_signature_shared(decl_id);
+        }
+        if decl_id.get() >= self.permanent_state.num_decls() {
+            return Arc::new(self.get_decl(decl_id).signature());
+        }
+        let mut cache = SignatureCache::lock(&self.permanent_state.signature_cache.declared);
+        Arc::clone(
+            cache
+                .entry(decl_id)
+                .or_insert_with(|| Arc::new(self.get_decl(decl_id).signature())),
+        )
+    }
+
+    /// The output type of a call to `decl_id` whose pipeline input is `input_type`, as the parser
+    /// assigns it when it parses the call: what the effective signature of `decl_id` (see
+    /// [`StateWorkingSet::get_signature_shared`]) gives for the input with `Nothing` added to it,
+    /// so that commands which ignore their input still type-check.
+    ///
+    /// `signature` is that effective signature, which the caller already has. It is only used for
+    /// delta declarations, whose output type is computed on every call. For permanent declarations
+    /// the answer is remembered per input type (see [`EngineState`]'s signature cache), so it is
+    /// computed from the cached effective signature of `decl_id` instead of from `signature`,
+    /// because the cache is keyed by the declaration alone and must not depend on what a caller
+    /// passes.
+    pub fn call_output_type(
+        &self,
+        decl_id: DeclId,
+        signature: &Signature,
+        input_type: Option<&Type>,
+    ) -> Option<Type> {
+        let output_type = |signature: &Signature| {
+            signature.get_output_type(
+                input_type
+                    .map(|ty| ty.clone().union(Type::Nothing))
+                    .as_ref(),
+            )
+        };
+        if decl_id.get() >= self.permanent_state.num_decls() {
+            return output_type(signature);
+        }
+        SignatureCache::output_type(
+            &self.permanent_state.signature_cache.call_outputs,
+            decl_id,
+            input_type,
+            || output_type(&self.get_signature_shared(decl_id)),
+        )
+    }
+
+    /// The output type the declaration's own signature (see
+    /// [`StateWorkingSet::get_decl_signature_shared`]) gives for `input_type`, as pipeline type
+    /// checking asks for it. Remembered like [`StateWorkingSet::call_output_type`].
+    pub fn decl_output_type(&self, decl_id: DeclId, input_type: Option<&Type>) -> Option<Type> {
+        let compute = || {
+            self.get_decl_signature_shared(decl_id)
+                .get_output_type(input_type)
+        };
+        if decl_id.get() >= self.permanent_state.num_decls() {
+            return compute();
+        }
+        SignatureCache::output_type(
+            &self.permanent_state.signature_cache.declared_outputs,
+            decl_id,
+            input_type,
+            compute,
+        )
     }
 
     /// Apply a function to all commands. The function accepts a command name and its DeclId
@@ -1026,6 +1188,37 @@ impl<'a> StateWorkingSet<'a> {
         None
     }
 
+    /// Blocks covering `span`, newest first (delta before permanent).
+    pub fn blocks_with_span_newest_first(&self, span: Span) -> Vec<Arc<Block>> {
+        let mut blocks = Vec::new();
+        for block in self.delta.blocks.iter().rev() {
+            if block.span == Some(span) {
+                blocks.push(block.clone());
+            }
+        }
+        for block in self.permanent_state.blocks.iter().rev() {
+            if block.span == Some(span) {
+                blocks.push(block.clone());
+            }
+        }
+        blocks
+    }
+
+    /// Identity lookup so a cache hit can keep the existing `BlockId`.
+    pub fn find_block_id_of(&self, block: &Arc<Block>) -> Option<BlockId> {
+        for (idx, existing) in self.delta.blocks.iter().enumerate() {
+            if Arc::ptr_eq(existing, block) {
+                return Some(BlockId::new(self.permanent_state.num_blocks() + idx));
+            }
+        }
+        for (idx, existing) in self.permanent_state.blocks.iter().enumerate() {
+            if Arc::ptr_eq(existing, block) {
+                return Some(BlockId::new(idx));
+            }
+        }
+        None
+    }
+
     pub fn find_module_by_span(&self, span: Span) -> Option<ModuleId> {
         for (id, module) in self.delta.modules.iter().enumerate() {
             if Some(span) == module.span {
@@ -1040,6 +1233,14 @@ impl<'a> StateWorkingSet<'a> {
         }
 
         None
+    }
+
+    /// Find the file which contains the given [`Span`]
+    pub fn find_file_by_span(&self, span: Span) -> Option<&CachedFile> {
+        self.files()
+            // the span we're looking for is much more likely to be in a recently added file
+            .rev()
+            .find(|file| file.covered_span.contains_span(span))
     }
 
     pub fn find_virtual_path(&self, name: &str) -> Option<&VirtualPath> {
@@ -1077,6 +1278,13 @@ impl<'a> StateWorkingSet<'a> {
         let num_permanent_spans = self.permanent_state.spans.len();
         self.delta.spans.push(span);
         SpanId::new(num_permanent_spans + self.delta.spans.len() - 1)
+    }
+
+    pub fn resolve_span<'s>(&'s self, span: Span) -> Option<ResolvedSpan<'s>> {
+        let cached_file = self.find_file_by_span(span)?;
+        let file = cached_file.name.as_ref().into();
+        let span = span.offset(cached_file.covered_span.start);
+        Some(ResolvedSpan { file, span })
     }
 }
 

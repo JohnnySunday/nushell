@@ -20,21 +20,17 @@ impl Command for ChunkBy {
                 ),
                 (Type::Range, Type::list(Type::list(Type::Any))),
             ])
-            .required(
-                "closure",
-                SyntaxShape::Closure(Some(vec![SyntaxShape::Any])),
-                "The closure to run.",
-            )
+            .required("closure", SyntaxShape::RowCondition, "The closure to run.")
             .category(Category::Filters)
     }
 
     fn description(&self) -> &str {
-        r#"Divides a sequence into sub-sequences based on a closure."#
+        "Divides a sequence into sub-sequences based on a closure."
     }
 
     fn extra_description(&self) -> &str {
-        r#"chunk-by applies the given closure to each value of the input list, and groups
-consecutive elements that share the same closure result value into lists."#
+        "chunk-by applies the given closure to each value of the input list, and groups
+consecutive elements that share the same closure result value into lists."
     }
 
     fn run(
@@ -51,7 +47,7 @@ consecutive elements that share the same closure result value into lists."#
         vec![
             Example {
                 description: "Chunk data into runs of larger than zero or not.",
-                example: "[1, 3, -2, -2, 0, 1, 2] | chunk-by {|it| $it >= 0 }",
+                example: "[1, 3, -2, -2, 0, 1, 2] | chunk-by $it >= 0",
                 result: Some(Value::test_list(vec![
                     Value::test_list(vec![Value::test_int(1), Value::test_int(3)]),
                     Value::test_list(vec![Value::test_int(-2), Value::test_int(-2)]),
@@ -64,7 +60,7 @@ consecutive elements that share the same closure result value into lists."#
             },
             Example {
                 description: "Identify repetitions in a string",
-                example: r#"[a b b c c c] | chunk-by { |it| $it }"#,
+                example: "[a b b c c c] | chunk-by $it",
                 result: Some(Value::test_list(vec![
                     Value::test_list(vec![Value::test_string("a")]),
                     Value::test_list(vec![Value::test_string("b"), Value::test_string("b")]),
@@ -77,7 +73,7 @@ consecutive elements that share the same closure result value into lists."#
             },
             Example {
                 description: "Chunk values of range by predicate",
-                example: r#"(0..8) | chunk-by { |it| $it // 3 }"#,
+                example: "(0..8) | chunk-by { |it| $it // 3 }",
                 result: Some(Value::test_list(vec![
                     Value::test_list(vec![
                         Value::test_int(0),
@@ -193,12 +189,12 @@ pub fn chunk_by(
     call: &Call,
     input: PipelineData,
 ) -> Result<PipelineData, ShellError> {
-    let input = input.into_stream_or_original(engine_state);
+    let mut input = input.into_stream_or_original(engine_state);
 
     let head = call.head;
     let closure: Closure = call.req(engine_state, stack, 0)?;
 
-    let metadata = input.metadata();
+    let metadata = input.take_metadata();
 
     match input {
         PipelineData::Empty => Ok(PipelineData::empty()),
@@ -250,9 +246,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(ChunkBy {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(ChunkBy)
     }
 }

@@ -1,24 +1,17 @@
 use chardetng::EncodingDetector;
 use encoding_rs::Encoding;
+use nu_protocol::shell_error::generic::GenericError;
 use nu_protocol::{ShellError, Span, Spanned, Value};
 
 pub fn detect_encoding_name(
-    head: Span,
-    input: Span,
+    _head: Span,
+    _input: Span,
     bytes: &[u8],
 ) -> Result<&'static Encoding, ShellError> {
-    let mut detector = EncodingDetector::new();
+    let mut detector = EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
     let _non_ascii = detector.feed(bytes, false);
     //Guess(TLD=None(usually used in HTML), Allow_UTF8=True)
-    let (encoding, is_certain) = detector.guess_assess(None, true);
-    if !is_certain {
-        return Err(ShellError::UnsupportedInput {
-            msg: "Input contains unknown encoding, try giving a encoding name".into(),
-            input: "value originates from here".into(),
-            msg_span: head,
-            input_span: input,
-        });
-    }
+    let encoding = detector.guess(None, chardetng::Utf8Detection::Allow);
     Ok(encoding)
 }
 
@@ -54,13 +47,14 @@ pub fn encode(
     // Since the Encoding Standard doesn't specify encoders for "UTF-16BE" and "UTF-16LE"
     // Check if the encoding is one of them and return an error
     if ["UTF-16BE", "UTF-16LE"].contains(&encoding.name()) {
-        return Err(ShellError::GenericError {
-            error: format!(r#"{} encoding is not supported"#, &encoding_name.item),
-            msg: "invalid encoding".into(),
-            span: Some(encoding_name.span),
-            help: Some("refer to https://docs.rs/encoding_rs/latest/encoding_rs/index.html#statics for a valid list of encodings".into()),
-            inner: vec![],
-        });
+        return Err(ShellError::Generic(
+            GenericError::new(
+                format!("{} encoding is not supported", encoding_name.item),
+                "invalid encoding",
+                encoding_name.span,
+            )
+            .with_help("refer to https://docs.rs/encoding_rs/latest/encoding_rs/index.html#statics for a valid list of encodings"),
+        ));
     }
 
     let (result, _actual_encoding, replacements) = encoding.encode(s);
@@ -68,13 +62,11 @@ pub fn encode(
     // This behaviour can be enabled with -i. Otherwise, it becomes an error.
     if replacements && !ignore_errors {
         // TODO: make GenericError accept two spans (including head)
-        Err(ShellError::GenericError {
-            error: "error while encoding string".into(),
-            msg: format!("string contained characters not in {}", &encoding_name.item),
-            span: Some(s_span),
-            help: None,
-            inner: vec![],
-        })
+        Err(ShellError::Generic(GenericError::new(
+            "error while encoding string",
+            format!("string contained characters not in {}", encoding_name.item),
+            s_span,
+        )))
     } else {
         Ok(Value::binary(result.into_owned(), head))
     }
@@ -88,15 +80,14 @@ fn parse_encoding(span: Span, label: &str) -> Result<&'static Encoding, ShellErr
         label
     };
     match Encoding::for_label_no_replacement(label.as_bytes()) {
-        None => Err(ShellError::GenericError{
-            error: format!(
-                r#"{label} is not a valid encoding"#
-            ),
-            msg: "invalid encoding".into(),
-            span: Some(span),
-            help: Some("refer to https://docs.rs/encoding_rs/latest/encoding_rs/index.html#statics for a valid list of encodings".into()),
-            inner: vec![],
-        }),
+        None => Err(ShellError::Generic(
+            GenericError::new(
+                format!("{label} is not a valid encoding"),
+                "invalid encoding",
+                span,
+            )
+            .with_help("refer to https://docs.rs/encoding_rs/latest/encoding_rs/index.html#statics for a valid list of encodings"),
+        )),
         Some(encoding) => Ok(encoding),
     }
 }

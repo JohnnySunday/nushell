@@ -1,17 +1,53 @@
 use crate::{
-    Config, ENV_VARIABLE_ID, IntoValue, NU_VARIABLE_ID, OutDest, ShellError, Span, Value, VarId,
+    Config, ENV_VARIABLE_ID, IntoValue, LAST_VARIABLE_ID, NU_VARIABLE_ID, OutDest, PipelineData,
+    PipelineMetadata, ShellError, Span, Value, VarId,
+    ast::PathMember,
     engine::{
         ArgumentStack, DEFAULT_OVERLAY_NAME, EngineState, EnvName, ErrorHandlerStack, Redirection,
-        StackCallArgGuard, StackCollectValueGuard, StackIoGuard, StackOutDest,
+        ScopeBindings, StackCallArgGuard, StackCollectValueGuard, StackIoGuard, StackOutDest,
+        StackWithInvocation,
     },
-    report_shell_warning,
+    ir::ScopeRegion,
+    record, report_shell_warning,
+    shell_error::generic::GenericError,
+    truncate_value_to_budget,
 };
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
     path::{Component, MAIN_SEPARATOR},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
+
+/// Shared interactive last-result (`$ans`) storage.
+///
+/// Held in an [`Arc`] so REPL child stacks from [`Stack::with_parent`] see the same
+/// payload and can clear `warn_pending` without mutating an immutable parent frame.
+///
+/// When [`Self::present`] is true, reading `$ans` yields a record with
+/// `exit_code`, `duration`, and `command`. The `last` field is included only when a
+/// payload is stored. When false (never snapshotted after a user command), `$ans`
+/// is `nothing`.
+#[derive(Debug, Default)]
+struct LastResultSlot {
+    /// Whether `$ans` should resolve to a record (vs `nothing`).
+    present: bool,
+    /// Pipeline payload for the `last` field (`None` when payload capture is off).
+    last: Option<Value>,
+    /// Pipeline metadata for replaying `last` (e.g. `ls` path_columns / colors).
+    metadata: Option<PipelineMetadata>,
+    truncated: bool,
+    /// Exit code of the last REPL line (mirrors `$env.LAST_EXIT_CODE`).
+    exit_code: i64,
+    /// Duration of the last REPL line in nanoseconds (Nushell `Duration` value).
+    duration_ns: i64,
+    /// Exact REPL source of the last user line (same buffer reedline stores in history).
+    command: String,
+    /// Set when a store was truncated; moved to `warn_deferred` on first access.
+    warn_pending: bool,
+    /// Set when `$ans` was accessed after a truncated store; reported after output prints.
+    warn_deferred: bool,
+}
 
 /// Environment variables per overlay
 pub type EnvVars = HashMap<String, HashMap<EnvName, Value>>;
@@ -41,14 +77,17 @@ pub struct Stack {
     pub env_vars: Vec<Arc<EnvVars>>,
     /// Tells which environment variables from engine state are hidden, per overlay.
     pub env_hidden: Arc<HashMap<String, HashSet<EnvName>>>,
+    /// Tracks env vars hidden in this stack context to report repeated `hide-env` calls.
+    ///
+    /// This is separate from `env_hidden`: `env_hidden` controls runtime visibility for engine
+    /// state values, while `env_hide_history` preserves command semantics for repeated hides.
+    pub env_hide_history: Arc<HashMap<String, HashSet<EnvName>>>,
     /// List of active overlays
     pub active_overlays: Vec<String>,
     /// Argument stack for IR evaluation
     pub arguments: ArgumentStack,
     /// Error handler stack for IR evaluation
     pub error_handlers: ErrorHandlerStack,
-    /// Finally handler stack for IR evaluation
-    pub finally_run_handlers: ErrorHandlerStack,
     pub recursion_count: u64,
     pub parent_stack: Option<Arc<Stack>>,
     /// Variables that have been deleted (this is used to hide values from parent stack lookups)
@@ -58,6 +97,24 @@ pub struct Stack {
     /// Locally updated config. Use [`.get_config()`](Self::get_config) to access correctly.
     pub config: Option<Arc<Config>>,
     pub(crate) out_dest: StackOutDest,
+    /// When `true`, external processes spawned from this stack are detached from
+    /// the controlling terminal, and empty stdin is `/dev/null` instead of inheriting
+    /// the TTY. Used on completion threads so children cannot race reedline.
+    pub suppress_stdin: bool,
+    /// Active block-local scope bindings (commands/modules), outer → inner.
+    ///
+    /// Pushed when evaluating a whole block via `eval_ir_block` (closures, custom commands).
+    /// Used by `scope` together with [`Self::ir_scope_regions`].
+    pub active_scope_bindings: Vec<Arc<ScopeBindings>>,
+    /// Scope regions of the IR block currently being evaluated (inlined keyword bodies).
+    pub ir_scope_regions: Vec<ScopeRegion>,
+    /// Current program counter while evaluating IR (for matching [`Self::ir_scope_regions`]).
+    pub ir_instruction_index: Option<usize>,
+    /// Interactive last-result payload for [`LAST_VARIABLE_ID`] (e.g. `$ans`).
+    ///
+    /// Shared across parent/child stacks so REPL iterations (which use
+    /// [`Stack::with_parent`]) can store and clear truncation warnings correctly.
+    last_result: Arc<Mutex<LastResultSlot>>,
 }
 
 impl Default for Stack {
@@ -79,16 +136,21 @@ impl Stack {
             vars: Vec::new(),
             env_vars: Vec::new(),
             env_hidden: Arc::new(HashMap::new()),
+            env_hide_history: Arc::new(HashMap::new()),
             active_overlays: vec![DEFAULT_OVERLAY_NAME.to_string()],
             arguments: ArgumentStack::new(),
             error_handlers: ErrorHandlerStack::new(),
-            finally_run_handlers: ErrorHandlerStack::new(),
             recursion_count: 0,
             parent_stack: None,
             parent_deletions: vec![],
             deletions: vec![],
             config: None,
             out_dest: StackOutDest::new(),
+            suppress_stdin: false,
+            active_scope_bindings: vec![],
+            ir_scope_regions: vec![],
+            ir_instruction_index: None,
+            last_result: Arc::new(Mutex::new(LastResultSlot::default())),
         }
     }
 
@@ -101,18 +163,40 @@ impl Stack {
             // here we are still cloning environment variable-related information
             env_vars: parent.env_vars.clone(),
             env_hidden: parent.env_hidden.clone(),
+            env_hide_history: parent.env_hide_history.clone(),
             active_overlays: parent.active_overlays.clone(),
             arguments: ArgumentStack::new(),
             error_handlers: ErrorHandlerStack::new(),
-            finally_run_handlers: ErrorHandlerStack::new(),
             recursion_count: parent.recursion_count,
             vars: vec![],
             parent_deletions: vec![],
             deletions: vec![],
             config: parent.config.clone(),
             out_dest: parent.out_dest.clone(),
+            suppress_stdin: parent.suppress_stdin,
+            // Child inherits outer block bindings so nested `scope` still sees them.
+            active_scope_bindings: parent.active_scope_bindings.clone(),
+            // Nested IR evaluation installs its own regions/pc.
+            ir_scope_regions: vec![],
+            ir_instruction_index: None,
+            // Share last-result with the parent (REPL uses with_parent every iteration).
+            last_result: parent.last_result.clone(),
             parent_stack: Some(parent),
         }
+    }
+
+    /// Push block-local scope bindings for the duration of evaluating a whole block.
+    pub fn push_scope_bindings(&mut self, bindings: Arc<ScopeBindings>) {
+        self.active_scope_bindings.push(bindings);
+    }
+
+    /// Pop the most recently pushed whole-block scope bindings.
+    pub fn pop_scope_bindings(&mut self) {
+        let popped = self.active_scope_bindings.pop();
+        debug_assert!(
+            popped.is_some(),
+            "pop_scope_bindings with empty active_scope_bindings (unbalanced push/pop)"
+        );
     }
 
     /// Take an [`Arc`] parent, and a child, and apply all the changes from a child back to the parent.
@@ -135,8 +219,10 @@ impl Stack {
         }
         unique_stack.env_vars = child.env_vars;
         unique_stack.env_hidden = child.env_hidden;
+        unique_stack.env_hide_history = child.env_hide_history;
         unique_stack.active_overlays = child.active_overlays;
         unique_stack.config = child.config;
+        // last_result is Arc-shared with the child; no merge needed.
         unique_stack
     }
 
@@ -157,6 +243,10 @@ impl Stack {
 
     /// Lookup a variable, returning None if it is not present
     fn lookup_var(&self, var_id: VarId) -> Option<Value> {
+        if var_id == LAST_VARIABLE_ID {
+            return self.assemble_ans_record(Span::unknown());
+        }
+
         for (id, val) in &self.vars {
             if var_id == *id {
                 return Some(val.clone());
@@ -171,12 +261,256 @@ impl Stack {
         None
     }
 
+    fn with_last_result_slot<R>(&self, f: impl FnOnce(&LastResultSlot) -> R) -> R {
+        match self.last_result.lock() {
+            Ok(slot) => f(&slot),
+            // Poison is rare; recover so `$ans` / capture do not hard-panic the REPL.
+            Err(poisoned) => f(&poisoned.into_inner()),
+        }
+    }
+
+    fn with_last_result_slot_mut<R>(&self, f: impl FnOnce(&mut LastResultSlot) -> R) -> R {
+        match self.last_result.lock() {
+            Ok(mut slot) => f(&mut slot),
+            Err(poisoned) => {
+                let mut slot = poisoned.into_inner();
+                // Drop potentially inconsistent state after a panic while locked.
+                *slot = LastResultSlot::default();
+                f(&mut slot)
+            }
+        }
+    }
+
+    /// Build the `$ans` record when the slot is present; otherwise `None` (→ `nothing`).
+    ///
+    /// Omits the `last` field entirely when no payload is stored (e.g. budget is `0`),
+    /// so `$ans` is `{ exit_code, duration, command }` only. `command` is always included
+    /// once the slot is present.
+    fn assemble_ans_record(&self, span: Span) -> Option<Value> {
+        self.with_last_result_slot(|slot| {
+            if !slot.present {
+                return None;
+            }
+            Some(match &slot.last {
+                Some(last) => Value::record(
+                    record! {
+                        "last" => last.clone().with_span(span),
+                        "exit_code" => Value::int(slot.exit_code, span),
+                        "duration" => Value::duration(slot.duration_ns, span),
+                        "command" => Value::string(slot.command.clone(), span),
+                    },
+                    span,
+                ),
+                None => Value::record(
+                    record! {
+                        "exit_code" => Value::int(slot.exit_code, span),
+                        "duration" => Value::duration(slot.duration_ns, span),
+                        "command" => Value::string(slot.command.clone(), span),
+                    },
+                    span,
+                ),
+            })
+        })
+    }
+
+    /// Drop the entire `$ans` slot (full clear).
+    pub fn clear_last_result(&mut self) {
+        self.with_last_result_slot_mut(|slot| {
+            if let Some(old) = slot.last.take() {
+                drop(old);
+            }
+            *slot = LastResultSlot::default();
+        });
+    }
+
+    /// Drop only `$ans.last` and its metadata/truncation flags, freeing payload memory.
+    ///
+    /// Leaves `present`, `exit_code`, `duration`, and `command` unchanged so a budget of
+    /// `0` can still expose timing/exit status/source without retaining the pipeline value.
+    pub fn clear_last_result_payload(&mut self) {
+        self.with_last_result_slot_mut(|slot| {
+            if let Some(old) = slot.last.take() {
+                drop(old);
+            }
+            slot.metadata = None;
+            slot.truncated = false;
+            slot.warn_pending = false;
+            slot.warn_deferred = false;
+        });
+    }
+
+    /// Store `value` as `$ans.last`, enforcing `budget` via truncation.
+    ///
+    /// When `budget == 0`, payload capture is disabled (clears `.last` only; exit code,
+    /// duration, and `command` stay). Preserves pipeline `metadata` (e.g. `path_columns` used for
+    /// `ls` coloring) so replaying `$ans.last` can match the original display.
+    pub fn set_last_result(
+        &mut self,
+        value: Value,
+        metadata: Option<PipelineMetadata>,
+        budget: usize,
+    ) {
+        if budget == 0 {
+            self.clear_last_result_payload();
+            return;
+        }
+
+        let (stored, truncated) = truncate_value_to_budget(value, budget);
+        self.store_last_result_raw(stored, metadata, truncated);
+    }
+
+    /// Install an already-budgeted `$ans.last` value (caller handled truncation).
+    ///
+    /// Marks `$ans` present. Does not reset `exit_code` / `duration` / `command` (those are
+    /// updated by [`Self::snapshot_ans_repl_metadata`] at end of each REPL line).
+    pub fn store_last_result_raw(
+        &mut self,
+        value: Value,
+        metadata: Option<PipelineMetadata>,
+        truncated: bool,
+    ) {
+        self.with_last_result_slot_mut(|slot| {
+            if let Some(old) = slot.last.replace(value) {
+                drop(old);
+            }
+            slot.metadata = metadata;
+            slot.truncated = truncated;
+            slot.warn_pending = truncated;
+            // Fresh store replaces any not-yet-shown deferred warning.
+            slot.warn_deferred = false;
+            slot.present = true;
+        });
+    }
+
+    /// After a REPL user command finishes: refresh `$ans.exit_code`, `$ans.duration`,
+    /// and `$ans.command`.
+    ///
+    /// `command` is the exact reedline buffer for this line (same text history stores).
+    /// Always marks `$ans` present so every user-typed line gets exit code, duration,
+    /// and source (empty Enter / auto-cd do not call this). When `budget == 0`, also
+    /// drops `$ans.last` (and its memory) so the record is `{ exit_code, duration, command }`
+    /// without a `last` field. When budget is positive, any `.last` already stored this
+    /// line (or earlier) is kept.
+    pub fn snapshot_ans_repl_metadata(
+        &mut self,
+        engine_state: &EngineState,
+        duration: std::time::Duration,
+        command: impl Into<String>,
+    ) {
+        let budget = self.get_config(engine_state).max_last_result_size_bytes();
+        let exit_code = self
+            .get_env_var(engine_state, "LAST_EXIT_CODE")
+            .and_then(|v| v.as_int().ok())
+            .unwrap_or(0);
+        let duration_ns = i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX);
+        let command = command.into();
+
+        if budget == 0 {
+            // Payload off: free `.last` memory before refreshing metadata.
+            self.clear_last_result_payload();
+        }
+
+        self.with_last_result_slot_mut(|slot| {
+            slot.exit_code = exit_code;
+            slot.duration_ns = duration_ns;
+            slot.command = command;
+            slot.present = true;
+        });
+    }
+
+    /// Pipeline metadata associated with the stored `$ans.last`, if any.
+    pub fn last_result_metadata(&self) -> Option<PipelineMetadata> {
+        self.with_last_result_slot(|slot| slot.metadata.clone())
+    }
+
+    /// Estimated memory size of the stored `$ans.last` payload (`0` if unset).
+    pub fn last_result_memory_size(&self) -> usize {
+        self.with_last_result_slot(|slot| slot.last.as_ref().map(|v| v.memory_size()).unwrap_or(0))
+    }
+
+    /// Marker key in [`PipelineMetadata::custom`] identifying pipeline data loaded from `$ans`.
+    ///
+    /// Used so IR cell-path follow only reattaches last-result metadata for `$ans.last`,
+    /// not every unrelated record field named `last`.
+    pub const ANS_LAST_RESULT_METADATA_KEY: &str = "ans_last_result";
+
+    /// Build [`PipelineData`] for `$ans`, restoring stored pipeline metadata on the record
+    /// so `$ans.last` cell-path access can reattach it (see IR `FollowCellPath`).
+    pub fn last_result_pipeline_data(&self, span: Span) -> PipelineData {
+        let mut metadata = self.last_result_metadata().unwrap_or_default();
+        // Mark so FollowCellPath can reattach payload metadata only for `$ans.*`.
+        metadata
+            .custom
+            .insert(Self::ANS_LAST_RESULT_METADATA_KEY, Value::bool(true, span));
+        let value = self
+            .assemble_ans_record(span)
+            .unwrap_or_else(|| Value::nothing(span));
+        PipelineData::value(value, Some(metadata))
+    }
+
+    /// Whether the currently stored `$ans.last` was truncated.
+    pub fn last_result_was_truncated(&self) -> bool {
+        self.with_last_result_slot(|slot| slot.truncated)
+    }
+
+    /// On `$ans` access after a truncated store: schedule a warning for after output prints.
+    ///
+    /// Does not print anything. Call [`Self::take_last_result_warn_deferred`] after display
+    /// so the truncated value is shown first, then the warning.
+    pub fn defer_last_result_truncation_warning(&self) {
+        self.with_last_result_slot_mut(|slot| {
+            if slot.warn_pending {
+                slot.warn_pending = false;
+                slot.warn_deferred = true;
+            }
+        });
+    }
+
+    /// Whether a truncation warning is waiting to be shown after print (does not clear).
+    pub fn last_result_warn_pending(&self) -> bool {
+        self.with_last_result_slot(|slot| slot.warn_pending)
+    }
+
+    /// Take the deferred truncation warning flag (clears it).
+    ///
+    /// Returns `true` once after a truncated `$ans` was accessed; intended to be called
+    /// after the pipeline has been printed so the warning appears below the data.
+    pub fn take_last_result_warn_deferred(&self) -> bool {
+        self.with_last_result_slot_mut(|slot| std::mem::take(&mut slot.warn_deferred))
+    }
+
+    /// Report a deferred last-result truncation warning, if any.
+    ///
+    /// Prefer calling this after printing so output is not scrolled away by the warning.
+    pub fn flush_last_result_truncation_warning(&self, engine_state: &EngineState, span: Span) {
+        if !self.take_last_result_warn_deferred() {
+            return;
+        }
+        let limit_bytes = self.get_config(engine_state).max_last_result_size_bytes();
+        report_shell_warning(
+            Some(self),
+            engine_state,
+            &crate::ShellWarning::LastResultTruncated {
+                span,
+                limit_bytes,
+                help: Some(format!(
+                    "Increase $env.config.max_last_result_size or use a smaller command result. Variable name is `${}`.",
+                    crate::LAST_RESULT_VAR_NAME
+                )),
+                // EveryUse: once-per-access is handled by warn_pending/warn_deferred flags.
+                report_mode: crate::ReportMode::EveryUse,
+            },
+        );
+    }
+
     /// Lookup a variable, erroring if it is not found
     ///
     /// The passed-in span will be used to tag the value
     pub fn get_var(&self, var_id: VarId, span: Span) -> Result<Value, ShellError> {
         match self.lookup_var(var_id) {
             Some(v) => Ok(v.with_span(span)),
+            // Unset last-result behaves like `nothing` rather than a missing variable.
+            None if var_id == LAST_VARIABLE_ID => Ok(Value::nothing(span)),
             None => Err(ShellError::VariableNotFoundAtRuntime { span }),
         }
     }
@@ -190,13 +524,11 @@ impl Stack {
             Some(v) => Ok(v),
             None => {
                 if var_id == NU_VARIABLE_ID || var_id == ENV_VARIABLE_ID {
-                    return Err(ShellError::GenericError {
-                        error: "Built-in variables `$env` and `$nu` have no metadata".into(),
-                        msg: "no metadata available".into(),
-                        span: Some(span),
-                        help: None,
-                        inner: vec![],
-                    });
+                    return Err(ShellError::Generic(GenericError::new(
+                        "Built-in variables `$env` and `$nu` have no metadata",
+                        "no metadata available",
+                        span,
+                    )));
                 }
                 Err(ShellError::VariableNotFoundAtRuntime { span })
             }
@@ -220,7 +552,11 @@ impl Stack {
         if let Some(value) = self.get_env_var(engine_state, "config") {
             let old = self.get_config(engine_state);
             let mut config = (*old).clone();
-            let result = config.update_from_value(&old, value);
+            let result = config.update_from_value_with_options(
+                &old,
+                value,
+                engine_state.history_locked_after_startup,
+            );
             // The config value is modified by the update, so we should add it again
             self.add_env_var("config".into(), config.clone().into_value(value.span()));
             self.config = Some(config.into());
@@ -244,6 +580,45 @@ impl Stack {
         self.vars.push((var_id, value));
     }
 
+    /// Return a mutable reference to a variable's value for in-place mutation.
+    ///
+    /// Looks up the variable in the current stack frame first. If not found, pulls it
+    /// from the parent chain into the current frame (cloning it once). This enables
+    /// zero-clone mutation for local `mut` variables: use `get_var_mut` + mutate instead
+    /// of `lookup_var` (clone) + mutate + `add_var` (move back).
+    pub fn get_var_mut(&mut self, var_id: VarId) -> Option<&mut Value> {
+        // Use index-based access to avoid conflicting mutable borrows
+        if let Some(pos) = self.vars.iter().position(|(id, _)| var_id == *id) {
+            return Some(&mut self.vars[pos].1);
+        }
+        // Check parent chain
+        if let Some(parent) = &self.parent_stack
+            && !self.parent_deletions.contains(&var_id)
+        {
+            let value = parent.lookup_var(var_id)?;
+            self.vars.push((var_id, value));
+            return self.vars.last_mut().map(|(_, val)| val);
+        }
+        None
+    }
+
+    /// Upsert a cell path on a variable in place (shared by AST and IR assignment paths).
+    ///
+    /// Errors with [`ShellError::VariableNotFoundAtRuntime`] if the variable is not on
+    /// this stack or its parent chain.
+    pub fn upsert_var_cell_path(
+        &mut self,
+        var_id: VarId,
+        members: &[PathMember],
+        new_value: Value,
+        span: Span,
+    ) -> Result<(), ShellError> {
+        let value = self
+            .get_var_mut(var_id)
+            .ok_or(ShellError::VariableNotFoundAtRuntime { span })?;
+        value.upsert_data_at_cell_path(members, new_value)
+    }
+
     pub fn remove_var(&mut self, var_id: VarId) {
         for (idx, (id, _)) in self.vars.iter().enumerate() {
             if *id == var_id {
@@ -260,36 +635,38 @@ impl Stack {
     }
 
     pub fn add_env_var(&mut self, var: String, value: Value) {
-        if let Some(last_overlay) = self.active_overlays.last() {
+        if let Some(last_overlay) = self.active_overlays.last().cloned() {
             let env_name = EnvName::from(var);
-            if let Some(env_hidden) = Arc::make_mut(&mut self.env_hidden).get_mut(last_overlay) {
-                // if the env var was hidden, let's activate it again
-                env_hidden.remove(&env_name);
-            }
+            self.clear_env_var_marks_in_active_overlay(&last_overlay, &env_name);
 
             if let Some(scope) = self.env_vars.last_mut() {
                 let scope = Arc::make_mut(scope);
-                if let Some(env_vars) = scope.get_mut(last_overlay) {
+                if let Some(env_vars) = scope.get_mut(&last_overlay) {
                     env_vars.insert(env_name, value);
                 } else {
-                    scope.insert(
-                        last_overlay.into(),
-                        [(env_name, value)].into_iter().collect(),
-                    );
+                    scope.insert(last_overlay, [(env_name, value)].into_iter().collect());
                 }
             } else {
                 self.env_vars.push(Arc::new(
-                    [(
-                        last_overlay.into(),
-                        [(env_name, value)].into_iter().collect(),
-                    )]
-                    .into_iter()
-                    .collect(),
+                    [(last_overlay, [(env_name, value)].into_iter().collect())]
+                        .into_iter()
+                        .collect(),
                 ));
             }
         } else {
             // TODO: Remove panic
             panic!("internal error: no active overlay");
+        }
+    }
+
+    fn clear_env_var_marks_in_active_overlay(&mut self, overlay: &str, env_name: &EnvName) {
+        if let Some(env_hidden) = Arc::make_mut(&mut self.env_hidden).get_mut(overlay) {
+            // Re-assigning re-activates a previously hidden env var in this overlay.
+            env_hidden.remove(env_name);
+        }
+
+        if let Some(hide_history) = Arc::make_mut(&mut self.env_hide_history).get_mut(overlay) {
+            hide_history.remove(env_name);
         }
     }
 
@@ -314,11 +691,17 @@ impl Stack {
             })
     }
 
+    /// Like [`captures_to_stack_preserve_out_dest`], but sets the new scope up to collect output into a Value.
     pub fn captures_to_stack(&self, captures: Vec<(VarId, Value)>) -> Stack {
         self.captures_to_stack_preserve_out_dest(captures)
             .collect_value()
     }
 
+    /// Creates a derived stack for a new scope, with the given captures.
+    ///
+    /// The caller is retained as [`Self::parent_stack`] so outer variables remain visible to
+    /// `scope variables` (and other stack lookups that walk parents). Captured values are still
+    /// copied onto this stack for isolation of the closure’s own locals.
     pub fn captures_to_stack_preserve_out_dest(&self, captures: Vec<(VarId, Value)>) -> Stack {
         let mut env_vars = self.env_vars.clone();
         env_vars.push(Arc::new(HashMap::new()));
@@ -327,16 +710,25 @@ impl Stack {
             vars: captures,
             env_vars,
             env_hidden: self.env_hidden.clone(),
+            env_hide_history: self.env_hide_history.clone(),
             active_overlays: self.active_overlays.clone(),
             arguments: ArgumentStack::new(),
             error_handlers: ErrorHandlerStack::new(),
-            finally_run_handlers: ErrorHandlerStack::new(),
             recursion_count: self.recursion_count,
-            parent_stack: None,
+            // Keep the caller as parent so global/outer locals stay nameable for `scope`
+            // (values are still resolved via the parent chain when not captured).
+            parent_stack: Some(Arc::new(self.clone())),
             parent_deletions: vec![],
             deletions: vec![],
             config: self.config.clone(),
             out_dest: self.out_dest.clone(),
+            suppress_stdin: self.suppress_stdin,
+            // Inherit caller block bindings so nested closures still see outer local defs.
+            active_scope_bindings: self.active_scope_bindings.clone(),
+            ir_scope_regions: vec![],
+            ir_instruction_index: None,
+            // Share last-result so closures can still read `$ans`.
+            last_result: self.last_result.clone(),
         }
     }
 
@@ -362,16 +754,23 @@ impl Stack {
             vars,
             env_vars,
             env_hidden: self.env_hidden.clone(),
+            env_hide_history: self.env_hide_history.clone(),
             active_overlays: self.active_overlays.clone(),
             arguments: ArgumentStack::new(),
             error_handlers: ErrorHandlerStack::new(),
-            finally_run_handlers: ErrorHandlerStack::new(),
             recursion_count: self.recursion_count,
-            parent_stack: None,
+            parent_stack: Some(Arc::new(self.clone())),
             parent_deletions: vec![],
             deletions: vec![],
             config: self.config.clone(),
             out_dest: self.out_dest.clone(),
+            suppress_stdin: self.suppress_stdin,
+            // Inherit caller block bindings so nested closures still see outer local defs.
+            active_scope_bindings: self.active_scope_bindings.clone(),
+            ir_scope_regions: vec![],
+            ir_instruction_index: None,
+            // Share last-result so closures can still read `$ans`.
+            last_result: self.last_result.clone(),
         }
     }
 
@@ -516,10 +915,12 @@ impl Stack {
         engine_state: &'a EngineState,
         name: &str,
     ) -> Option<&'a Value> {
+        let env_name = EnvName::from(name);
+
         for scope in self.env_vars.iter().rev() {
             for active_overlay in self.active_overlays.iter().rev() {
                 if let Some(env_vars) = scope.get(active_overlay)
-                    && let Some(v) = env_vars.get(&EnvName::from(name))
+                    && let Some(v) = env_vars.get(&env_name)
                 {
                     return Some(v);
                 }
@@ -527,15 +928,9 @@ impl Stack {
         }
 
         for active_overlay in self.active_overlays.iter().rev() {
-            let is_hidden = if let Some(env_hidden) = self.env_hidden.get(active_overlay) {
-                env_hidden.contains(&EnvName::from(name))
-            } else {
-                false
-            };
-
-            if !is_hidden
+            if !self.is_env_hidden_in_overlay(active_overlay, &env_name)
                 && let Some(env_vars) = engine_state.env_vars.get(active_overlay)
-                && let Some(v) = env_vars.get(&EnvName::from(name))
+                && let Some(v) = env_vars.get(&env_name)
             {
                 return Some(v);
             }
@@ -544,10 +939,12 @@ impl Stack {
     }
 
     pub fn has_env_var(&self, engine_state: &EngineState, name: &str) -> bool {
+        let env_name = EnvName::from(name);
+
         for scope in self.env_vars.iter().rev() {
             for active_overlay in self.active_overlays.iter().rev() {
                 if let Some(env_vars) = scope.get(active_overlay)
-                    && env_vars.contains_key(&EnvName::from(name))
+                    && env_vars.contains_key(&env_name)
                 {
                     return true;
                 }
@@ -555,15 +952,9 @@ impl Stack {
         }
 
         for active_overlay in self.active_overlays.iter().rev() {
-            let is_hidden = if let Some(env_hidden) = self.env_hidden.get(active_overlay) {
-                env_hidden.contains(&EnvName::from(name))
-            } else {
-                false
-            };
-
-            if !is_hidden
+            if !self.is_env_hidden_in_overlay(active_overlay, &env_name)
                 && let Some(env_vars) = engine_state.env_vars.get(active_overlay)
-                && env_vars.contains_key(&EnvName::from(name))
+                && env_vars.contains_key(&env_name)
             {
                 return true;
             }
@@ -572,37 +963,155 @@ impl Stack {
         false
     }
 
+    /// Removes `name` from the stack. If it was not on the stack and lives in `engine_state`,
+    /// marks it hidden in `env_hidden`. Returns `true` if the variable was found and removed.
+    ///
+    /// Use this for temporary bookkeeping removals (e.g. `FILE_PWD`, canary variables) where
+    /// the goal is to clean up a stack-level value without necessarily hiding the engine-state
+    /// baseline. Use [`Self::hide_env_var`] when the intent is to make the variable invisible
+    /// to subsequent lookups (e.g. `hide-env`).
     pub fn remove_env_var(&mut self, engine_state: &EngineState, name: &str) -> bool {
-        for scope in self.env_vars.iter_mut().rev() {
-            let scope = Arc::make_mut(scope);
-            for active_overlay in self.active_overlays.iter().rev() {
-                if let Some(env_vars) = scope.get_mut(active_overlay)
-                    && env_vars.remove(&EnvName::from(name)).is_some()
-                {
-                    return true;
-                }
-            }
+        let env_name = EnvName::from(name);
+
+        self.remove_env_var_from_stack(&env_name)
+            || self.hide_engine_state_env_var(engine_state, &env_name)
+    }
+
+    /// Removes `env_name` from all stack scopes and returns `true` if it was found.
+    /// Does not affect `env_hidden`; use [`Self::hide_env_var`] for full hiding semantics.
+    fn remove_env_var_from_stack(&mut self, env_name: &EnvName) -> bool {
+        self.env_vars
+            .iter_mut()
+            .rev()
+            .map(Arc::make_mut)
+            .find_map(|scope| {
+                self.active_overlays
+                    .iter()
+                    .rev()
+                    .find_map(|active_overlay| scope.get_mut(active_overlay)?.remove(env_name))
+            })
+            .is_some()
+    }
+
+    /// Marks `env_name` as hidden in `env_hidden` for the active overlay where it exists in
+    /// `engine_state`.
+    ///
+    /// Returns `true` only when the baseline variable exists and was newly hidden.
+    fn hide_engine_state_env_var(
+        &mut self,
+        engine_state: &EngineState,
+        env_name: &EnvName,
+    ) -> bool {
+        let overlay_containing_env_var = self.active_overlays.iter().rev().find(|active_overlay| {
+            engine_state
+                .env_vars
+                .get(active_overlay.as_str())
+                .is_some_and(|env_vars| env_vars.contains_key(env_name))
+        });
+
+        let Some(overlay_containing_env_var) = overlay_containing_env_var else {
+            return false;
+        };
+
+        let env_hidden = Arc::make_mut(&mut self.env_hidden);
+
+        if env_hidden
+            .get(overlay_containing_env_var.as_str())
+            .is_some_and(|hidden_vars| hidden_vars.contains(env_name))
+        {
+            return false;
         }
 
-        for active_overlay in self.active_overlays.iter().rev() {
-            if let Some(env_vars) = engine_state.env_vars.get(active_overlay)
-                && env_vars.get(&EnvName::from(name)).is_some()
-            {
-                let env_hidden = Arc::make_mut(&mut self.env_hidden);
-                if let Some(env_hidden_in_overlay) = env_hidden.get_mut(active_overlay) {
-                    env_hidden_in_overlay.insert(EnvName::from(name));
-                } else {
-                    env_hidden.insert(
-                        active_overlay.into(),
-                        [EnvName::from(name)].into_iter().collect(),
-                    );
-                }
+        env_hidden
+            .entry(overlay_containing_env_var.clone())
+            .or_default()
+            .insert(env_name.clone());
+        true
+    }
 
-                return true;
+    /// Records that `env_name` has been hidden in the active overlay and returns `false` if it
+    /// was already recorded as hidden there.
+    fn record_env_var_hide_in_active_overlay(&mut self, env_name: &EnvName) -> bool {
+        let Some(active_overlay) = self.active_overlays.last().cloned() else {
+            return false;
+        };
+
+        Arc::make_mut(&mut self.env_hide_history)
+            .entry(active_overlay)
+            .or_default()
+            .insert(env_name.clone())
+    }
+
+    fn is_env_var_hide_recorded(&self, env_name: &EnvName) -> bool {
+        self.active_overlays
+            .iter()
+            .rev()
+            .filter_map(|overlay| self.env_hide_history.get(overlay))
+            .any(|hidden_vars| hidden_vars.contains(env_name))
+    }
+
+    fn is_env_hidden_in_overlay(&self, overlay: &str, env_name: &EnvName) -> bool {
+        self.env_hidden
+            .get(overlay)
+            .is_some_and(|hidden_vars| hidden_vars.contains(env_name))
+    }
+
+    /// Returns `true` if `name` was hidden in this stack context (e.g. by `hide-env`), either by
+    /// masking an `engine_state` baseline value or by removing a stack-level value.
+    ///
+    /// A variable that was re-added after being hidden is still reported as hidden here, so only
+    /// use this after a failed lookup to distinguish "hidden" from "never set".
+    pub fn is_env_var_hidden(&self, name: &str) -> bool {
+        let env_name = EnvName::from(name);
+
+        self.active_overlays
+            .iter()
+            .rev()
+            .any(|overlay| self.is_env_hidden_in_overlay(overlay, &env_name))
+            || self.is_env_var_hide_recorded(&env_name)
+    }
+
+    /// Hides `name` so it is no longer visible to subsequent lookups. Removes it from the stack
+    /// and, if no stack shadowing remains, also marks the `engine_state` baseline as hidden in
+    /// `env_hidden`. Returns `true` if the variable was found.
+    ///
+    /// This is the correct method for `hide-env` and `redirect_env`; it ensures that a variable
+    /// set in engine_state (from a previous REPL merge) cannot be seen after hiding even when a
+    /// stack-level override (e.g. an empty-string assignment) was present at hide time.
+    pub fn hide_env_var(&mut self, engine_state: &EngineState, name: &str) -> bool {
+        let env_name = EnvName::from(name);
+
+        // Re-hiding the same env var in the same scope should report not found.
+        if self.is_env_var_hide_recorded(&env_name) {
+            return false;
+        }
+
+        if self.remove_env_var_from_stack(&env_name) {
+            self.record_env_var_hide_in_active_overlay(&env_name);
+
+            if !self.has_env_var_in_stack(&env_name) {
+                self.hide_engine_state_env_var(engine_state, &env_name);
             }
+            return true;
+        }
+
+        if self.hide_engine_state_env_var(engine_state, &env_name) {
+            self.record_env_var_hide_in_active_overlay(&env_name);
+            return true;
         }
 
         false
+    }
+
+    /// Returns `true` if `name` exists in any stack scope (without consulting `engine_state`).
+    fn has_env_var_in_stack(&self, name: &EnvName) -> bool {
+        self.env_vars.iter().rev().any(|scope| {
+            self.active_overlays
+                .iter()
+                .rev()
+                .filter_map(|active_overlay| scope.get(active_overlay))
+                .any(|env_vars| env_vars.contains_key(name))
+        })
     }
 
     pub fn has_env_overlay(&self, name: &str, engine_state: &EngineState) -> bool {
@@ -654,6 +1163,47 @@ impl Stack {
     /// Returns the [`OutDest`] of the pipe redirection applied to the current command's stderr.
     pub fn pipe_stderr(&self) -> Option<&OutDest> {
         self.out_dest.pipe_stderr.as_ref()
+    }
+
+    /// Returns the stdout destination of the innermost active custom-command invocation, if any.
+    ///
+    /// This is the destination of that command's *return value*. It stays stable even when
+    /// intermediate expressions temporarily set [`OutDest::Value`] (e.g. `if (…)`), so callers
+    /// can answer "where does *this command* go?" from anywhere in the body.
+    ///
+    /// See also [`Self::is_stdout_redirected`] and [`StackWithInvocation`].
+    pub fn invocation_stdout(&self) -> Option<&OutDest> {
+        self.out_dest.invocation_stdout.last()
+    }
+
+    /// Whether the current custom command's return value is redirected away from display.
+    ///
+    /// Uses the active [`Self::invocation_stdout`] frame when inside a custom command so the
+    /// answer is stable across nested `if` / `let` collection. Outside a custom command, falls
+    /// back to [`Self::stdout`].
+    ///
+    /// Semantics match [`OutDest::is_redirected`] (only [`OutDest::Print`] is not redirected).
+    /// This is the engine-side helper behind the `is-redirected` command.
+    #[must_use]
+    pub fn is_stdout_redirected(&self) -> bool {
+        self.invocation_stdout()
+            .unwrap_or_else(|| self.stdout())
+            .is_redirected()
+    }
+
+    /// Wrap this stack with an invocation-stdout frame for a custom command about to run.
+    ///
+    /// Push the destination of the call's *return value* (typically
+    /// `caller_stack.stdout().clone()` after redirections are applied). The frame is popped when
+    /// the returned [`StackWithInvocation`] is dropped.
+    ///
+    /// # Why a separate frame?
+    ///
+    /// Intermediate evaluation sets [`OutDest::Value`] via [`Self::start_collect_value`]. Without
+    /// an invocation frame, queries like `is-redirected` inside `if (…)` would always see
+    /// `Value` and report redirected—even when the enclosing custom command's result is printed.
+    pub fn with_invocation_stdout(self, dest: OutDest) -> StackWithInvocation {
+        StackWithInvocation::new(self, dest)
     }
 
     /// Temporarily set the pipe stdout redirection to [`OutDest::Value`].
@@ -714,6 +1264,55 @@ impl Stack {
         self
     }
 
+    /// Redirects stdout and stderr to [`OutDest::Null`], discarding all output.
+    ///
+    /// Use this for background evaluation tasks (e.g., completion) that must
+    /// never write to the terminal while reedline owns it.
+    pub fn suppress_output(mut self) -> Self {
+        self.out_dest.stdout = OutDest::Null;
+        self.out_dest.stderr = OutDest::Null;
+        self
+    }
+
+    /// Causes external processes spawned from this stack to detach from the
+    /// controlling terminal. Empty input also receives `/dev/null` for stdin
+    /// instead of inheriting the terminal.
+    ///
+    /// Use this together with [`suppress_output`](Self::suppress_output) for
+    /// background tasks (e.g. completion threads).  Without it, subprocesses
+    /// spawned by closure-based completers (carapace, fish_complete, etc.)
+    /// inherit the live terminal fd and can race with reedline's reads,
+    /// causing `Input/output error` (EIO). Piped stdin (candidate lists for
+    /// `fzf`) is still detached so the child cannot open `/dev/tty`.
+    pub fn suppress_stdin(mut self) -> Self {
+        self.suppress_stdin = true;
+        self
+    }
+
+    /// Error if this stack is detached from the controlling terminal (see
+    /// [`suppress_stdin`](Self::suppress_stdin), set on completion threads). Commands that grab
+    /// the terminal (`input`, `input list`, `input listen`, `term query`) call this first so
+    /// they decline instead of racing reedline for it; completers turn the error into a
+    /// fallback. `span` points at the offending call.
+    pub fn require_stdin(&self, span: Span) -> Result<(), ShellError> {
+        if self.suppress_stdin {
+            Err(ShellError::Generic(
+                GenericError::new(
+                    "Interactive input is unavailable in this context",
+                    "this command reads from the terminal",
+                    span,
+                )
+                .with_help(
+                    "this stack is detached from the terminal (completion worker or MCP), so \
+                     interactive commands like `input`, `input list`, `input listen`, and \
+                     `term query` cannot run here",
+                ),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Clears any pipe redirections, keeping the current stdout and stderr.
     ///
     /// This will irreversibly reset some of the output redirections, and so it only makes sense to use this on an owned `Stack`
@@ -734,7 +1333,7 @@ impl Stack {
     ///
     /// For use in third-party applications pipes might be very useful as they allow using the
     /// stdout of external commands for different uses.
-    /// For example the [`os_pipe`](https://docs.rs/os_pipe) crate provides a elegant way to to
+    /// For example the [`os_pipe`](https://docs.rs/os_pipe) crate provides an elegant way to
     /// access the stdout.
     ///
     /// ```
@@ -783,29 +1382,23 @@ impl Stack {
         // Helper function to create a simple generic error.
         // Its messages are not especially helpful, but these errors don't occur often, so it's probably fine.
         fn error(msg: &str) -> Result<(), ShellError> {
-            Err(ShellError::GenericError {
-                error: msg.into(),
-                msg: "".into(),
-                span: None,
-                help: None,
-                inner: vec![],
-            })
+            Err(ShellError::Generic(GenericError::new_internal(
+                msg.to_string(),
+                "",
+            )))
         }
 
         let path = path.as_ref();
 
         if !path.is_absolute() {
             if let Some(Component::Prefix(_)) = path.components().next() {
-                return Err(ShellError::GenericError {
-                    error: "Cannot set $env.PWD to a prefix-only path".to_string(),
-                    msg: "".into(),
-                    span: None,
-                    help: Some(format!(
-                        "Try to use {}{MAIN_SEPARATOR} instead",
-                        path.display()
-                    )),
-                    inner: vec![],
-                });
+                return Err(ShellError::Generic(
+                    GenericError::new_internal("Cannot set $env.PWD to a prefix-only path", "")
+                        .with_help(format!(
+                            "Try to use {}{MAIN_SEPARATOR} instead",
+                            path.display()
+                        )),
+                ));
             }
 
             error("Cannot set $env.PWD to a non-absolute path")
@@ -941,5 +1534,96 @@ mod test {
                 .cloned(),
             Some(Value::test_string("New Env Var")),
         );
+    }
+
+    #[test]
+    fn test_get_var_mut_local_in_place() {
+        use crate::ast::PathMember;
+        use crate::casing::Casing;
+        use crate::record;
+
+        let mut stack = Stack::new();
+        let var_id = VarId::new(0);
+        stack.add_var(
+            var_id,
+            Value::test_record(record! { "a" => Value::test_int(1) }),
+        );
+
+        let path = vec![PathMember::test_string("a", false, Casing::Sensitive)];
+        stack
+            .upsert_var_cell_path(var_id, &path, Value::test_int(2), Span::test_data())
+            .expect("upsert should succeed");
+
+        assert_eq!(
+            stack.get_var(var_id, Span::test_data()),
+            Ok(Value::test_record(record! { "a" => Value::test_int(2) }))
+        );
+        // Still a single local binding (no extra shadow entries).
+        assert_eq!(stack.vars.len(), 1);
+    }
+
+    #[test]
+    fn test_get_var_mut_pulls_from_parent() {
+        use crate::ast::PathMember;
+        use crate::casing::Casing;
+        use crate::record;
+
+        let mut parent = Stack::new();
+        let var_id = VarId::new(0);
+        parent.add_var(
+            var_id,
+            Value::test_record(record! { "a" => Value::test_int(1) }),
+        );
+
+        let mut child = Stack::with_parent(Arc::new(parent));
+        assert!(child.vars.is_empty());
+
+        let path = vec![PathMember::test_string("a", false, Casing::Sensitive)];
+        child
+            .upsert_var_cell_path(var_id, &path, Value::test_int(9), Span::test_data())
+            .expect("upsert should succeed");
+
+        // Value was pulled into the child frame, then mutated.
+        assert_eq!(child.vars.len(), 1);
+        assert_eq!(
+            child.get_var(var_id, Span::test_data()),
+            Ok(Value::test_record(record! { "a" => Value::test_int(9) }))
+        );
+
+        // Second mutation hits the local copy.
+        child
+            .upsert_var_cell_path(var_id, &path, Value::test_int(10), Span::test_data())
+            .expect("second upsert should succeed");
+        assert_eq!(child.vars.len(), 1);
+        assert_eq!(
+            child.get_var(var_id, Span::test_data()),
+            Ok(Value::test_record(record! { "a" => Value::test_int(10) }))
+        );
+    }
+
+    #[test]
+    fn test_upsert_var_cell_path_missing_and_deleted() {
+        use crate::ast::PathMember;
+        use crate::casing::Casing;
+
+        let mut stack = Stack::new();
+        let var_id = VarId::new(0);
+        let path = vec![PathMember::test_string("a", false, Casing::Sensitive)];
+
+        assert!(matches!(
+            stack.upsert_var_cell_path(var_id, &path, Value::test_int(1), Span::test_data()),
+            Err(crate::ShellError::VariableNotFoundAtRuntime { .. })
+        ));
+
+        let mut parent = Stack::new();
+        parent.add_var(var_id, Value::test_int(1));
+        let mut child = Stack::with_parent(Arc::new(parent));
+        child.remove_var(var_id);
+
+        assert!(matches!(
+            child.upsert_var_cell_path(var_id, &path, Value::test_int(2), Span::test_data()),
+            Err(crate::ShellError::VariableNotFoundAtRuntime { .. })
+        ));
+        assert!(child.get_var_mut(var_id).is_none());
     }
 }

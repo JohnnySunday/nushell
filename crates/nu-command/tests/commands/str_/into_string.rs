@@ -2,9 +2,9 @@ use nu_test_support::{fs::Stub::FileWithContentToBeTrimmed, prelude::*};
 
 #[test]
 fn from_range() -> Result {
-    let code = r#"
+    let code = "
         echo 1..5 | into string | to json -r
-        "#;
+        ";
 
     test()
         .run(code)
@@ -13,36 +13,36 @@ fn from_range() -> Result {
 
 #[test]
 fn from_number() -> Result {
-    let code = r#"
+    let code = "
         echo 5 | into string
-        "#;
+        ";
 
     test().run(code).expect_value_eq("5")
 }
 
 #[test]
 fn from_float() -> Result {
-    let code = r#"
+    let code = "
         echo 1.5 | into string
-        "#;
+        ";
 
     test().run(code).expect_value_eq("1.5")
 }
 
 #[test]
 fn from_boolean() -> Result {
-    let code = r#"
+    let code = "
         echo true | into string
-        "#;
+        ";
 
     test().run(code).expect_value_eq("true")
 }
 
 #[test]
 fn from_cell_path() -> Result {
-    let code = r#"
+    let code = "
         $.test | into string
-        "#;
+        ";
 
     test().run(code).expect_value_eq("$.test")
 }
@@ -95,9 +95,9 @@ fn from_filesize() -> Result {
 
 #[test]
 fn from_float_correct_trailing_zeros() -> Result {
-    let code = r#"
+    let code = "
         1.23000 | into string -d 3
-        "#;
+        ";
 
     let outcome: String = test().run(code)?;
     assert_contains("1.230", outcome);
@@ -106,9 +106,9 @@ fn from_float_correct_trailing_zeros() -> Result {
 
 #[test]
 fn from_int_float_correct_trailing_zeros() -> Result {
-    let code = r#"
+    let code = "
         1.00000 | into string -d 3
-        "#;
+        ";
 
     let outcome: String = test().run(code)?;
     assert_contains("1.000", outcome);
@@ -147,9 +147,9 @@ fn from_table() -> Result {
 
 #[test]
 fn from_nothing() -> Result {
-    let code = r#"
+    let code = "
         null | into string
-        "#;
+        ";
 
     let err = test().run(code).expect_parse_error()?;
     assert!(matches!(err, ParseError::InputMismatch { .. }));
@@ -157,10 +157,47 @@ fn from_nothing() -> Result {
 }
 
 #[test]
+fn from_semver() -> Result {
+    test()
+        .run("'1.2.3' | into semver | into string")
+        .expect_value_eq("1.2.3")
+}
+
+#[test]
+fn from_semver_let_binding() -> Result {
+    test()
+        .run(r#"let s = "1.0.0" | into semver | into string; $s"#)
+        .expect_value_eq("1.0.0")
+}
+
+#[test]
+fn from_semver_let_binding_is_string() -> Result {
+    test()
+        .run(r#"let s = "1.0.0" | into semver | into string; $s | describe"#)
+        .expect_value_eq("string")
+}
+
+#[test]
+fn from_semver_path_join() -> Result {
+    test()
+        .run(
+            r#""versions" | path join ("1.115.0" | into semver | into string) | path split | last"#,
+        )
+        .expect_value_eq("1.115.0")
+}
+
+#[test]
+fn from_semver_range_let_binding() -> Result {
+    test()
+        .run(r#"let s = ">=1.0.0" | into semver-range | into string; $s"#)
+        .expect_value_eq(">=1.0.0")
+}
+
+#[test]
 fn int_into_string() -> Result {
-    let code = r#"
+    let code = "
         10 | into string
-        "#;
+        ";
 
     test().run(code).expect_value_eq("10")
 }
@@ -168,9 +205,9 @@ fn int_into_string() -> Result {
 #[test]
 #[env(NU_TEST_LOCALE_OVERRIDE = "en_US.UTF-8")]
 fn int_into_string_decimals_0() -> Result {
-    let code = r#"
+    let code = "
     10 | into string --decimals 0
-    "#;
+    ";
 
     test().run(code).expect_value_eq("10")
 }
@@ -178,9 +215,9 @@ fn int_into_string_decimals_0() -> Result {
 #[test]
 #[env(NU_TEST_LOCALE_OVERRIDE = "en_US.UTF-8")]
 fn int_into_string_decimals_1() -> Result {
-    let code = r#"
+    let code = "
     10 | into string --decimals 1
-    "#;
+    ";
 
     test().run(code).expect_value_eq("10.0")
 }
@@ -188,9 +225,9 @@ fn int_into_string_decimals_1() -> Result {
 #[test]
 #[env(NU_TEST_LOCALE_OVERRIDE = "en_US.UTF-8")]
 fn int_into_string_decimals_10() -> Result {
-    let code = r#"
+    let code = "
     10 | into string --decimals 10
-    "#;
+    ";
 
     test().run(code).expect_value_eq("10.0000000000")
 }
@@ -198,9 +235,9 @@ fn int_into_string_decimals_10() -> Result {
 #[test]
 #[env(NU_TEST_LOCALE_OVERRIDE = "de_DE.UTF-8")]
 fn int_into_string_decimals_respects_system_locale_de() -> Result {
-    let code = r#"
+    let code = "
     10 | into string --decimals 1
-    "#;
+    ";
 
     test().run(code).expect_value_eq("10,0")
 }
@@ -208,9 +245,9 @@ fn int_into_string_decimals_respects_system_locale_de() -> Result {
 #[test]
 #[env(NU_TEST_LOCALE_OVERRIDE = "en_US.UTF-8")]
 fn int_into_string_decimals_respects_system_locale_en() -> Result {
-    let code = r#"
+    let code = "
     10 | into string --decimals 1
-    "#;
+    ";
 
     test().run(code).expect_value_eq("10.0")
 }

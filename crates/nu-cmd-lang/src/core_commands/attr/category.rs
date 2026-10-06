@@ -38,10 +38,11 @@ impl Command for AttrCategory {
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let arg: String = call.req_const(working_set, 0)?;
+        let arg: String = call.req_const(working_set, stack, 0)?;
         Ok(Value::string(arg, call.head).into_pipeline_data())
     }
 
@@ -52,9 +53,9 @@ impl Command for AttrCategory {
     fn examples(&self) -> Vec<Example<'_>> {
         vec![Example {
             description: "Add a category to a custom command.",
-            example: r###"# Double numbers
+            example: "# Double numbers
     @category math
-    def double []: [number -> number] { $in * 2 }"###,
+    def double []: [number -> number] { $in * 2 }",
             result: None,
         }]
     }

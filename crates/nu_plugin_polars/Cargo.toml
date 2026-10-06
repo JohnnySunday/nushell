@@ -1,11 +1,12 @@
 [package]
-authors = ["The Nushell Project Developers"]
+authors.workspace = true
 description = "Nushell dataframe plugin commands based on polars."
-edition = "2024"
-license = "MIT"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 name = "nu_plugin_polars"
 repository = "https://github.com/nushell/nushell/tree/main/crates/nu_plugin_polars"
-version = "0.111.1"
+version.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -17,10 +18,10 @@ bench = false
 bench = false
 
 [dependencies]
-nu-protocol = { path = "../nu-protocol", version = "0.111.1" }
-nu-plugin = { path = "../nu-plugin", version = "0.111.1" }
-nu-path = { path = "../nu-path", version = "0.111.1" }
-nu-utils = { path = "../nu-utils", version = "0.111.1" }
+nu-protocol.workspace = true
+nu-plugin.workspace = true
+nu-path.workspace = true
+nu-utils.workspace = true
 
 # Potential dependencies for extras
 chrono = { workspace = true, features = [
@@ -31,28 +32,30 @@ fancy-regex = { workspace = true }
 indexmap = { version = "2.13" }
 num = { version = "0.4" }
 serde = { version = "1.0", features = ["derive"] }
-sqlparser = { version = "~0.60.0" }
-polars-io = { version = "~0.53.0", features = ["avro", "cloud", "aws", "azure", "gcp"] }
-polars-arrow = { version = "~0.53.0" }
-polars-ops = { version = "~0.53.0", features = ["pivot", "cutqcut"] }
-polars-plan = { version = "~0.53.0", features = ["regex"] }
-polars-utils = { version = "~0.53.0" }
-polars-lazy = { version = "~0.53.0" }
-polars-compute = { version = "~0.53.0" }
+sqlparser = { version = "~0.61.0" }
+polars-io = { version = "~0.55.2", features = ["avro", "cloud", "aws", "azure", "gcp"] }
+polars-arrow = { version = "~0.55.2" }
+polars-ops = { version = "~0.55.2", features = ["pivot", "cutqcut"] }
+polars-plan = { version = "~0.55.2", features = ["regex"] }
+polars-utils = { version = "~0.55.2" }
+polars-lazy = { version = "~0.55.2" }
+polars-compute = { version = "~0.55.2" }
 planus = { version = "~1.1.1" } # Temporarily here to convince cargo not to upgrade planus to 1.2.0
 typetag = "0.2"
 env_logger = "0.11.8"
 log.workspace = true
-uuid = { version = "1.21", features = ["v4", "serde"] }
+uuid = { version = "1.23", features = ["v4", "serde"] }
 
 # Do to a compile error with polars, this included to force the raw dependency
-hashbrown = { version = "0.16", features = ["rayon", "serde"] }
+hashbrown = { version = "0.17", features = ["rayon", "serde"] }
 
 # Cloud support
+# Note: do not depend on `object_store` directly. polars-io already depends on it
+# and re-exports the config key types we need. A second version (e.g. 0.14 while
+# polars is on 0.13) causes incompatible type mismatches in cloud option builders.
 aws-config = { version = "1.8", features = ["sso"] }
 aws-credential-types = "1.2"
-tokio = { version = "1.49", features = ["full"] }
-object_store = { version = "0.13.1", features = ["aws", "azure", "gcp"], default-features = false }
+tokio = { workspace = true, features = ["full"] }
 url.workspace = true
 
 [dependencies.polars]
@@ -60,6 +63,7 @@ features = [
   "abs",
   "arg_where",
   "bigidx",
+  "bitwise",
   "checked_arithmetic",
   "cloud",
   "concat_str",
@@ -68,7 +72,9 @@ features = [
   "csv",
   "cum_agg",
   "default",
+  "dtype-array",
   "dtype-categorical",
+  "dtype-date",
   "dtype-datetime",
   "dtype-struct",
   "dtype-decimal",
@@ -78,6 +84,7 @@ features = [
   "dtype-u16",
   "dtype-u128",
   "dynamic_group_by",
+  "range",
   "ipc",
   "is_in",
   "json",
@@ -102,12 +109,13 @@ features = [
   "trigonometry",
 ]
 optional = false
-version = "=0.53.0"
+version = "=0.55.2"
 
 [dev-dependencies]
-nu-cmd-lang = { path = "../nu-cmd-lang", version = "0.111.1" }
-nu-engine = { path = "../nu-engine", version = "0.111.1" }
-nu-parser = { path = "../nu-parser", version = "0.111.1" }
-nu-command = { path = "../nu-command", version = "0.111.1" }
-nu-plugin-test-support = { path = "../nu-plugin-test-support", version = "0.111.1" }
+nu-cmd-lang = { workspace = true, features = ["plugin"] }
+nu-engine = { workspace = true, features = ["plugin"] }
+nu-parser = { workspace = true, features = ["plugin"] }
+nu-command = { workspace = true, features = ["plugin"] }
+nu-plugin-test-support.workspace = true
+
 tempfile.workspace = true

@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use crate::PolarsPlugin;
 use crate::dataframe::values::{Column, NuDataFrame, NuExpression, NuLazyFrame};
-use crate::values::{CustomValueSupport, NuSelector, PolarsPluginObject, PolarsPluginType};
+use crate::values::{
+    CustomValueSupport, NuSelector, PolarsPluginObject, PolarsPluginType, cant_convert_err,
+};
 
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
 use nu_protocol::{
@@ -36,6 +38,10 @@ impl PluginCommand for LazyExplode {
             .input_output_types(vec![
                 (
                     PolarsPluginType::NuExpression.into(),
+                    PolarsPluginType::NuExpression.into(),
+                ),
+                (
+                    PolarsPluginType::NuSelector.into(),
                     PolarsPluginType::NuExpression.into(),
                 ),
                 (
@@ -92,6 +98,7 @@ impl PluginCommand for LazyExplode {
                             ),
                         ],
                         None,
+                        Span::test_data(),
                     )
                     .expect("simple df for test should not fail")
                     .into_value(Span::test_data()),
@@ -112,6 +119,7 @@ impl PluginCommand for LazyExplode {
                             ],
                         )],
                         None,
+                        Span::test_data(),
                     )
                     .expect("simple df for test should not fail")
                     .into_value(Span::test_data()),
@@ -125,9 +133,9 @@ impl PluginCommand for LazyExplode {
         plugin: &Self::Plugin,
         engine: &EngineInterface,
         call: &EvaluatedCall,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
-        let metadata = input.metadata();
+        let metadata = input.take_metadata();
         explode(plugin, engine, call, input)
             .map_err(LabeledError::from)
             .map(|pd| pd.set_metadata(metadata))
@@ -156,12 +164,15 @@ pub(crate) fn explode(
         PolarsPluginObject::NuExpression(expr) => {
             explode_expr(plugin, engine, call, expr, explode_options)
         }
-        _ => Err(ShellError::CantConvert {
-            to_type: "dataframe or expression".into(),
-            from_type: value.get_type().to_string(),
-            span: call.head,
-            help: None,
-        }),
+        _ => Err(cant_convert_err(
+            &value,
+            &[
+                PolarsPluginType::NuDataFrame,
+                PolarsPluginType::NuLazyFrame,
+                PolarsPluginType::NuExpression,
+                PolarsPluginType::NuSelector,
+            ],
+        )),
     }
 }
 

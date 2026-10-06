@@ -1,5 +1,6 @@
 use log::{Level, LevelFilter, SetLoggerError};
 use nu_protocol::ShellError;
+use nu_protocol::shell_error::generic::GenericError;
 use simplelog::{
     Color, ColorChoice, Config, ConfigBuilder, LevelPadding, TermLogger, TerminalMode, WriteLogger,
     format_description,
@@ -44,13 +45,10 @@ pub fn logger(
             let file_path = if let Some(p) = custom_file.as_ref() {
                 p
             } else {
-                return Err(ShellError::GenericError {
-                    error: "logger misconfigured".into(),
-                    msg: "log target is file but no path was provided".into(),
-                    span: None,
-                    help: None,
-                    inner: vec![],
-                });
+                return Err(ShellError::Generic(GenericError::new_internal(
+                    "logger misconfigured",
+                    "log target is file but no path was provided",
+                )));
             };
 
             let path = Path::new(file_path).to_path_buf();
@@ -94,17 +92,28 @@ pub fn configure(
     filters: Filters,
     builder: &mut ConfigBuilder,
 ) -> Result<(LevelFilter, LogTarget, Option<String>), ShellError> {
-    let level = match Level::from_str(level) {
-        Ok(level) => level,
-        Err(_) => Level::Info,
+    let is_perf = level == "perf";
+    let level_filter = if is_perf {
+        LevelFilter::Info
+    } else {
+        match Level::from_str(level) {
+            Ok(l) => l.to_level_filter(),
+            Err(_) => LevelFilter::Info,
+        }
     };
 
     // Add allowed module filter
+    // "perf" is a pseudo-level: it maps to LevelFilter::Info (where the perf! macro
+    // logs) but restricts the module target to "nu::perf" so only perf! output is shown.
+    // User-specified --log-include filters stack on top of this restriction.
+    if is_perf {
+        builder.add_filter_allow_str("nu::perf");
+    }
     if let Some(include) = filters.include {
         for filter in include {
             builder.add_filter_allow(filter);
         }
-    } else {
+    } else if !is_perf {
         builder.add_filter_allow_str("nu");
     }
 
@@ -134,23 +143,17 @@ pub fn configure(
     // Require an explicit log file when the target is "file".
     if let LogTarget::File = log_target {
         if custom_file.is_none() {
-            return Err(ShellError::GenericError {
-                error: "missing log file".into(),
-                msg: "--log-target file requires --log-file".into(),
-                span: None,
-                help: None,
-                inner: vec![],
-            });
+            return Err(ShellError::Generic(GenericError::new_internal(
+                "missing log file",
+                "--log-target file requires --log-file",
+            )));
         }
     } else if custom_file.is_some() {
         // If the target isn't file, providing a custom log file makes no sense.
-        return Err(ShellError::GenericError {
-            error: "log file without file target".into(),
-            msg: "--log-file requires --log-target file".into(),
-            span: None,
-            help: None,
-            inner: vec![],
-        });
+        return Err(ShellError::Generic(GenericError::new_internal(
+            "log file without file target",
+            "--log-file requires --log-target file",
+        )));
     }
 
     // Only TermLogger supports color output
@@ -158,11 +161,7 @@ pub fn configure(
         Level::iter().for_each(|level| set_colored_level(builder, level));
     }
 
-    Ok((
-        level.to_level_filter(),
-        log_target,
-        custom_file.map(|s| s.to_string()),
-    ))
+    Ok((level_filter, log_target, custom_file.map(|s| s.to_string())))
 }
 
 fn set_colored_level(builder: &mut ConfigBuilder, level: Level) {

@@ -1,12 +1,15 @@
+use crate::platform::RawModeGuard;
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
     EnableMouseCapture, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
-use crossterm::{execute, terminal};
+use crossterm::execute;
 use nu_engine::command_prelude::*;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use nu_protocol::shell_error::io::IoError;
+use nu_utils::time::Instant;
+
+use nu_protocol::shell_error::{generic::GenericError, io::IoError};
 use num_traits::AsPrimitive;
 use std::io::stdout;
 
@@ -44,9 +47,11 @@ impl Command for InputListen {
             )
             .input_output_types(vec![(
                 Type::Nothing,
-                Type::Record([
-                    ("keycode".to_string(), Type::String),
-                    ("modifiers".to_string(), Type::List(Box::new(Type::String))),
+                Type::Record(vec![
+                    ("type".to_string(), Type::String),
+                    ("key_type".to_string(), Type::String),
+                    ("code".to_string(), Type::String),
+                    ("modifiers".to_string(), Type::list(Type::String)),
                 ].into()),
             )])
     }
@@ -56,7 +61,7 @@ impl Command for InputListen {
     }
 
     fn extra_description(&self) -> &str {
-        r#"There are 5 different type of events: focus, key, mouse, paste, resize. Each will produce a
+        "There are 5 different type of events: focus, key, mouse, paste, resize. Each will produce a
 corresponding record, distinguished by type field:
 ```
     { type: focus event: (gained|lost) }
@@ -70,7 +75,7 @@ There are 4 `key_type` variants:
     f - f1, f2, f3 ... keys
     char - alphanumeric and special symbols (a, A, 1, $ ...)
     media - dedicated media keys (play, pause, tracknext ...)
-    other - keys not falling under previous categories (up, down, backspace, enter ...)"#
+    other - keys not falling under previous categories (up, down, backspace, enter ...)"
     }
     fn examples(&self) -> Vec<Example<'_>> {
         vec![Example {
@@ -92,7 +97,7 @@ There are 4 `key_type` variants:
         let add_raw = call.has_flag(engine_state, stack, "raw")?;
         let config = stack.get_config(engine_state);
 
-        terminal::enable_raw_mode().map_err(|err| IoError::new(err, head, None))?;
+        let _raw_mode = RawModeGuard::acquire(stack, head)?;
 
         if config.use_kitty_protocol {
             if let Ok(false) = crossterm::terminal::supports_keyboard_enhancement() {
@@ -126,33 +131,21 @@ There are 4 `key_type` variants:
 
         loop {
             if let Some(t) = remaining_time
-                && !crossterm::event::poll(t).map_err(|_| ShellError::GenericError {
-                    error: "Error with user input".into(),
-                    msg: "".into(),
-                    span: Some(head),
-                    help: None,
-                    inner: vec![],
+                && !crossterm::event::poll(t).map_err(|_| {
+                    ShellError::Generic(GenericError::new("Error with user input", "", head))
                 })?
             {
-                terminal::disable_raw_mode().map_err(|err| IoError::new(err, head, None))?;
-                return Err(ShellError::GenericError {
-                    error: "Timed out while waiting for user input".into(),
-                    msg: "no input was received within the timeout duration".into(),
-                    span: Some(head),
-                    help: None,
-                    inner: vec![],
-                });
+                return Err(ShellError::Generic(GenericError::new(
+                    "Timed out while waiting for user input",
+                    "no input was received within the timeout duration",
+                    head,
+                )));
             }
-            let event = crossterm::event::read().map_err(|_| ShellError::GenericError {
-                error: "Error with user input".into(),
-                msg: "".into(),
-                span: Some(head),
-                help: None,
-                inner: vec![],
+            let event = crossterm::event::read().map_err(|_| {
+                ShellError::Generic(GenericError::new("Error with user input", "", head))
             })?;
             let event = parse_event(head, &event, &event_type_filter, add_raw);
             if let Some(event) = event {
-                terminal::disable_raw_mode().map_err(|err| IoError::new(err, head, None))?;
                 if config.use_kitty_protocol {
                     let _ = execute!(
                         std::io::stdout(),

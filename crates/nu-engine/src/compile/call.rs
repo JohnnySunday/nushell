@@ -1,13 +1,12 @@
-use std::sync::Arc;
-
+use super::{BlockBuilder, CompileError, RedirectModes, compile_expression, keyword::*};
+use crate::HELP_DECL_ID_PARSER_INFO;
 use nu_protocol::{
-    IntoSpanned, RegId, Span, Spanned,
-    ast::{Argument, Call, Expression, ExternalArgument},
-    engine::{ENV_VARIABLE_ID, IN_VARIABLE_ID, NU_VARIABLE_ID, StateWorkingSet},
+    DeclId, IntoSpanned, RegId, Span, Spanned, Type,
+    ast::{Argument, Call, Expr, Expression, ExternalArgument, FlagRef},
+    engine::{ENV_VARIABLE_ID, IN_VARIABLE_ID, NU_VARIABLE_ID, StateWorkingSet, UNKNOWN_SPAN_ID},
     ir::{Instruction, IrAstRef, Literal},
 };
-
-use super::{BlockBuilder, CompileError, RedirectModes, compile_expression, keyword::*};
+use std::sync::Arc;
 
 pub(crate) fn compile_call(
     working_set: &StateWorkingSet,
@@ -17,10 +16,46 @@ pub(crate) fn compile_call(
     input_reg: Option<RegId>,
     io_reg: RegId,
 ) -> Result<(), CompileError> {
+    // Handle dynamic percent builtin dispatch: `%($cmd)` or `%$cmd`.
+    // The parser stored the head expression in parser_info as a placeholder.
+    // Rewrite this call as `run-internal <head-expr> ...args`, mirroring how
+    // `compile_external_call` rewrites dynamic external calls to `run-external`.
+    if let Some(head_expr) = call.parser_info.get("percent_forced_builtin") {
+        let run_internal_id = working_set.find_decl(b"run-internal").ok_or_else(|| {
+            CompileError::MissingRequiredDeclaration {
+                decl_name: "run-internal".into(),
+                span: call.head,
+            }
+        })?;
+
+        let mut new_call = Call::new(call.head);
+        new_call.decl_id = run_internal_id;
+        new_call
+            .arguments
+            .push(Argument::Positional(head_expr.clone()));
+        for arg in &call.arguments {
+            new_call.arguments.push(arg.clone());
+        }
+
+        return compile_call(
+            working_set,
+            builder,
+            &new_call,
+            redirect_modes,
+            input_reg,
+            io_reg,
+        );
+    }
+
     let decl = working_set.get_decl(call.decl_id);
 
     // Check if this call has --help - if so, just redirect to `help`
+    // FIXME: This `<cmd> --help` -> `help <name>` rewrite is a historical detour that
+    // resolves by name again. A future cleanup could theoretically render docs directly from
+    // `call.decl_id` while still preserving custom `help` overrides.
     if call.named_iter().any(|(name, _, _)| name.item == "help") {
+        let resolved_help_decl = Some(call.decl_id);
+
         let decl_name = decl.name();
         // Prefer the overlay-visible name (e.g. "spam prefix" for module-qualified lookups).
         // However, if the block's own signature name was rewritten (e.g. "main" → "script.nu"
@@ -44,7 +79,13 @@ pub(crate) fn compile_call(
                 .and_then(|name| std::str::from_utf8(name).ok())
                 .unwrap_or(decl_name) // fall back to decl's name
         };
-        return compile_help(working_set, builder, name.into_spanned(call.head), io_reg);
+        return compile_help(
+            working_set,
+            builder,
+            name.into_spanned(call.head),
+            resolved_help_decl,
+            io_reg,
+        );
     }
 
     // Try to figure out if this is a keyword call like `if`, and handle those specially
@@ -170,13 +211,16 @@ pub(crate) fn compile_call(
         }
     }
 
-    // Special handling for builtin commands that have direct IR equivalents
+    // Special handling for builtin commands that have direct IR equivalents.
+    // `unlet` never goes through `Command::run`; see `compile_unlet`.
     if decl.name() == "unlet" {
         return compile_unlet(working_set, builder, call, io_reg);
     }
 
     // Keep AST if the decl needs it.
     let requires_ast = decl.requires_ast_for_arguments();
+    // `metadata $var` needs the variable's definition span, not the use-site span.
+    let preserve_var_origin = decl.name() == "metadata";
 
     // It's important that we evaluate the args first before trying to set up the argument
     // state for the call.
@@ -186,13 +230,7 @@ pub(crate) fn compile_call(
     // it.
     enum CompiledArg<'a> {
         Positional(RegId, Span, Option<IrAstRef>),
-        Named(
-            &'a str,
-            Option<&'a str>,
-            Option<RegId>,
-            Span,
-            Option<IrAstRef>,
-        ),
+        Named(FlagRef<'a>, Option<RegId>, Span, Option<IrAstRef>),
         Spread(RegId, Span, Option<IrAstRef>),
     }
 
@@ -203,6 +241,19 @@ pub(crate) fn compile_call(
             .expr()
             .map(|expr| {
                 let arg_reg = builder.next_register()?;
+
+                // Bare variables for `metadata` load with origin span preserved.
+                if preserve_var_origin && let Some(var_id) = bare_var_id(expr) {
+                    builder.push(
+                        Instruction::LoadVariable {
+                            dst: arg_reg,
+                            var_id,
+                            preserve_origin: true,
+                        }
+                        .into_spanned(expr.span),
+                    )?;
+                    return Ok(arg_reg);
+                }
 
                 compile_expression(
                     working_set,
@@ -230,9 +281,8 @@ pub(crate) fn compile_call(
                     ast_ref,
                 ))
             }
-            Argument::Named((name, short, _)) => compiled_args.push(CompiledArg::Named(
-                &name.item,
-                short.as_ref().map(|spanned| spanned.item.as_str()),
+            Argument::Named((long, short, _)) => compiled_args.push(CompiledArg::Named(
+                FlagRef::from_named(long, short.as_ref()),
                 arg_reg,
                 arg.span(),
                 ast_ref,
@@ -252,25 +302,25 @@ pub(crate) fn compile_call(
                 builder.push(Instruction::PushPositional { src: reg }.into_spanned(span))?;
                 builder.set_last_ast(ast_ref);
             }
-            CompiledArg::Named(name, short, Some(reg), span, ast_ref) => {
-                if !name.is_empty() {
-                    let name = builder.data(name)?;
-                    builder.push(Instruction::PushNamed { name, src: reg }.into_spanned(span))?;
-                } else {
-                    let short = builder.data(short.unwrap_or(""))?;
-                    builder
-                        .push(Instruction::PushShortNamed { short, src: reg }.into_spanned(span))?;
-                }
-                builder.set_last_ast(ast_ref);
-            }
-            CompiledArg::Named(name, short, None, span, ast_ref) => {
-                if !name.is_empty() {
-                    let name = builder.data(name)?;
-                    builder.push(Instruction::PushFlag { name }.into_spanned(span))?;
-                } else {
-                    let short = builder.data(short.unwrap_or(""))?;
-                    builder.push(Instruction::PushShortFlag { short }.into_spanned(span))?;
-                }
+            // The long/short × with-value/bare grid, spelled out once.
+            CompiledArg::Named(flag, reg, span, ast_ref) => {
+                let instruction = match (flag, reg) {
+                    (FlagRef::Long(name), Some(src)) => Instruction::PushNamed {
+                        name: builder.data(name)?,
+                        src,
+                    },
+                    (FlagRef::Long(name), None) => Instruction::PushFlag {
+                        name: builder.data(name)?,
+                    },
+                    (FlagRef::Short(short), Some(src)) => Instruction::PushShortNamed {
+                        short: builder.data(short)?,
+                        src,
+                    },
+                    (FlagRef::Short(short), None) => Instruction::PushShortFlag {
+                        short: builder.data(short)?,
+                    },
+                };
+                builder.push(instruction.into_spanned(span))?;
                 builder.set_last_ast(ast_ref);
             }
             CompiledArg::Spread(reg, span, ast_ref) => {
@@ -322,6 +372,7 @@ pub(crate) fn compile_help(
     working_set: &StateWorkingSet<'_>,
     builder: &mut BlockBuilder,
     decl_name: Spanned<&str>,
+    resolved_help_decl: Option<DeclId>,
     io_reg: RegId,
 ) -> Result<(), CompileError> {
     let help_command_id =
@@ -337,6 +388,19 @@ pub(crate) fn compile_help(
 
     builder.push(Instruction::PushPositional { src: name_literal }.into_spanned(decl_name.span))?;
 
+    if let Some(resolved_help_decl) =
+        resolved_help_decl.and_then(|decl_id| help_decl_parser_info_expr(decl_id, decl_name.span))
+    {
+        let parser_info_name = builder.data(HELP_DECL_ID_PARSER_INFO)?;
+        builder.push(
+            Instruction::PushParserInfo {
+                name: parser_info_name,
+                info: Box::new(resolved_help_decl),
+            }
+            .into_spanned(decl_name.span),
+        )?;
+    }
+
     builder.push(
         Instruction::Call {
             decl_id: help_command_id,
@@ -346,6 +410,17 @@ pub(crate) fn compile_help(
     )?;
 
     Ok(())
+}
+
+// When compile_call rewrites `<cmd> --help` to `help <name>`, preserve the already-resolved
+// declaration identity so help output reflects the original command resolution.
+fn help_decl_parser_info_expr(decl_id: DeclId, span: Span) -> Option<Expression> {
+    i64::try_from(decl_id.get()).ok().map(|decl_id| Expression {
+        expr: Expr::Int(decl_id),
+        span,
+        span_id: UNKNOWN_SPAN_ID,
+        ty: Type::Int,
+    })
 }
 
 pub(crate) fn compile_external_call(
@@ -388,6 +463,18 @@ pub(crate) fn compile_external_call(
     )
 }
 
+/// Extract a bare variable id from `$var` or a FullCellPath with empty tail.
+fn bare_var_id(expr: &Expression) -> Option<nu_protocol::VarId> {
+    match &expr.expr {
+        Expr::Var(var_id) => Some(*var_id),
+        Expr::FullCellPath(cell_path) if cell_path.tail.is_empty() => match &cell_path.head.expr {
+            Expr::Var(var_id) => Some(*var_id),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 pub(crate) fn compile_unlet(
     _working_set: &StateWorkingSet,
     builder: &mut BlockBuilder,
@@ -395,51 +482,32 @@ pub(crate) fn compile_unlet(
     io_reg: RegId,
 ) -> Result<(), CompileError> {
     // unlet takes one or more positional arguments which should be variable references
-    if call.positional_len() == 0 {
-        return Err(CompileError::InvalidLiteral {
-            msg: "unlet takes at least one argument".into(),
-            span: call.head,
-        });
-    }
+    let mut iter_empty = true;
 
     // Process each positional argument
-    for i in 0..call.positional_len() {
-        let Some(arg) = call.positional_nth(i) else {
-            return Err(CompileError::InvalidLiteral {
-                msg: "Expected positional argument".into(),
-                span: call.head,
-            });
-        };
+    for arg in call.positional_iter() {
+        iter_empty = false;
 
-        // Extract variable ID from the expression
         // Handle both direct variable references (Expr::Var) and full cell paths (Expr::FullCellPath)
         // that represent simple variables (e.g., $var parsed as FullCellPath with empty tail).
-        // This allows unlet to work with variables parsed in different contexts.
-        let var_id = match &arg.expr {
-            nu_protocol::ast::Expr::Var(var_id) => Some(*var_id),
-            nu_protocol::ast::Expr::FullCellPath(cell_path) => {
-                if cell_path.tail.is_empty() {
-                    match &cell_path.head.expr {
-                        nu_protocol::ast::Expr::Var(var_id) => Some(*var_id),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
+        let var_id = bare_var_id(arg);
 
         match var_id {
             Some(var_id) => {
                 // Prevent deletion of built-in variables that are essential for nushell operation
-                if var_id == NU_VARIABLE_ID || var_id == ENV_VARIABLE_ID || var_id == IN_VARIABLE_ID
+                if var_id == NU_VARIABLE_ID
+                    || var_id == ENV_VARIABLE_ID
+                    || var_id == IN_VARIABLE_ID
+                    || var_id == nu_protocol::LAST_VARIABLE_ID
                 {
                     // Determine the variable name for the error message
                     let var_name = match var_id {
                         NU_VARIABLE_ID => "nu",
                         ENV_VARIABLE_ID => "env",
                         IN_VARIABLE_ID => "in",
+                        _ if var_id == nu_protocol::LAST_VARIABLE_ID => {
+                            nu_protocol::LAST_RESULT_VAR_NAME
+                        }
                         _ => "unknown", // This should never happen due to the check above
                     };
 
@@ -463,6 +531,13 @@ pub(crate) fn compile_unlet(
                 });
             }
         }
+    }
+
+    if iter_empty {
+        return Err(CompileError::InvalidLiteral {
+            msg: "unlet takes at least one argument".into(),
+            span: call.head,
+        });
     }
 
     // Load empty value as the result

@@ -5,7 +5,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{PluginIdentity, PluginMetadata, PluginSignature, ShellError, Span};
+use crate::{
+    PluginIdentity, PluginMetadata, PluginSignature, ShellError, Span,
+    shell_error::generic::GenericError,
+};
 
 // This has a big impact on performance
 const BUFFER_SIZE: usize = 65536;
@@ -43,18 +46,34 @@ impl PluginRegistryFile {
         reader: impl Read,
         error_span: Option<Span>,
     ) -> Result<PluginRegistryFile, ShellError> {
-        // Format is brotli compressed messagepack
-        let brotli_reader = brotli::Decompressor::new(reader, BUFFER_SIZE);
+        let load_error = |err: String| {
+            let error = format!("Failed to load plugin file: {err}");
+            let msg = "plugin file load attempted here";
+            let help = "it may be corrupt. Try deleting it and registering your plugins again";
+            match error_span {
+                Some(span) => {
+                    ShellError::Generic(GenericError::new(error, msg, span).with_help(help))
+                }
+                None => ShellError::Generic(GenericError::new_internal(error, msg).with_help(help)),
+            }
+        };
 
-        rmp_serde::from_read(brotli_reader).map_err(|err| ShellError::GenericError {
-            error: format!("Failed to load plugin file: {err}"),
-            msg: "plugin file load attempted here".into(),
-            span: error_span,
-            help: Some(
-                "it may be corrupt. Try deleting it and registering your plugins again".into(),
-            ),
-            inner: vec![],
-        })
+        // Format is brotli compressed messagepack
+        let mut bytes = Vec::new();
+        brotli::Decompressor::new(reader, BUFFER_SIZE)
+            .read_to_end(&mut bytes)
+            .map_err(|err| load_error(err.to_string()))?;
+
+        // `PluginRegistryItem` flattens an untagged enum so that an entry whose signatures no
+        // longer deserialize is loaded as `Invalid` instead of failing the whole file. That
+        // tolerance makes serde buffer every entry into a generic value tree and decode it a
+        // second time, which is the bulk of the time spent loading the registry at startup.
+        // The entries are all valid in the common case, so decode the plain layout in one pass
+        // first and only fall back to the tolerant decoder when that fails.
+        match rmp_serde::from_slice::<StrictPluginRegistryFile>(&bytes) {
+            Ok(file) => Ok(file.into()),
+            Err(_) => rmp_serde::from_slice(&bytes).map_err(|err| load_error(err.to_string())),
+        }
     }
 
     /// Write the plugin registry file to a writer, e.g. [`File`](std::fs::File).
@@ -75,12 +94,17 @@ impl PluginRegistryFile {
         rmp_serde::encode::write_named(&mut brotli_writer, self)
             .map_err(|err| err.to_string())
             .and_then(|_| brotli_writer.flush().map_err(|err| err.to_string()))
-            .map_err(|err| ShellError::GenericError {
-                error: "Failed to save plugin file".into(),
-                msg: "plugin file save attempted here".into(),
-                span: error_span,
-                help: Some(err.to_string()),
-                inner: vec![],
+            .map_err(|err| {
+                let error = "Failed to save plugin file";
+                let msg = "plugin file save attempted here";
+                match error_span {
+                    Some(span) => {
+                        ShellError::Generic(GenericError::new(error, msg, span).with_help(err))
+                    }
+                    None => {
+                        ShellError::Generic(GenericError::new_internal(error, msg).with_help(err))
+                    }
+                }
             })
     }
 
@@ -94,6 +118,47 @@ impl PluginRegistryFile {
             // Sort the plugins for consistency
             self.plugins
                 .sort_by(|item1, item2| item1.name.cmp(&item2.name));
+        }
+    }
+}
+
+/// The on-disk layout of [`PluginRegistryFile`] without the error tolerance of
+/// [`PluginRegistryItemData`]: the same maps, decoded in a single pass. Only used for reading;
+/// see [`PluginRegistryFile::read_from`].
+#[derive(Deserialize)]
+struct StrictPluginRegistryFile {
+    nushell_version: String,
+    plugins: Vec<StrictPluginRegistryItem>,
+}
+
+/// A [`PluginRegistryItem`] whose data is known to be valid. See [`StrictPluginRegistryFile`].
+#[derive(Deserialize)]
+struct StrictPluginRegistryItem {
+    name: String,
+    filename: PathBuf,
+    shell: Option<PathBuf>,
+    #[serde(default)]
+    metadata: PluginMetadata,
+    commands: Vec<PluginSignature>,
+}
+
+impl From<StrictPluginRegistryFile> for PluginRegistryFile {
+    fn from(file: StrictPluginRegistryFile) -> Self {
+        PluginRegistryFile {
+            nushell_version: file.nushell_version,
+            plugins: file
+                .plugins
+                .into_iter()
+                .map(|item| PluginRegistryItem {
+                    name: item.name,
+                    filename: item.filename,
+                    shell: item.shell,
+                    data: PluginRegistryItemData::Valid {
+                        metadata: item.metadata,
+                        commands: item.commands,
+                    },
+                })
+                .collect(),
         }
     }
 }

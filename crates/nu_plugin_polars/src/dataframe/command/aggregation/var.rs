@@ -31,6 +31,10 @@ impl PluginCommand for ExprVar {
                     PolarsPluginType::NuExpression.into(),
                 ),
                 (
+                    PolarsPluginType::NuSelector.into(),
+                    PolarsPluginType::NuExpression.into(),
+                ),
+                (
                     PolarsPluginType::NuDataFrame.into(),
                     PolarsPluginType::NuDataFrame.into(),
                 ),
@@ -54,6 +58,7 @@ impl PluginCommand for ExprVar {
                             Column::new("b".to_string(), vec![Value::test_float(0.0)]),
                         ],
                         None,
+                        Span::test_data(),
                     )
                     .expect("simple df for test should not fail")
                     .into_value(Span::test_data()),
@@ -86,9 +91,9 @@ impl PluginCommand for ExprVar {
         plugin: &Self::Plugin,
         engine: &EngineInterface,
         call: &EvaluatedCall,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
-        let metadata = input.metadata();
+        let metadata = input.take_metadata();
         let value = input.into_value(call.head)?;
         match PolarsPluginObject::try_from_value(plugin, &value)? {
             PolarsPluginObject::NuDataFrame(df) => command_lazy(plugin, engine, call, df.lazy()),
@@ -100,6 +105,7 @@ impl PluginCommand for ExprVar {
                     PolarsPluginType::NuDataFrame,
                     PolarsPluginType::NuLazyFrame,
                     PolarsPluginType::NuExpression,
+                    PolarsPluginType::NuSelector,
                 ],
             )),
         }

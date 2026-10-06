@@ -1,10 +1,9 @@
 use super::Director;
-use crate::fs::{self, Stub};
-use nu_glob::{Uninterruptible, glob};
+use crate::{fs::Stub, tester::FIXTURES};
 #[cfg(not(target_arch = "wasm32"))]
 use nu_path::Path;
 use nu_path::{AbsolutePath, AbsolutePathBuf};
-use std::str;
+use std::{ops::Deref, str};
 use tempfile::{TempDir, tempdir};
 
 #[derive(Default, Clone, Debug)]
@@ -87,14 +86,15 @@ impl Playground<'_> {
             .canonicalize()
             .expect("Could not canonicalize test path");
 
-        let fixtures = fs::fixtures()
-            .canonicalize()
-            .expect("Could not canonicalize fixtures path");
+        let fixtures = FIXTURES
+            .deref()
+            .try_into()
+            .expect("fixtures is absolute path");
 
         let dirs = Dirs {
             root: root.into(),
             test: test.as_path().into(),
-            fixtures: fixtures.into(),
+            fixtures,
         };
 
         let mut playground = Playground {
@@ -133,10 +133,6 @@ impl Playground<'_> {
             environment_vars: self.environment_vars.clone(),
             ..Default::default()
         }
-    }
-
-    pub fn cococo(&mut self, arg: &str) -> Director {
-        self.build().cococo(arg)
     }
 
     pub fn pipeline(&mut self, commands: &str) -> Director {
@@ -179,8 +175,6 @@ impl Playground<'_> {
     }
 
     pub fn with_files(&mut self, files: &[Stub]) -> &mut Self {
-        let endl = fs::line_ending();
-
         files
             .iter()
             .map(|f| {
@@ -196,7 +190,7 @@ impl Playground<'_> {
                             .skip(1)
                             .map(|line| line.trim())
                             .collect::<Vec<&str>>()
-                            .join(&endl),
+                            .join(nu_utils::consts::LINE_SEPARATOR_STR),
                     ),
                     Stub::FileWithPermission(name, is_write_able) => {
                         permission_set = true;
@@ -231,16 +225,15 @@ impl Playground<'_> {
     }
 
     pub fn glob_vec(pattern: &str) -> Vec<std::path::PathBuf> {
-        let glob = glob(pattern, Uninterruptible);
-
-        glob.expect("invalid pattern")
-            .map(|path| {
-                if let Ok(path) = path {
-                    path
-                } else {
-                    unreachable!()
-                }
-            })
-            .collect()
+        let cwd = std::env::current_dir().expect("current directory should be available");
+        if nu_experimental::DC_GLOB.get() {
+            let glob = nu_glob::dc_glob::glob_from(&cwd, pattern).expect("invalid pattern");
+            glob.map(|path| path.expect("glob entry should resolve"))
+                .collect()
+        } else {
+            let glob = nu_glob::glob(pattern, nu_glob::Uninterruptible).expect("invalid pattern");
+            glob.map(|path| path.expect("glob entry should resolve"))
+                .collect()
+        }
     }
 }

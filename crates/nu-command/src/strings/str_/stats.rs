@@ -47,6 +47,7 @@ impl Command for StrStats {
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        _stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
@@ -69,7 +70,7 @@ impl Command for StrStats {
             },
             Example {
                 description: "Counts unicode characters.",
-                example: r#"'今天天气真好' | str stats"#,
+                example: "'今天天气真好' | str stats",
                 result: Some(Value::test_record(record! {
                         "lines" =>     Value::test_int(1),
                         "words" =>     Value::test_int(6),
@@ -292,10 +293,8 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(StrStats {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(StrStats)
     }
 }
 

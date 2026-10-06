@@ -195,17 +195,26 @@ fn regex_error_in_pattern() -> Result {
          "#;
 
         let err = test().cwd(dirs.test()).run(code).expect_shell_error()?;
-        assert_contains("Incorrect value", err.to_string());
+        assert_contains("Invalid value", err.to_string());
         Ok(())
     })
 }
 
 #[test]
+fn regex_error_in_pattern_without_input() -> Result {
+    let code = r#"[] | str replace -r '[' "destination""#;
+
+    let err = test().run(code).expect_shell_error()?;
+    assert_contains("Invalid value", err.to_string());
+    Ok(())
+}
+
+#[test]
 fn find_and_replaces_with_closure() -> Result {
-    let code = r#"
+    let code = "
          'source string'
          | str replace 'str' { str upcase }
-     "#;
+     ";
 
     test().run(code).expect_value_eq("source STRing")
 }
@@ -224,10 +233,10 @@ fn find_and_replaces_regex_with_closure() -> Result {
 
 #[test]
 fn find_and_replaces_closure_error() -> Result {
-    let code = r#"
+    let code = "
          'source string'
          | str replace 'str' { 1 / 0 }
-     "#;
+     ";
 
     let err = test().run(code).expect_shell_error()?;
     assert!(matches!(err, ShellError::DivisionByZero { .. }));
@@ -236,10 +245,10 @@ fn find_and_replaces_closure_error() -> Result {
 
 #[test]
 fn find_and_replaces_regex_closure_error() -> Result {
-    let code = r#"
+    let code = "
          'source string'
          | str replace -r 'str' { 1 / 0 }
-     "#;
+     ";
 
     let err = test().run(code).expect_shell_error()?;
     assert!(matches!(err, ShellError::DivisionByZero { .. }));
@@ -248,10 +257,10 @@ fn find_and_replaces_regex_closure_error() -> Result {
 
 #[test]
 fn find_and_replaces_closure_type_mismatch() -> Result {
-    let code = r#"
+    let code = "
          'source string'
          | str replace 'str' { 42 }
-     "#;
+     ";
 
     let err = test().run(code).expect_shell_error()?;
     assert!(matches!(err, ShellError::RuntimeTypeMismatch { .. }));
@@ -260,10 +269,10 @@ fn find_and_replaces_closure_type_mismatch() -> Result {
 
 #[test]
 fn find_and_replaces_regex_closure_type_mismatch() -> Result {
-    let code = r#"
+    let code = "
          'source string'
          | str replace -r 'str' { 42 }
-     "#;
+     ";
 
     let err = test().run(code).expect_shell_error()?;
     assert!(matches!(err, ShellError::RuntimeTypeMismatch { .. }));
@@ -281,11 +290,11 @@ fn substrings_the_input() -> Result {
                  "#,
         )]);
 
-        let code = r#"
+        let code = "
              open sample.toml
              | str substring 6..14 fortune.teller.phone
              | get fortune.teller.phone
-         "#;
+         ";
 
         test()
             .cwd(dirs.test())
@@ -305,11 +314,11 @@ fn substring_empty_if_start_index_is_greater_than_end_index() -> Result {
                  "#,
         )]);
 
-        let code = r#"
+        let code = "
              open sample.toml
              | str substring 6..4 fortune.teller.phone
              | get fortune.teller.phone
-         "#;
+         ";
 
         test().cwd(dirs.test()).run(code).expect_value_eq("")
     })
@@ -326,11 +335,11 @@ fn substrings_the_input_and_returns_the_string_if_end_index_exceeds_length() -> 
                  "#,
         )]);
 
-        let code = r#"
+        let code = "
              open sample.toml
              | str substring 0..999 package.name
              | get package.name
-         "#;
+         ";
 
         test()
             .cwd(dirs.test())
@@ -350,11 +359,11 @@ fn substrings_the_input_and_returns_blank_if_start_index_exceeds_length() -> Res
                  "#,
         )]);
 
-        let code = r#"
+        let code = "
              open sample.toml
              | str substring 50..999 package.name
              | get package.name
-         "#;
+         ";
 
         test().cwd(dirs.test()).run(code).expect_value_eq("")
     })
@@ -371,11 +380,11 @@ fn substrings_the_input_and_treats_start_index_as_zero_if_blank_start_index_give
                  "#,
         )]);
 
-        let code = r#"
+        let code = "
              open sample.toml
              | str substring ..1 package.name
              | get package.name
-         "#;
+         ";
 
         test().cwd(dirs.test()).run(code).expect_value_eq("nu")
     })
@@ -392,11 +401,11 @@ fn substrings_the_input_and_treats_end_index_as_length_if_blank_end_index_given(
                  "#,
         )]);
 
-        let code = r#"
+        let code = "
              open sample.toml
              | str substring 3.. package.name
              | get package.name
-         "#;
+         ";
 
         test().cwd(dirs.test()).run(code).expect_value_eq("arepas")
     })
@@ -423,11 +432,13 @@ fn substring_of_empty_string() -> Result {
 
 #[test]
 fn substring_drops_content_type() -> Result {
-    let code = format!(
-        "open {} | str substring 0..2 | metadata | get content_type? | describe",
-        file!(),
-    );
-    test().run(code).expect_value_eq("nothing")
+    let code = "
+        open --raw formats/cargo_sample.toml
+        | str substring 0..2
+        | metadata
+        | $in.content_type?
+    ";
+    test().cwd(FIXTURES.as_path()).run(code).expect_value_eq(())
 }
 
 #[test]
@@ -442,10 +453,11 @@ fn str_reverse() -> Result {
 }
 
 #[test]
+#[deps(TESTBIN_COCOCO)]
 fn test_redirection_trim() -> Result {
-    let code = r#"
-        let x = (nu --testbin cococo niceone); $x | str trim | str length
-        "#;
+    let code = "
+        let x = (cococo niceone); $x | str trim | str length
+    ";
 
-    test().add_nu_to_path().run(code).expect_value_eq(7)
+    test().run(code).expect_value_eq(7)
 }

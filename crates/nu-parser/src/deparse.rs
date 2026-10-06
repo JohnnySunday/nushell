@@ -1,16 +1,24 @@
 use nu_utils::escape_quote_string;
 
 fn string_should_be_quoted(input: &str) -> bool {
-    input.starts_with('$')
+    input.is_empty()
+        || input.starts_with('$')
         || input.chars().any(|c| {
-            c == ' '
+            c.is_whitespace()
                 || c == '('
+                || c == '['
+                || c == '{'
+                || c == '}'
                 || c == '\''
                 || c == '`'
                 || c == '"'
                 || c == '\\'
                 || c == ';'
                 || c == '|'
+                // `#` starts a comment when it begins a token (or after whitespace).
+                // Without quoting, `nu script.nu #000000` becomes `main #000000` and
+                // the argument is stripped.
+                || c == '#'
         })
 }
 
@@ -20,7 +28,7 @@ fn string_should_be_quoted(input: &str) -> bool {
 // input argument is a flag without =, it's passed as it is (--foo -> --foo)
 // input argument is a flag with =, the first two points apply to the value (--foo=bar -> --foo=bar; --foo=bar' -> --foo="bar'")
 //
-// special characters are white space, (, ', `, ",and \
+// special characters are white space, (, [, {, }, ', `, ", \, ;, |, and #
 pub fn escape_for_script_arg(input: &str) -> String {
     // handle for flag, maybe we need to escape the value.
     if input.starts_with("--") {
@@ -64,11 +72,28 @@ mod test {
             ("`123", r#""`123""#),
             ("this|cat", r#""this|cat""#),
             ("this;cat", r#""this;cat""#),
+            // `#` would start a comment when re-parsed as `main <arg>`
+            ("#000000", r##""#000000""##),
+            ("#", r##""#""##),
+            ("foo#bar", r##""foo#bar""##),
         ];
 
         for (input, expected) in cases {
             assert_eq!(escape_for_script_arg(input).as_str(), expected);
         }
+    }
+
+    #[test]
+    fn test_flag_value_with_hash() {
+        assert_eq!(
+            escape_for_script_arg("--color=#000000"),
+            r##"--color="#000000""##.to_string()
+        );
+    }
+
+    #[test]
+    fn test_quote_newline() {
+        assert_eq!(escape_for_script_arg("c\nd"), format!("\"c\nd\""));
     }
 
     #[test]

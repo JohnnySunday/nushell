@@ -101,7 +101,7 @@ impl Command for JobSpawn {
                     Some(Redirection::Pipe(OutDest::Null)),
                 );
                 ClosureEvalOnce::new_preserve_out_dest(&job_state, &stack, closure)
-                    .run_with_input(Value::nothing(head).into_pipeline_data())
+                    .run_with_input(PipelineData::Empty)
                     .and_then(|data| data.drain())
                     .unwrap_or_else(|err| {
                         if !job_state.signals().interrupted() {
@@ -139,10 +139,10 @@ impl Command for JobSpawn {
     }
 
     fn extra_description(&self) -> &str {
-        r#"Executes the provided closure in a background thread
+        "Executes the provided closure in a background thread
 and registers this task in the background job table, which can be retrieved with `job list`.
 
 This command returns the job id of the newly created job.
-            "#
+            "
     }
 }

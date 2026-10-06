@@ -213,6 +213,8 @@ fn insert_recursive(
                         value.insert_data_at_cell_path(path, replacement, head_span)?;
                     }
                     pre_elems.push(value)
+                } else if pre_elems.is_empty() {
+                    return Err(ShellError::AccessEmptyContent { span: path_span });
                 } else {
                     return Err(ShellError::AccessBeyondEnd {
                         max_idx: pre_elems.len() - 1,
@@ -335,9 +337,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Insert {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Insert)
     }
 }

@@ -1,16 +1,25 @@
 use std/testing *
 use std/assert
 
-def run [
+def run-command [
     system_level,
-    message_level
+    message_level,
+    --context :record
     --short
 ] {
+    mut args = []
+
     if $short {
-        ^$nu.current-exe --no-config-file --commands $'use std; use std/log; NU_LOG_LEVEL=($system_level) log ($message_level) --short "test message"'
-    } else {
-        ^$nu.current-exe --no-config-file --commands $'use std; use std/log; NU_LOG_LEVEL=($system_level) log ($message_level) "test message"'
+      $args = $args | append ["--short"]
     }
+
+    if $context != null {
+      $args = $args | append ["--context" ($context | to nuon)]
+    }
+
+    let args = $args | str join ' '
+
+    ^$nu.current-exe --no-config-file --commands $'use std; use std/log; NU_LOG_LEVEL=($system_level) log ($message_level) ($args) "test message"'
     | complete | get --optional stderr
 }
 
@@ -18,7 +27,7 @@ def "assert no message" [
     system_level,
     message_level
 ] {
-    let output = (run $system_level $message_level)
+    let output = (run-command $system_level $message_level)
     assert equal "" $output
 }
 
@@ -27,7 +36,7 @@ def "assert message" [
     message_level,
     message_level_str
 ] {
-    let output = (run $system_level $message_level)
+    let output = (run-command $system_level $message_level)
     assert str contains $output $message_level_str
     assert str contains $output "test message"
 }
@@ -37,9 +46,20 @@ def "assert message short" [
     message_level,
     message_level_str
 ] {
-    let output = (run --short $system_level $message_level)
+    let output = (run-command --short $system_level $message_level)
     assert str contains $output $message_level_str
     assert str contains $output "test message"
+}
+
+def "assert context" [
+  system_level,
+  message_level,
+  message_level_str
+] {
+    let output = (run-command $system_level --context {varA: valueA varB: valueB} $message_level)
+    assert str contains $output $message_level_str
+    assert str contains $output "test message"
+    assert str contains $output 'varA="valueA" varB="valueB"'
 }
 
 @test
@@ -54,6 +74,11 @@ def critical_short [] {
 }
 
 @test
+def critical_context [] {
+    assert context CRITICAL critical CRT
+}
+
+@test
 def error [] {
     assert no message CRITICAL error
     assert message ERROR error ERR
@@ -62,6 +87,11 @@ def error [] {
 @test
 def error_short [] {
     assert message short ERROR error E
+}
+
+@test
+def error_context [] {
+    assert context ERROR error E
 }
 
 @test
@@ -76,6 +106,11 @@ def warning_short [] {
 }
 
 @test
+def warning_context [] {
+    assert context WARNING warning W
+}
+
+@test
 def info [] {
     assert no message WARNING info
     assert message INFO info "INF" # INF has to be quoted, otherwise it is the `inf` float
@@ -87,6 +122,11 @@ def info_short [] {
 }
 
 @test
+def info_context [] {
+    assert context INFO info I
+}
+
+@test
 def debug [] {
     assert no message INFO debug
     assert message DEBUG debug DBG
@@ -95,4 +135,9 @@ def debug [] {
 @test
 def debug_short [] {
     assert message short DEBUG debug D
+}
+
+@test
+def debug_context [] {
+    assert context DEBUG debug D
 }

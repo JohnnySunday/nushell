@@ -111,10 +111,11 @@ impl Command for SplitChars {
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let graphemes = grapheme_flags_const(working_set, call)?;
+        let graphemes = grapheme_flags_const(working_set, stack, call)?;
         split_chars(working_set.permanent(), call, input, graphemes)
     }
 }
@@ -175,9 +176,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SplitChars {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(SplitChars)
     }
 }

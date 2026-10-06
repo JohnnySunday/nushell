@@ -1,9 +1,9 @@
 #[cfg(feature = "sqlite")]
-use crate::database::SQLiteQueryBuilder;
+use crate::database::QueryPlan;
 use nu_engine::command_prelude::*;
 use nu_protocol::{
     DeprecationEntry, DeprecationType, PipelineIterator, ReportMode, ast::PathMember,
-    casing::Casing,
+    casing::Casing, shell_error::generic::GenericError,
 };
 use std::collections::BTreeSet;
 
@@ -57,9 +57,9 @@ impl Command for Select {
     }
 
     fn extra_description(&self) -> &str {
-        r#"This differs from `get` in that, rather than accessing the given value in the data structure,
+        "This differs from `get` in that, rather than accessing the given value in the data structure,
 it removes all non-selected values from the structure. Hence, using `select` on a table will
-produce a table, a list will produce a list, and a record will produce a record."#
+produce a table, a list will produce a list, and a record will produce a record."
     }
 
     fn search_terms(&self) -> Vec<&str> {
@@ -207,7 +207,7 @@ produce a table, a list will produce a list, and a record will produce a record.
             },
             Example {
                 description: "Select multiple columns by spreading a list.",
-                example: r#"let cols = [name type]; [[name type size]; [Cargo.toml toml 1kb] [Cargo.lock toml 2kb]] | select ...$cols"#,
+                example: "let cols = [name type]; [[name type size]; [Cargo.toml toml 1kb] [Cargo.lock toml 2kb]] | select ...$cols",
                 result: Some(Value::test_list(vec![
                     Value::test_record(record! {
                         "name" => Value::test_string("Cargo.toml"),
@@ -227,7 +227,7 @@ fn select(
     engine_state: &EngineState,
     call_span: Span,
     columns: Vec<CellPath>,
-    input: PipelineData,
+    mut input: PipelineData,
 ) -> Result<PipelineData, ShellError> {
     let mut unique_rows: BTreeSet<usize> = BTreeSet::new();
 
@@ -238,13 +238,11 @@ fn select(
         match members.first() {
             Some(PathMember::Int { val, span, .. }) => {
                 if members.len() > 1 {
-                    return Err(ShellError::GenericError {
-                        error: "Select only allows row numbers for rows".into(),
-                        msg: "extra after row number".into(),
-                        span: Some(*span),
-                        help: None,
-                        inner: vec![],
-                    });
+                    return Err(ShellError::Generic(GenericError::new(
+                        "Select only allows row numbers for rows",
+                        "extra after row number",
+                        *span,
+                    )));
                 }
                 unique_rows.insert(*val);
             }
@@ -258,7 +256,7 @@ fn select(
     let columns = new_columns;
 
     let input = if !unique_rows.is_empty() {
-        let metadata = input.metadata();
+        let metadata = input.take_metadata();
         let pipeline_iter: PipelineIterator = input.into_iter();
 
         NthIterator {
@@ -276,9 +274,9 @@ fn select(
     };
 
     #[cfg(feature = "sqlite")]
-    // Pushdown optimization: handle 'select' on SQLiteQueryBuilder for lazy column selection
+    // Pushdown optimization: handle 'select' via QueryPlan for lazy column selection
     if let PipelineData::Value(Value::Custom { val, .. }, ..) = &input
-        && let Some(table) = val.as_any().downcast_ref::<SQLiteQueryBuilder>()
+        && let Some(plan) = QueryPlan::try_from_any(val.as_any())
     {
         // Push down only simple single-segment string paths; everything else
         // falls back to the generic in-memory selection path below.
@@ -291,9 +289,9 @@ fn select(
             .collect();
 
         if let Some(select_columns) = select_columns.filter(|selected| !selected.is_empty())
-            && let Some(new_table) = table.project_output_columns(&select_columns)
+            && let Some(new_plan) = plan.project_output_columns(&select_columns)
         {
-            return Ok(Value::custom(Box::new(new_table), call_span).into_pipeline_data());
+            return Ok(new_plan.into_value(call_span).into_pipeline_data());
         }
     }
 
@@ -377,18 +375,15 @@ impl Iterator for NthIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(row) = self.rows.peek() {
-                if self.current == *row {
-                    self.rows.next();
-                    self.current += 1;
-                    return self.input.next();
-                } else {
-                    self.current += 1;
-                    let _ = self.input.next()?;
-                    continue;
-                }
+            let row = self.rows.peek()?;
+            if self.current == *row {
+                self.rows.next();
+                self.current += 1;
+                return self.input.next();
             } else {
-                return None;
+                self.current += 1;
+                let _ = self.input.next()?;
+                continue;
             }
         }
     }
@@ -399,9 +394,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Select)
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Select)
     }
 }

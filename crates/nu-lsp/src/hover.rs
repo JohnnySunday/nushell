@@ -1,6 +1,6 @@
 use lsp_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
 use nu_protocol::{PositionalArg, engine::Command};
-use std::borrow::Cow;
+use std::{borrow::Cow, fmt::Write};
 
 use crate::{
     Id, LanguageServer,
@@ -13,15 +13,17 @@ impl LanguageServer {
 
         if !skip_description {
             // First description
-            description.push_str(&format!("{}\n", decl.description().replace('\r', "")));
+            writeln!(description, "{}", decl.description().replace('\r', ""))
+                .expect("writing to a String is infallible");
 
             // Additional description
             if !decl.extra_description().is_empty() {
-                description.push_str(&format!("\n{}\n", decl.extra_description()));
+                write!(description, "\n{}\n", decl.extra_description())
+                    .expect("writing to a String is infallible");
             }
         }
         // Usage
-        description.push_str("---\n### Usage \n```nu\n");
+        description.push_str("\n---\n### Usage \n```nu\n");
         let signature = decl.signature();
         description.push_str(&get_signature_label(&signature, true));
         description.push_str("\n```\n");
@@ -62,7 +64,7 @@ impl LanguageServer {
                 } else {
                     description.push('\n');
                 }
-                description.push_str(&format!("  `{}`", arg.name));
+                write!(description, "  `{}`", arg.name).expect("writing to a String is infallible");
                 description.push_str(&doc_for_arg(
                     Some(arg.shape),
                     arg.desc,
@@ -81,7 +83,8 @@ impl LanguageServer {
                 if !first {
                     description.push('\n');
                 }
-                description.push_str(&format!(" `...{}`", arg.name));
+                write!(description, " `...{}`", arg.name)
+                    .expect("writing to a String is infallible");
                 description.push_str(&doc_for_arg(
                     Some(arg.shape),
                     arg.desc,
@@ -98,7 +101,8 @@ impl LanguageServer {
             description.push_str("\n### Input/output types\n");
             description.push_str("\n```nu\n");
             for input_output in &signature.input_output_types {
-                description.push_str(&format!(" {} | {}\n", input_output.0, input_output.1));
+                writeln!(description, " {} | {}", input_output.0, input_output.1)
+                    .expect("writing to a String is infallible");
             }
             description.push_str("\n```\n");
         }
@@ -107,10 +111,12 @@ impl LanguageServer {
         if !decl.examples().is_empty() {
             description.push_str("### Example(s)\n");
             for example in decl.examples() {
-                description.push_str(&format!(
+                write!(
+                    description,
                     "  {}\n```nu\n  {}\n```\n",
                     example.description, example.example
-                ));
+                )
+                .expect("writing to a String is infallible");
             }
         }
         description
@@ -180,13 +186,12 @@ impl LanguageServer {
                 false,
             )),
             Id::Module(module_id, _) => {
-                let description = working_set
-                    .get_module_comments(module_id)?
-                    .iter()
-                    .map(|sp| String::from_utf8_lossy(working_set.get_span_contents(*sp)).into())
-                    .collect::<Vec<String>>()
-                    .join("\n");
-                markdown_hover(description)
+                let (mut desc, extra) = working_set
+                    .get_module_comments(module_id)
+                    .map(|spans| working_set.build_desc(spans))?;
+                desc.push_str("\n\n");
+                desc.push_str(&extra);
+                markdown_hover(desc)
             }
             Id::Value(t) => markdown_hover(format!("`{t}`")),
             Id::External(cmd) => {
@@ -214,7 +219,7 @@ impl LanguageServer {
                         .as_ref(),
                     )
                     .to_string(),
-                    Err(_) => format!("No command help found for {}", &cmd),
+                    Err(_) => format!("No command help found for {}", cmd),
                 };
                 markdown_hover(manpage_str)
             }
@@ -231,22 +236,22 @@ mod hover_tests {
         },
     };
     use assert_json_diff::assert_json_eq;
-    use nu_test_support::fs::fixtures;
+    use nu_test_support::prelude::*;
     use rstest::rstest;
 
     #[rstest]
     #[case::variable("var.nu", (2, 0), "```\ntable\n``` \n---\nimmutable")]
     #[case::custom_command(
         "command.nu", (3, 0),
-        "Renders some greeting message\n---\n### Usage \n```nu\n  hello {flags}\n```\n\n### Flags\n\n  `-h`, `--help` - Display the help message for this command\n\n"
+        "Renders some greeting message\n\n---\n### Usage \n```nu\n  hello {flags}\n```\n\n### Flags\n\n  `-h`, `--help` - Display the help message for this command\n\n"
     )]
     #[case::custom_in_custom(
         "command.nu", (9, 7),
-        "\n---\n### Usage \n```nu\n  bar {flags}\n```\n\n### Flags\n\n  `-h`, `--help` - Display the help message for this command\n\n"
+        "\n\n---\n### Usage \n```nu\n  bar {flags}\n```\n\n### Flags\n\n  `-h`, `--help` - Display the help message for this command\n\n"
     )]
     #[case::str_join(
         "command.nu", (5, 8),
-        "Concatenate multiple strings into a single string, with an optional separator between each.\n---\n### Usage \n```nu\n  str join {flags} (separator)\n```\n\n### Flags\n\n  `-h`, `--help` - Display the help message for this command\n\n\n### Parameters\n\n  `separator`: `<string>` - Optional separator to use when creating string. (optional)\n\n\n### Input/output types\n\n```nu\n list<any> | string\n string | string\n\n```\n### Example(s)\n  Create a string from input.\n```nu\n  ['nu', 'shell'] | str join\n```\n  Create a string from input with a separator.\n```nu\n  ['nu', 'shell'] | str join '-'\n```\n"
+        "Concatenate multiple strings into a single string, with an optional separator between each.\n\n---\n### Usage \n```nu\n  str join {flags} (separator)\n```\n\n### Flags\n\n  `-h`, `--help` - Display the help message for this command\n\n\n### Parameters\n\n  `separator`: `<string>` - Optional separator to use when creating string. (optional)\n\n\n### Input/output types\n\n```nu\n list<any> | string\n string | string\n\n```\n### Example(s)\n  Create a string from input.\n```nu\n  ['nu', 'shell'] | str join\n```\n  Create a string from input with a separator.\n```nu\n  ['nu', 'shell'] | str join '-'\n```\n"
     )]
     #[case::cell_path1("use.nu", (2, 3), "```\nlist<oneof<int, record<bar: int>>>\n```")]
     #[case::cell_path2("use.nu", (2, 7), "```\nrecord<bar: int>\n```")]
@@ -261,7 +266,7 @@ mod hover_tests {
     ) {
         let (client_connection, _recv) = initialize_language_server(None, None);
 
-        let mut script = fixtures();
+        let mut script = FIXTURES.clone();
         script.push("lsp/hover");
         script.push(filename);
         let script = path_to_uri(&script);
@@ -281,7 +286,7 @@ mod hover_tests {
     fn hover_on_external_command() {
         let (client_connection, _recv) = initialize_language_server(None, None);
 
-        let mut script = fixtures();
+        let mut script = FIXTURES.clone();
         script.push("lsp/hover/command.nu");
         let script = path_to_uri(&script);
 
@@ -298,18 +303,18 @@ mod hover_tests {
 
     #[rstest]
     #[case::use_record("hover/use.nu", (0, 19), "```\nrecord<foo: list<oneof<int, record<bar: int>>>>\n``` \n---\nimmutable", true)]
-    #[case::use_function("hover/use.nu", (0, 22), "\n---\n### Usage \n```nu\n  foo {flags}\n```\n\n### Flags", true)]
+    #[case::use_function("hover/use.nu", (0, 22), "\n\n---\n### Usage \n```nu\n  foo {flags}\n```\n\n### Flags", true)]
     #[case::cell_path("workspace/baz.nu", (8, 42), "```\nstring\n```\n---\nconst value", false)]
-    #[case::module_first("workspace/foo.nu", (15, 15), "# cmt", false)]
-    #[case::module_second("workspace/foo.nu", (17, 27), "# sub cmt", false)]
-    #[case::module_third("workspace/foo.nu", (19, 33), "# sub sub cmt", false)]
+    #[case::module_first("workspace/foo.nu", (15, 15), "cmt", false)]
+    #[case::module_second("workspace/foo.nu", (17, 27), "sub cmt", false)]
+    #[case::module_third("workspace/foo.nu", (21, 33), "sub sub cmt\n\nextra", false)]
     fn hover_on_exportable(
         #[case] filename: &str,
         #[case] cursor: (u32, u32),
         #[case] expected_prefix: &str,
         #[case] use_config: bool,
     ) {
-        let mut script = fixtures();
+        let mut script = FIXTURES.clone();
         script.push("lsp");
         script.push(filename);
         let script_uri = path_to_uri(&script);

@@ -33,14 +33,14 @@ impl Command for Encode {
     }
 
     fn extra_description(&self) -> &str {
-        r#"Multiple encodings are supported; here are a few:
+        "Multiple encodings are supported; here are a few:
 big5, euc-jp, euc-kr, gbk, iso-8859-1, cp1252, latin5
 
 Note that since the Encoding Standard doesn't specify encoders for utf-16le and utf-16be, these are not yet supported.
 More information can be found here: https://docs.rs/encoding_rs/latest/encoding_rs/#utf-16le-utf-16be-and-unicode-encoding-schemes
 
 For a more complete list of encodings, please refer to the encoding_rs
-documentation link at https://docs.rs/encoding_rs/latest/encoding_rs/#statics"#
+documentation link at https://docs.rs/encoding_rs/latest/encoding_rs/#statics"
     }
 
     fn examples(&self) -> Vec<Example<'_>> {
@@ -88,11 +88,12 @@ documentation link at https://docs.rs/encoding_rs/latest/encoding_rs/#statics"#
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let encoding: Spanned<String> = call.req_const(working_set, 0)?;
-        let ignore_errors = call.has_flag_const(working_set, "ignore-errors")?;
+        let encoding: Spanned<String> = call.req_const(working_set, stack, 0)?;
+        let ignore_errors = call.has_flag_const(working_set, stack, "ignore-errors")?;
         run(call, input, encoding, ignore_errors)
     }
 }
@@ -144,7 +145,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        crate::test_examples(Encode)
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Encode)
     }
 }

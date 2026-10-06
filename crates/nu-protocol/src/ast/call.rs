@@ -33,6 +33,29 @@ pub enum Argument {
     Spread(Expression),
 }
 
+/// A named argument's flag identity (long, or short when the long name is empty).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlagRef<'a> {
+    Long(&'a str),
+    Short(&'a str),
+}
+
+impl<'a> FlagRef<'a> {
+    /// The `(long, short)` pair's identity: the long name, else the short spelling.
+    pub fn from_named(long: &'a Spanned<String>, short: Option<&'a Spanned<String>>) -> Self {
+        match short.filter(|_| long.item.is_empty()) {
+            Some(short) => FlagRef::Short(&short.item),
+            None => FlagRef::Long(&long.item),
+        }
+    }
+
+    /// The flag's name, without any dash prefix.
+    pub fn name(self) -> &'a str {
+        let (FlagRef::Long(name) | FlagRef::Short(name)) = self;
+        name
+    }
+}
+
 impl Argument {
     /// The span for an argument
     pub fn span(&self) -> Span {
@@ -188,10 +211,12 @@ impl Call {
             })
     }
 
+    #[deprecated(since = "0.113.0", note = "use .positional_iter().nth(n) instead")]
     pub fn positional_nth(&self, i: usize) -> Option<&Expression> {
         self.positional_iter().nth(i)
     }
 
+    #[deprecated(since = "0.113.0", note = "use .positional_iter().count(n) instead")]
     pub fn positional_len(&self) -> usize {
         self.positional_iter().count()
     }
@@ -319,7 +344,7 @@ impl Call {
             let result = eval(expr)?;
             if spread {
                 match result {
-                    Value::List { mut vals, .. } => output.append(&mut vals),
+                    Value::List { vals, .. } => output.extend(vals),
                     Value::Nothing { .. } => (),
                     _ => return Err(ShellError::CannotSpreadAsList { span: expr.span }),
                 }
@@ -336,17 +361,18 @@ impl Call {
         working_set: &StateWorkingSet,
         pos: usize,
     ) -> Result<T, ShellError> {
-        if let Some(expr) = self.positional_nth(pos) {
-            let result = eval_constant(working_set, expr)?;
-            FromValue::from_value(result)
-        } else if self.positional_len() == 0 {
-            Err(ShellError::AccessEmptyContent { span: self.head })
-        } else {
-            Err(ShellError::AccessBeyondEnd {
-                max_idx: self.positional_len() - 1,
-                span: self.head,
-            })
-        }
+        let expr = self.positional_iter().nth(pos).ok_or_else(|| {
+            match self.positional_iter().count().checked_sub(1) {
+                None => ShellError::AccessEmptyContent { span: self.head },
+                Some(n) => ShellError::AccessBeyondEnd {
+                    max_idx: n,
+                    span: self.head,
+                },
+            }
+        })?;
+
+        let result = eval_constant(working_set, expr)?;
+        FromValue::from_value(result)
     }
 
     pub fn span(&self) -> Span {

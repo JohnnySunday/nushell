@@ -38,11 +38,19 @@ impl PluginCommand for LastDF {
                     PolarsPluginType::NuExpression.into(),
                 ),
                 (
+                    PolarsPluginType::NuSelector.into(),
+                    PolarsPluginType::NuExpression.into(),
+                ),
+                (
                     PolarsPluginType::NuDataFrame.into(),
                     PolarsPluginType::NuDataFrame.into(),
                 ),
                 (
                     PolarsPluginType::NuLazyFrame.into(),
+                    PolarsPluginType::NuLazyFrame.into(),
+                ),
+                (
+                    PolarsPluginType::NuLazyGroupBy.into(),
                     PolarsPluginType::NuLazyFrame.into(),
                 ),
             ])
@@ -61,6 +69,7 @@ impl PluginCommand for LastDF {
                             Column::new("b".to_string(), vec![Value::test_int(4)]),
                         ],
                         None,
+                        Span::test_data(),
                     )
                     .expect("simple df for test should not fail")
                     .into_value(Span::test_data()),
@@ -97,9 +106,9 @@ impl PluginCommand for LastDF {
         plugin: &Self::Plugin,
         engine: &EngineInterface,
         call: &EvaluatedCall,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
-        let metadata = input.metadata();
+        let metadata = input.take_metadata();
         let value = input.into_value(call.head)?;
         match PolarsPluginObject::try_from_value(plugin, &value)? {
             PolarsPluginObject::NuDataFrame(df) => {

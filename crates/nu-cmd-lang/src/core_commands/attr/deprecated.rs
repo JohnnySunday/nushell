@@ -74,10 +74,11 @@ impl Command for AttrDeprecated {
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let call = WrapCall::ConstEval(working_set, call);
+        let call = WrapCall::ConstEval(working_set, stack, call);
         Ok(deprecated_record(call)?.into_pipeline_data())
     }
 
@@ -89,8 +90,8 @@ impl Command for AttrDeprecated {
         vec![
             Example {
                 description: "Add a deprecation warning to a custom command.",
-                example: r###"@deprecated
-    def outdated [] {}"###,
+                example: "@deprecated
+    def outdated [] {}",
                 result: Some(Value::nothing(Span::test_data())),
             },
             Example {

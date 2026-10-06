@@ -1,7 +1,8 @@
 use crate::{
-    BlockId, DeclId, DeprecationEntry, Example, FromValue, IntoValue, PipelineData, ShellError,
-    Span, SyntaxShape, Type, Value, VarId,
+    BlockId, CompareTypes, DeclId, DeprecationEntry, Example, FromValue, IntoValue, PipelineData,
+    ShellError, Span, SyntaxShape, Type, TypeSet, Value, VarId,
     engine::{Call, Command, CommandType, EngineState, Stack},
+    shell_error::generic::GenericError,
 };
 use nu_derive_value::FromValue as DeriveFromValue;
 use nu_utils::NuCow;
@@ -42,6 +43,24 @@ pub struct Flag {
 }
 
 impl Flag {
+    /// The flag's long name, or `None` for a short-only flag (whose `long` is empty).
+    #[inline]
+    pub fn long_name(&self) -> Option<&str> {
+        (!self.long.is_empty()).then_some(self.long.as_str())
+    }
+
+    /// Whether this flag's value type accepts `nothing`/`null`.
+    ///
+    /// Used so `--flag=$null` can either pass `null` through (when the type allows it) or omit
+    /// the flag (when it does not). Switches (`arg: None`) never accept nothing — null means omit.
+    #[inline]
+    pub fn type_accepts_nothing(&self) -> bool {
+        match &self.arg {
+            Some(shape) => Type::Nothing.is_assignable_to(&shape.to_type()),
+            None => false,
+        }
+    }
+
     #[inline]
     pub fn new(long: impl Into<String>) -> Self {
         Flag {
@@ -161,10 +180,27 @@ pub enum CommandWideCompleter {
     Command(DeclId),
 }
 
+/// A built-in completion a command declares for one of its arguments, dispatched on by the
+/// completer so renaming the command can't silently disable its argument completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BuiltinCompletion {
+    /// A `.nu` file or directory (`use`, `overlay use`, `source-env`); `std_virtual_path`
+    /// also offers the virtual `std/` modules (disabled for `source-env`).
+    NuFile { std_virtual_path: bool },
+    /// The exported members of an already-named module (`use spam <tab>`).
+    ModuleExports,
+    /// An environment variable name (`hide-env`).
+    EnvVar,
+    /// A command name; `internal_only` restricts to internal commands (`attr complete`).
+    Command { internal_only: bool },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Completion {
     Command(DeclId),
     List(NuCow<&'static [&'static str], Vec<String>>),
+    /// A completion the engine provides for the argument (module/env/command names, …).
+    Builtin(BuiltinCompletion),
 }
 
 impl Completion {
@@ -179,6 +215,16 @@ impl Completion {
                 .name()
                 .to_owned()
                 .into_value(span),
+            // No list to surface; name it so `scope commands` stays honest.
+            Completion::Builtin(kind) => Value::string(
+                match kind {
+                    BuiltinCompletion::NuFile { .. } => "<nu-file>",
+                    BuiltinCompletion::ModuleExports => "<module-exports>",
+                    BuiltinCompletion::EnvVar => "<env-var>",
+                    BuiltinCompletion::Command { .. } => "<command-name>",
+                },
+                span,
+            ),
             Completion::List(list) => match list {
                 NuCow::Borrowed(list) => list
                     .iter()
@@ -343,6 +389,28 @@ impl PartialEq for Signature {
 
 impl Eq for Signature {}
 
+fn type_involves_custom(ty: &Type) -> bool {
+    match ty {
+        Type::Custom(_) => true,
+        Type::OneOf(types) => types.iter().any(type_involves_custom),
+        Type::List(inner) => type_involves_custom(inner),
+        _ => false,
+    }
+}
+
+fn is_structured_type(ty: &Type) -> bool {
+    matches!(ty, Type::List(_) | Type::Table(_) | Type::Record(_))
+}
+
+/// Custom values are assignable to list/table/record so `get` / `into record` type-check.
+/// That special case must not steal the output type of a real custom IO pair
+/// (`semver | into string` is a string, not `oneof<list, table, record>`).
+fn is_custom_structured_fallback(input: &Type, declared: &Type) -> bool {
+    type_involves_custom(input)
+        && is_structured_type(declared)
+        && input.compare_types(declared).is_none()
+}
+
 impl Signature {
     /// Creates a new signature for a command with `name`
     pub fn new(name: impl Into<String>) -> Signature {
@@ -367,52 +435,60 @@ impl Signature {
 
     /// Gets the input type from the signature
     ///
-    /// If the input was unspecified or the signature has several different
-    /// input types, [`Type::Any`] is returned.  Otherwise, if the signature has
-    /// one or same input types, this type is returned.
-    // XXX: remove?
+    /// - If the input was unspecified  [`Type::Any`] is returned.
+    /// - If the signature has a single input type, it is returned.
+    /// - If there are multiple input types, a [union](Type::union) of them is returned.
     pub fn get_input_type(&self) -> Type {
-        match self.input_output_types.len() {
-            0 => Type::Any,
-            1 => self.input_output_types[0].0.clone(),
-            _ => {
-                let first = &self.input_output_types[0].0;
-                if self
-                    .input_output_types
-                    .iter()
-                    .all(|(input, _)| input == first)
-                {
-                    first.clone()
-                } else {
-                    Type::Any
-                }
-            }
+        match self.input_output_types.as_slice() {
+            [] => Type::Any,
+            [(input, _output)] => input.clone(),
+            multiple => Type::one_of(multiple.iter().map(|(input, _)| input.clone())),
         }
     }
 
-    /// Gets the output type from the signature
+    /// Gets the output type from the signature based on `input`
     ///
-    /// If the output was unspecified or the signature has several different
-    /// input types, [`Type::Any`] is returned.  Otherwise, if the signature has
-    /// one or same output types, this type is returned.
+    /// - If the signature's output was unspecified [`Type::Any`] is returned.
+    /// - If `input` is [`None`], it's treated as [`Type::Any`]. i.e. all IO pairs are considered.
+    /// - IO pairs where the given `input` is [assignable to](crate::CompareTypes::is_assignable_to)
+    ///   the input type are considered valid.
+    /// - Custom values are assignable to list/table/record. Those fallback pairs are ignored
+    ///   when a lattice match exists (so `semver | into string` is `string`).
+    /// - [Union](TypeSet::union) of remaining outputs is returned.
+    /// - If there are no valid IO pairs for the given `input`, [`None`] is returned.
     // XXX: remove?
-    pub fn get_output_type(&self) -> Type {
-        match self.input_output_types.len() {
-            0 => Type::Any,
-            1 => self.input_output_types[0].1.clone(),
-            _ => {
-                let first = &self.input_output_types[0].1;
-                if self
-                    .input_output_types
-                    .iter()
-                    .all(|(_, output)| output == first)
-                {
-                    first.clone()
-                } else {
-                    Type::Any
+    pub fn get_output_type(&self, input_type: Option<&Type>) -> Option<Type> {
+        if self.input_output_types.is_empty() {
+            return Some(Type::Any);
+        }
+        let input = input_type.unwrap_or(&Type::Any);
+        // Entries whose input type accepts `input` are the candidates; among those, the ones
+        // that are not merely a structured-type fallback for a custom value are preferred. Two
+        // passes without temporary collections: this runs for every call the parser
+        // type-checks.
+        let mut any_match = false;
+        let mut any_strict_match = false;
+        for (in_ty, _) in &self.input_output_types {
+            if input.is_assignable_to(in_ty) {
+                any_match = true;
+                if !is_custom_structured_fallback(input, in_ty) {
+                    any_strict_match = true;
+                    break;
                 }
             }
         }
+        if !any_match {
+            return None;
+        }
+
+        self.input_output_types
+            .iter()
+            .filter(|(in_ty, _)| {
+                input.is_assignable_to(in_ty)
+                    && (!any_strict_match || !is_custom_structured_fallback(input, in_ty))
+            })
+            .map(|(_, out)| out.clone())
+            .reduce(Type::union)
     }
 
     /// Add a default help option to a signature
@@ -771,7 +847,9 @@ impl Signature {
     /// Returns an argument with the index `position`
     ///
     /// It will index, in order, required arguments, then optional, then the
-    /// trailing `...rest` argument.
+    /// trailing `...rest` argument. Note that the `...rest` argument must be
+    /// a [`Value::List`], therefore this method may not work as intended when
+    /// the closure uses a rest argument.
     pub fn get_positional(&self, position: usize) -> Option<&PositionalArg> {
         if position < self.required_positional.len() {
             self.required_positional.get(position)
@@ -839,7 +917,16 @@ impl Signature {
     /// signature so other definitions can see it. This placeholder is later replaced with the
     /// full definition in a second pass of the parser.
     pub fn predeclare(self) -> Box<dyn Command> {
-        Box::new(Predeclaration { signature: self })
+        self.predeclare_with_command_type(CommandType::Builtin)
+    }
+
+    /// Create a placeholder implementation of Command as a way to predeclare a definition's
+    /// signature with an explicit command type.
+    pub fn predeclare_with_command_type(self, command_type: CommandType) -> Box<dyn Command> {
+        Box::new(Predeclaration {
+            signature: self,
+            command_type,
+        })
     }
 
     /// Combines a signature and a block into a runnable block
@@ -861,6 +948,7 @@ impl Signature {
 #[derive(Clone)]
 struct Predeclaration {
     signature: Signature,
+    command_type: CommandType,
 }
 
 impl Command for Predeclaration {
@@ -884,10 +972,20 @@ impl Command for Predeclaration {
         &self,
         _engine_state: &EngineState,
         _stack: &mut Stack,
-        _call: &Call,
+        call: &Call,
         _input: PipelineData,
     ) -> Result<PipelineData, crate::ShellError> {
-        panic!("Internal error: can't run a predeclaration without a body")
+        // A call can only resolve to a predeclaration whose `def` never defined it; report that
+        // instead of panicking on the user's input.
+        Err(crate::ShellError::NushellFailedSpanned {
+            msg: "Can't run a predeclaration without a body".to_string(),
+            label: "originates from here".to_string(),
+            span: call.head,
+        })
+    }
+
+    fn command_type(&self) -> CommandType {
+        self.command_type
     }
 }
 
@@ -959,13 +1057,10 @@ impl Command for BlockCommand {
         _call: &Call,
         _input: PipelineData,
     ) -> Result<crate::PipelineData, crate::ShellError> {
-        Err(ShellError::GenericError {
-            error: "Internal error: can't run custom command with 'run', use block_id".into(),
-            msg: "".into(),
-            span: None,
-            help: None,
-            inner: vec![],
-        })
+        Err(ShellError::Generic(GenericError::new_internal(
+            "Internal error: can't run custom command with 'run', use block_id",
+            "",
+        )))
     }
 
     fn command_type(&self) -> CommandType {

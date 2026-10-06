@@ -86,27 +86,30 @@ impl Command for StrSubstring {
             cell_paths,
             graphemes: grapheme_flags(engine_state, stack, call)?,
         };
-        operate(action, args, input, call.head, engine_state.signals()).map(|pipeline| {
-            // a substring of text/json is not necessarily text/json itself
-            let metadata = pipeline.metadata().map(|m| m.with_content_type(None));
-            pipeline.set_metadata(metadata)
+        operate(action, args, input, call.head, engine_state.signals()).map(|mut pipeline| {
+            if let Some(metadata) = pipeline.metadata_mut() {
+                // a substring of text/json is not necessarily text/json itself
+                metadata.content_type = None;
+            }
+            pipeline
         })
     }
 
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let range: IntRange = call.req_const(working_set, 0)?;
+        let range: IntRange = call.req_const(working_set, stack, 0)?;
 
-        let cell_paths: Vec<CellPath> = call.rest_const(working_set, 1)?;
+        let cell_paths: Vec<CellPath> = call.rest_const(working_set, stack, 1)?;
         let cell_paths = (!cell_paths.is_empty()).then_some(cell_paths);
         let args = Arguments {
             range,
             cell_paths,
-            graphemes: grapheme_flags_const(working_set, call)?,
+            graphemes: grapheme_flags_const(working_set, stack, call)?,
         };
         operate(
             action,
@@ -115,10 +118,12 @@ impl Command for StrSubstring {
             call.head,
             working_set.permanent().signals(),
         )
-        .map(|pipeline| {
-            // a substring of text/json is not necessarily text/json itself
-            let metadata = pipeline.metadata().map(|m| m.with_content_type(None));
-            pipeline.set_metadata(metadata)
+        .map(|mut pipeline| {
+            if let Some(metadata) = pipeline.metadata_mut() {
+                // a substring of text/json is not necessarily text/json itself
+                metadata.content_type = None;
+            }
+            pipeline
         })
     }
 
@@ -199,10 +204,8 @@ mod tests {
     use super::{Arguments, Span, StrSubstring, Value, action};
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(StrSubstring {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(StrSubstring)
     }
 
     #[derive(Clone, Copy, Debug)]

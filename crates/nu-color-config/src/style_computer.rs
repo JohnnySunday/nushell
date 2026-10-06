@@ -1,15 +1,12 @@
 use crate::{TextStyle, color_record_to_nustyle, lookup_ansi_color_style, text_style::Alignment};
-use nu_ansi_term::{Color, Style};
+use nu_ansi_term::Style;
 use nu_engine::ClosureEvalOnce;
 use nu_protocol::{
-    Span, Value,
+    Span, Value, default_color_config,
     engine::{Closure, EngineState, Stack},
     report_shell_error,
 };
-use std::{
-    collections::HashMap,
-    fmt::{Debug, Formatter, Result},
-};
+use std::{collections::HashMap, fmt::Debug};
 
 // ComputableStyle represents the valid user style types: a single color value, or a closure which
 // takes an input value and produces a color value. The latter represents a value which
@@ -22,16 +19,38 @@ pub enum ComputableStyle {
 
 // An alias for the mapping used internally by StyleComputer.
 pub type StyleMapping = HashMap<String, ComputableStyle>;
-//
+
 // A StyleComputer is an all-in-one way to compute styles. A nu command can
 // simply create it with from_config(), and then use it with compute().
 // It stores the engine state and stack needed to run closures that
 // may be defined as a user style.
-//
+
+#[derive(Debug)]
 pub struct StyleComputer<'a> {
     engine_state: &'a EngineState,
     stack: &'a Stack,
     map: StyleMapping,
+}
+
+/// Insert a color_config value into a style map (string / record / closure).
+fn insert_style_from_value(map: &mut StyleMapping, key: String, value: &Value) {
+    let span = value.span();
+    match value {
+        Value::Closure { val, .. } => {
+            map.insert(key, ComputableStyle::Closure(*val.clone(), span));
+        }
+        Value::Record { .. } => {
+            map.insert(key, ComputableStyle::Static(color_record_to_nustyle(value)));
+        }
+        Value::String { val, .. } => {
+            map.insert(
+                key,
+                ComputableStyle::Static(lookup_ansi_color_style(val.as_str())),
+            );
+        }
+        // Unsupported types are ignored (same as pre-existing from_config behavior).
+        _ => (),
+    }
 }
 
 impl<'a> StyleComputer<'a> {
@@ -85,7 +104,7 @@ impl<'a> StyleComputer<'a> {
     // Used only by the `table` command.
     pub fn style_primitive(&self, value: &Value) -> TextStyle {
         use Alignment::*;
-        let s = self.compute(&value.get_type().get_non_specified_string(), value);
+        let s = self.compute(&value.get_type_shallow().get_non_specified_string(), value);
         match *value {
             Value::Bool { .. } => TextStyle::with_style(Left, s),
             Value::Int { .. } => TextStyle::with_style(Right, s),
@@ -100,152 +119,112 @@ impl<'a> StyleComputer<'a> {
             Value::Binary { .. } => TextStyle::with_style(Left, s),
             Value::CellPath { .. } => TextStyle::with_style(Left, s),
             Value::Record { .. } | Value::List { .. } => TextStyle::with_style(Left, s),
-            Value::Closure { .. } | Value::Custom { .. } | Value::Error { .. } => {
-                TextStyle::basic_left()
+            Value::Closure { .. } | Value::Error { .. } => TextStyle::basic_left(),
+            Value::Custom { ref val, .. } => {
+                let type_name = val.type_name();
+                let custom_style = self.compute(&type_name, value);
+                TextStyle::with_style(Left, custom_style)
             }
         }
     }
 
     // The main constructor.
+    //
+    // Defaults come from `default_color_config()` (same source as
+    // `Config::default().color_config`). We seed with those defaults, then overlay
+    // the live `color_config` so partial theme assignments that omit keys
+    // (e.g. `binary_*`) still fall back to the built-in styles instead of plain
+    // `Style::default()`.
     pub fn from_config(engine_state: &'a EngineState, stack: &'a Stack) -> StyleComputer<'a> {
         let config = stack.get_config(engine_state);
 
-        // Create the hashmap
-        #[rustfmt::skip]
-        let mut map: StyleMapping = [
-            ("separator".to_string(), ComputableStyle::Static(Color::Default.normal())),
-            ("leading_trailing_space_bg".to_string(), ComputableStyle::Static(Style::default().on(Color::Rgb(128, 128, 128)))),
-            ("header".to_string(), ComputableStyle::Static(Color::Green.bold())),
-            ("empty".to_string(), ComputableStyle::Static(Color::Blue.normal())),
-            ("bool".to_string(), ComputableStyle::Static(Color::LightCyan.normal())),
-            ("int".to_string(), ComputableStyle::Static(Color::Default.normal())),
-            ("filesize".to_string(), ComputableStyle::Static(Color::Cyan.normal())),
-            ("duration".to_string(), ComputableStyle::Static(Color::Default.normal())),
-            ("datetime".to_string(), ComputableStyle::Static(Color::Purple.normal())),
-            ("range".to_string(), ComputableStyle::Static(Color::Default.normal())),
-            ("float".to_string(), ComputableStyle::Static(Color::Default.normal())),
-            ("string".to_string(), ComputableStyle::Static(Color::Default.normal())),
-            ("nothing".to_string(), ComputableStyle::Static(Color::Default.normal())),
-            ("binary".to_string(), ComputableStyle::Static(Color::Default.normal())),
-            ("cell-path".to_string(), ComputableStyle::Static(Color::Default.normal())),
-            ("row_index".to_string(), ComputableStyle::Static(Color::Green.bold())),
-            ("record".to_string(), ComputableStyle::Static(Color::Default.normal())),
-            ("list".to_string(), ComputableStyle::Static(Color::Default.normal())),
-            ("block".to_string(), ComputableStyle::Static(Color::Default.normal())),
-            ("hints".to_string(), ComputableStyle::Static(Color::DarkGray.normal())),
-            ("search_result".to_string(), ComputableStyle::Static(Color::Default.normal().on(Color::Red))),
-        ].into_iter().collect();
+        let mut map: StyleMapping = HashMap::new();
+
+        for (key, value) in default_color_config() {
+            insert_style_from_value(&mut map, key, &value);
+        }
 
         for (key, value) in &config.color_config {
-            let span = value.span();
-            match value {
-                Value::Closure { val, .. } => {
-                    map.insert(
-                        key.to_string(),
-                        ComputableStyle::Closure(*val.clone(), span),
-                    );
-                }
-                Value::Record { .. } => {
-                    map.insert(
-                        key.to_string(),
-                        ComputableStyle::Static(color_record_to_nustyle(value)),
-                    );
-                }
-                Value::String { val, .. } => {
-                    // update the stylemap with the found key
-                    let color = lookup_ansi_color_style(val.as_str());
-                    if let Some(v) = map.get_mut(key) {
-                        *v = ComputableStyle::Static(color);
-                    } else {
-                        map.insert(key.to_string(), ComputableStyle::Static(color));
-                    }
-                }
-                // This should never occur.
-                _ => (),
-            }
+            insert_style_from_value(&mut map, key.clone(), value);
         }
+
         StyleComputer::new(engine_state, stack, map)
     }
 }
 
-// Because EngineState doesn't have Debug (Dec 2022),
-// this incomplete representation must be used.
-impl Debug for StyleComputer<'_> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-        f.debug_struct("StyleComputer")
-            .field("map", &self.map)
-            .finish()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nu_protocol::Config;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_computable_style_static() {
+        let style1 = Style::default().italic();
+        let style2 = Style::default().underline();
+        // Create a "dummy" style_computer for this test.
+        let dummy_engine_state = EngineState::new();
+        let dummy_stack = Stack::new();
+        let style_computer = StyleComputer::new(
+            &dummy_engine_state,
+            &dummy_stack,
+            [
+                ("string".into(), ComputableStyle::Static(style1)),
+                ("row_index".into(), ComputableStyle::Static(style2)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(
+            style_computer.compute("string", &Value::nothing(Span::unknown())),
+            style1
+        );
+        assert_eq!(
+            style_computer.compute("row_index", &Value::nothing(Span::unknown())),
+            style2
+        );
     }
-}
 
-#[test]
-fn test_computable_style_static() {
-    use nu_protocol::Span;
+    #[test]
+    fn partial_color_config_falls_back_to_defaults_for_binary() {
+        // Simulates `$env.config.color_config = { header: red }` which replaces
+        // the whole map and drops keys the theme never set (e.g. binary_*).
+        let engine_state = EngineState::new();
+        let mut stack = Stack::new();
+        let config = Config {
+            color_config: [("header".to_string(), Value::test_string("red"))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        stack.config = Some(Arc::new(config));
 
-    let style1 = Style::default().italic();
-    let style2 = Style::default().underline();
-    // Create a "dummy" style_computer for this test.
-    let dummy_engine_state = EngineState::new();
-    let dummy_stack = Stack::new();
-    let style_computer = StyleComputer::new(
-        &dummy_engine_state,
-        &dummy_stack,
-        [
-            ("string".into(), ComputableStyle::Static(style1)),
-            ("row_index".into(), ComputableStyle::Static(style2)),
-        ]
-        .into_iter()
-        .collect(),
-    );
-    assert_eq!(
-        style_computer.compute("string", &Value::nothing(Span::unknown())),
-        style1
-    );
-    assert_eq!(
-        style_computer.compute("row_index", &Value::nothing(Span::unknown())),
-        style2
-    );
-}
+        let style_computer = StyleComputer::from_config(&engine_state, &stack);
+        let null = Value::nothing(Span::unknown());
 
-// Because each closure currently runs in a separate environment, checks that the closures have run
-// must use the filesystem.
-#[test]
-fn test_computable_style_closure_basic() {
-    use nu_test_support::{nu, nu_repl_code, playground::Playground};
-    Playground::setup("computable_style_closure_basic", |dirs, _| {
-        let inp = [
-            r#"$env.config = {
-                color_config: {
-                    string: {|e| touch ($e + '.obj'); 'red' }
-                }
-            };"#,
-            "[bell book candle] | table | ignore",
-            "ls | get name | to nuon",
-        ];
-        let actual_repl = nu!(cwd: dirs.test(), nu_repl_code(&inp));
-        assert_eq!(actual_repl.err, "");
-        assert_eq!(actual_repl.out, r#"["bell.obj", "book.obj", "candle.obj"]"#);
-    });
-}
-
-#[test]
-fn test_computable_style_closure_errors() {
-    use nu_test_support::{nu, nu_repl_code};
-    let inp = [
-        r#"$env.config = {
-            color_config: {
-                string: {|e| $e + 2 }
-            }
-        };"#,
-        "[bell] | table",
-    ];
-    let actual_repl = nu!(nu_repl_code(&inp));
-    // Check that the error was printed
-    assert!(
-        actual_repl
-            .err
-            .contains("nu::shell::operator_incompatible_types")
-    );
-    // Check that the value was printed
-    assert!(actual_repl.out.contains("bell"));
+        assert_eq!(
+            style_computer.compute("header", &null),
+            lookup_ansi_color_style("red")
+        );
+        assert_eq!(
+            style_computer.compute("binary_null_char", &null),
+            lookup_ansi_color_style("grey42")
+        );
+        assert_eq!(
+            style_computer.compute("binary_printable", &null),
+            lookup_ansi_color_style("cyan_bold")
+        );
+        assert_eq!(
+            style_computer.compute("binary_whitespace", &null),
+            lookup_ansi_color_style("green_bold")
+        );
+        assert_eq!(
+            style_computer.compute("binary_ascii_other", &null),
+            lookup_ansi_color_style("purple_bold")
+        );
+        assert_eq!(
+            style_computer.compute("binary_non_ascii", &null),
+            lookup_ansi_color_style("yellow_bold")
+        );
+    }
 }

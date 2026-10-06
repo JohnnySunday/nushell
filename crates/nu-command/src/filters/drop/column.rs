@@ -42,18 +42,8 @@ impl Command for DropColumn {
     ) -> Result<PipelineData, ShellError> {
         let input = input.into_stream_or_original(engine_state);
         // the number of columns to drop
-        let columns: Option<Spanned<i64>> = call.opt(engine_state, stack, 0)?;
+        let columns = call.opt::<usize>(engine_state, stack, 0)?.unwrap_or(1);
         let from_left = call.has_flag(engine_state, stack, "left")?;
-
-        let columns = if let Some(columns) = columns {
-            if columns.item < 0 {
-                return Err(ShellError::NeedsPositiveValue { span: columns.span });
-            } else {
-                columns.item as usize
-            }
-        } else {
-            1
-        };
 
         drop_cols(engine_state, input, call.head, columns, from_left)
     }
@@ -107,9 +97,8 @@ fn drop_cols(
     // `[{a: 1}, {b: 2}] | drop column`
     // This will drop the column "a" instead of "b" even though column "b"
     // is displayed farther to the right.
-    let metadata = input.metadata();
     match input {
-        PipelineData::ListStream(stream, ..) => {
+        PipelineData::ListStream(stream, metadata) => {
             let mut stream = stream.into_iter();
             if let Some(mut first) = stream.next() {
                 let drop_cols = drop_cols_set(&mut first, head, columns, from_left)?;
@@ -130,17 +119,18 @@ fn drop_cols(
                 Ok(PipelineData::empty())
             }
         }
-        PipelineData::Value(mut v, ..) => {
+        PipelineData::Value(mut v, metadata) => {
             let span = v.span();
             match v {
                 Value::List { mut vals, .. } => {
-                    if let Some((first, rest)) = vals.split_first_mut() {
+                    if let Some((first, rest)) = vals.to_mut().split_first_mut() {
                         let drop_cols = drop_cols_set(first, head, columns, from_left)?;
                         for val in rest {
                             drop_record_cols(val, head, &drop_cols)?
                         }
                     }
-                    Ok(Value::list(vals, span).into_pipeline_data_with_metadata(metadata))
+                    Ok(Value::list(vals.into_owned(), span)
+                        .into_pipeline_data_with_metadata(metadata))
                 }
                 Value::Record {
                     val: ref mut record,
@@ -215,7 +205,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        crate::test_examples(DropColumn)
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(DropColumn)
     }
 }

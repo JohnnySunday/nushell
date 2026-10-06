@@ -38,6 +38,10 @@ impl PluginCommand for LazyQuantile {
                     PolarsPluginType::NuExpression.into(),
                 ),
                 (
+                    PolarsPluginType::NuSelector.into(),
+                    PolarsPluginType::NuExpression.into(),
+                ),
+                (
                     PolarsPluginType::NuDataFrame.into(),
                     PolarsPluginType::NuDataFrame.into(),
                 ),
@@ -61,6 +65,7 @@ impl PluginCommand for LazyQuantile {
                             Column::new("b".to_string(), vec![Value::test_float(2.0)]),
                         ],
                         None,
+                        Span::test_data(),
                     )
                     .expect("simple df for test should not fail")
                     .into_value(Span::test_data()),
@@ -87,6 +92,7 @@ impl PluginCommand for LazyQuantile {
                             ),
                         ],
                         None,
+                        Span::test_data(),
                     )
                     .expect("simple df for test should not fail")
                     .into_value(Span::test_data()),
@@ -100,9 +106,9 @@ impl PluginCommand for LazyQuantile {
         plugin: &Self::Plugin,
         engine: &EngineInterface,
         call: &EvaluatedCall,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
-        let metadata = input.metadata();
+        let metadata = input.take_metadata();
         let value = input.into_value(call.head)?;
         let quantile: f64 = call.req(0)?;
         match PolarsPluginObject::try_from_value(plugin, &value)? {
@@ -123,6 +129,7 @@ impl PluginCommand for LazyQuantile {
                     PolarsPluginType::NuDataFrame,
                     PolarsPluginType::NuLazyFrame,
                     PolarsPluginType::NuExpression,
+                    PolarsPluginType::NuSelector,
                 ],
             )),
         }

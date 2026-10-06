@@ -1,6 +1,12 @@
-use crate::{TableOutput, TableTheme, clean_charset, colorize_space_str, string_wrap};
+use crate::{
+    TableOutput, TableTheme, clean_charset, colorize_space_str, string_truncate, string_width,
+    string_wrap,
+};
 use nu_color_config::{Alignment, StyleComputer, TextStyle};
-use nu_protocol::{Config, FooterMode, ShellError, Span, TableMode, TrimStrategy, Value};
+use nu_protocol::{
+    Config, FooterMode, ShellError, Span, TableMode, TrimStrategy, Value,
+    shell_error::generic::GenericError,
+};
 use nu_utils::terminal_size;
 
 pub type NuText = (String, TextStyle);
@@ -17,13 +23,16 @@ pub fn configure_table(
 ) {
     let with_footer = is_footer_needed(config, out);
     let theme = load_theme(mode);
+    // Markup themes must keep the header in its own row to stay valid
+    // Markdown/reStructuredText, so never move it onto the separator.
+    let is_markup = matches!(mode, TableMode::Markdown | TableMode::Restructured);
 
     out.table.set_theme(theme);
     out.table
         .set_structure(out.with_index, out.with_header, with_footer);
     out.table.set_trim(config.table.trim.clone());
     out.table
-        .set_border_header(config.table.header_on_separator);
+        .set_border_header(config.table.header_on_separator && !is_markup);
     out.table.set_border_color(lookup_separator_color(comp));
 }
 
@@ -79,8 +88,32 @@ pub fn error_sign(text: String, style_computer: &StyleComputer) -> (String, Text
 }
 
 pub fn wrap_text(text: &str, width: usize, config: &Config) -> String {
-    let keep_words = config.table.trim == TrimStrategy::wrap(true);
-    string_wrap(text, width, keep_words)
+    if width == 0 {
+        return String::new();
+    }
+
+    match &config.table.trim {
+        TrimStrategy::Wrap { try_to_keep_words } => string_wrap(text, width, *try_to_keep_words),
+        TrimStrategy::Truncate { suffix } => {
+            if string_width(text) <= width {
+                return text.to_owned();
+            }
+            let suffix = suffix.as_deref().unwrap_or("");
+            let suffix_width = string_width(suffix);
+            text.lines()
+                .map(|line| {
+                    if string_width(line) <= width {
+                        line.to_owned()
+                    } else if suffix_width >= width {
+                        string_truncate(line, width)
+                    } else {
+                        format!("{}{}", string_truncate(line, width - suffix_width), suffix)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
 }
 
 pub fn get_header_style(style_computer: &StyleComputer) -> TextStyle {
@@ -121,16 +154,6 @@ pub fn get_value_style(value: &Value, config: &Config, style_computer: &StyleCom
     }
 }
 
-pub fn get_empty_style(text: String, style_computer: &StyleComputer) -> NuText {
-    (
-        text,
-        TextStyle::with_style(
-            Alignment::Right,
-            style_computer.compute("empty", &Value::nothing(Span::unknown())),
-        ),
-    )
-}
-
 fn make_styled_value(
     text: String,
     value: &Value,
@@ -156,13 +179,10 @@ fn convert_with_precision(val: &str, precision: usize) -> Result<String, ShellEr
     let val_float = match val.trim().parse::<f64>() {
         Ok(f) => f,
         Err(e) => {
-            return Err(ShellError::GenericError {
-                error: format!("error converting string [{}] to f64", &val),
-                msg: "".into(),
-                span: None,
-                help: Some(e.to_string()),
-                inner: vec![],
-            });
+            return Err(ShellError::Generic(
+                GenericError::new_internal(format!("error converting string [{}] to f64", val), "")
+                    .with_help(e.to_string()),
+            ));
         }
     };
     Ok(format!("{val_float:.precision$}"))
@@ -174,6 +194,7 @@ pub fn load_theme(mode: TableMode) -> TableTheme {
         TableMode::Thin => TableTheme::thin(),
         TableMode::Light => TableTheme::light(),
         TableMode::Compact => TableTheme::compact(),
+        TableMode::Frameless => TableTheme::frameless(),
         TableMode::WithLove => TableTheme::with_love(),
         TableMode::CompactDouble => TableTheme::compact_double(),
         TableMode::Rounded => TableTheme::rounded(),

@@ -1,6 +1,8 @@
 use itertools::Itertools;
 use nu_engine::command_prelude::*;
-use nu_protocol::{Config, ListStream, ast::PathMember, casing::Casing};
+use nu_protocol::{
+    Config, ListStream, ast::PathMember, casing::Casing, shell_error::generic::GenericError,
+};
 
 #[derive(Clone)]
 pub struct FormatPattern;
@@ -139,8 +141,17 @@ fn extract_formatting_operations(
     };
 
     let mut is_fixed = true;
+    // `batching` stops on `None`. An unclosed `{` at end-of-pattern yields
+    // FixedText first, then the next call peeks empty; report that error once.
+    let mut reported_unclosed = false;
     let ops = pattern.char_indices().peekable().batching(move |it| {
-        let start_index = it.peek()?.0;
+        let Some(&(start_index, _)) = it.peek() else {
+            if is_fixed || reported_unclosed {
+                return None;
+            }
+            reported_unclosed = true;
+            return Some(Err(()));
+        };
         let mut buf = String::new();
         while let Some((index, ch)) = it.next() {
             match ch {
@@ -192,12 +203,15 @@ fn extract_formatting_operations(
         span: call_head,
     };
 
-    let make_removed_functionality_error = |span: Span| ShellError::GenericError {
-        error: "Removed functionality".into(),
-        msg: "The ability to use variables ($it) in `format pattern` has been removed.".into(),
-        span: Some(span),
-        help: Some("You can use other formatting options, such as string interpolation.".into()),
-        inner: vec![],
+    let make_removed_functionality_error = |span: Span| {
+        ShellError::Generic(
+            GenericError::new(
+                "Removed functionality",
+                "The ability to use variables ($it) in `format pattern` has been removed.",
+                span,
+            )
+            .with_help("You can use other formatting options, such as string interpolation."),
+        )
     };
 
     ops.map(|res_op| {
@@ -312,9 +326,8 @@ fn format_record(
 #[cfg(test)]
 mod test {
     #[test]
-    fn test_examples() {
+    fn test_examples() -> nu_test_support::Result {
         use super::FormatPattern;
-        use crate::test_examples;
-        test_examples(FormatPattern {})
+        nu_test_support::test().examples(FormatPattern)
     }
 }

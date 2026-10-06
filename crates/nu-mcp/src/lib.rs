@@ -1,13 +1,9 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
-
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
     service::TowerToHyperService,
 };
-use nu_protocol::{ShellError, engine::EngineState};
+use nu_protocol::{ShellError, engine::EngineState, shell_error::generic::GenericError};
 use rmcp::{
     ServiceExt,
     transport::{
@@ -19,8 +15,9 @@ use rmcp::{
     },
 };
 use server::NushellMcpServer;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::runtime::Runtime;
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -36,20 +33,39 @@ pub enum McpTransport {
     Stdio,
     /// HTTP transport with SSE streaming
     Http {
+        /// Address to bind to (default: 127.0.0.1)
+        bind_host: String,
         /// Port to listen on
-        port: u16,
+        bind_port: u16,
     },
+}
+
+impl McpTransport {
+    /// Create a new MCP transport configuration for HTTP
+    pub fn http(bind_address: Option<String>, port: Option<u16>) -> Self {
+        McpTransport::Http {
+            bind_host: bind_address.unwrap_or("127.0.0.1".into()),
+            bind_port: port.unwrap_or(8080),
+        }
+    }
 }
 
 pub fn initialize_mcp_server(
     mut engine_state: EngineState,
     transport: McpTransport,
 ) -> Result<(), ShellError> {
-    tracing_subscriber::fmt()
+    if let Err(err) = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::DEBUG.into()))
         .with_writer(std::io::stderr)
         .with_ansi(false)
-        .init();
+        // The MCP host owns our stderr pipe and closes it on exit. Once closed, every
+        // event write returns `Err(BrokenPipe)`, and the default fallback runs `eprintln!`, which
+        // panics on a broken pipe.
+        .log_internal_errors(false)
+        .try_init()
+    {
+        tracing::debug!("tracing subscriber already initialized: {err}");
+    }
 
     // Detach from controlling terminal to prevent child processes from prompting for input.
     //
@@ -70,18 +86,23 @@ pub fn initialize_mcp_server(
     engine_state.is_mcp = true;
 
     tracing::info!(?transport, "Starting MCP server");
-    let runtime = Runtime::new().map_err(|e| ShellError::GenericError {
-        error: format!("Could not instantiate tokio: {e}"),
-        msg: "".into(),
-        span: None,
-        help: None,
-        inner: vec![],
+    let runtime = Runtime::new().map_err(|e| {
+        ShellError::Generic(GenericError::new_internal(
+            format!("Could not instantiate tokio: {e}"),
+            "",
+        ))
     })?;
 
     runtime.block_on(async {
         let result = match transport {
             McpTransport::Stdio => run_stdio_server(engine_state).await,
-            McpTransport::Http { port } => run_http_server(engine_state, port).await,
+            McpTransport::Http {
+                bind_host,
+                bind_port,
+            } => {
+                let addr = format!("{bind_host}:{bind_port}");
+                run_http_server(engine_state, &addr).await
+            }
         };
         if let Err(e) = result {
             tracing::error!("Error running MCP server: {:?}", e);
@@ -108,28 +129,22 @@ const SESSION_KEEP_ALIVE: Duration = Duration::from_secs(30 * 60);
 /// Channel capacity for session message buffering
 const SESSION_CHANNEL_CAPACITY: usize = 16;
 
-/// SSE keep-alive ping interval
-const SSE_KEEP_ALIVE: Duration = Duration::from_secs(15);
-
-/// SSE retry interval for client reconnection
-const SSE_RETRY: Duration = Duration::from_secs(3);
-
 async fn run_http_server(
     engine_state: EngineState,
-    port: u16,
+    bind_address: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let engine_state = Arc::new(engine_state);
 
     // Create cancellation token to propagate shutdown to all sessions/streams
     let cancellation_token = CancellationToken::new();
 
-    let session_manager = Arc::new(LocalSessionManager {
-        sessions: RwLock::new(HashMap::new()),
-        session_config: SessionConfig {
-            channel_capacity: SESSION_CHANNEL_CAPACITY,
-            keep_alive: Some(SESSION_KEEP_ALIVE),
-        },
-    });
+    let mut session_config = SessionConfig::default();
+    session_config.channel_capacity = SESSION_CHANNEL_CAPACITY;
+    session_config.keep_alive = Some(SESSION_KEEP_ALIVE);
+
+    let mut session_manager = LocalSessionManager::default();
+    session_manager.session_config = session_config;
+    let session_manager = Arc::new(session_manager);
 
     let service = TowerToHyperService::new(StreamableHttpService::new(
         {
@@ -137,18 +152,12 @@ async fn run_http_server(
             move || Ok(NushellMcpServer::new((*engine_state).clone()))
         },
         session_manager,
-        StreamableHttpServerConfig {
-            sse_keep_alive: Some(SSE_KEEP_ALIVE),
-            sse_retry: Some(SSE_RETRY),
-            stateful_mode: true,
-            cancellation_token: cancellation_token.clone(),
-        },
+        StreamableHttpServerConfig::default(),
     ));
 
-    let addr = format!("0.0.0.0:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("MCP HTTP server listening on http://{addr}");
-    eprintln!("MCP HTTP server listening on http://{addr}");
+    let listener = tokio::net::TcpListener::bind(bind_address).await?;
+    tracing::info!("MCP HTTP server listening on http://{bind_address}");
+    eprintln!("MCP HTTP server listening on http://{bind_address}");
 
     loop {
         let io = tokio::select! {

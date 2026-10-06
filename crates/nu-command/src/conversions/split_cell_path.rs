@@ -11,20 +11,17 @@ impl Command for SplitCellPath {
 
     fn signature(&self) -> Signature {
         Signature::build(self.name())
-            .input_output_types(vec![
-                (Type::CellPath, Type::List(Box::new(Type::Any))),
-                (
-                    Type::CellPath,
-                    Type::List(Box::new(Type::Record(
-                        [
-                            ("value".into(), Type::Any),
-                            ("optional".into(), Type::Bool),
-                            ("insensitive".into(), Type::Bool),
-                        ]
-                        .into(),
-                    ))),
+            .input_output_types(vec![(
+                Type::CellPath,
+                Type::Table(
+                    vec![
+                        ("value".into(), Type::Any),
+                        ("optional".into(), Type::Bool),
+                        ("insensitive".into(), Type::Bool),
+                    ]
+                    .into(),
                 ),
-            ])
+            )])
             .category(Category::Conversions)
             .allow_variants_without_examples(true)
     }
@@ -171,9 +168,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SplitCellPath {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(SplitCellPath)
     }
 }

@@ -61,6 +61,7 @@ pub fn help_commands(
             &f.item,
             &["name", "description", "search_terms"],
             true,
+            head,
         );
     }
 
@@ -87,7 +88,7 @@ pub fn help_commands(
             // Usage line in the generated help text accordingly.
             let sig = engine_state.get_signature(cmd).update_from_command(cmd);
 
-            let mut help_text = get_full_help(cmd, engine_state, stack);
+            let mut help_text = get_full_help(cmd, engine_state, stack, head);
 
             // If the requested name differs from the signature's base name (module-qualified
             // request), replace the first occurrence of the usage call name so help shows
@@ -203,14 +204,11 @@ fn build_help_commands(engine_state: &EngineState, span: Span) -> PipelineData {
             }
 
             for named_param in &sig.named {
-                let name = if let Some(short) = named_param.short {
-                    if named_param.long.is_empty() {
-                        format!("-{short}")
-                    } else {
-                        format!("--{}(-{})", named_param.long, short)
-                    }
-                } else {
-                    format!("--{}", named_param.long)
+                let name = match (named_param.long_name(), named_param.short) {
+                    (Some(long), Some(short)) => format!("--{long}(-{short})"),
+                    (Some(long), None) => format!("--{long}"),
+                    (None, Some(short)) => format!("-{short}"),
+                    (None, None) => format!("--{}", named_param.long),
                 };
 
                 let typ = if let Some(arg) = &named_param.arg {
@@ -270,9 +268,8 @@ fn build_help_commands(engine_state: &EngineState, span: Span) -> PipelineData {
 #[cfg(test)]
 mod test {
     #[test]
-    fn test_examples() {
+    fn test_examples() -> nu_test_support::Result {
         use super::HelpCommands;
-        use crate::test_examples;
-        test_examples(HelpCommands {})
+        nu_test_support::test().examples(HelpCommands)
     }
 }

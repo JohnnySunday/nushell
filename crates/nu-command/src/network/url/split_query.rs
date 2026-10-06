@@ -14,7 +14,9 @@ impl Command for UrlSplitQuery {
         Signature::build("url split-query")
             .input_output_types(vec![(
                 Type::String,
-                Type::Table([("key".into(), Type::String), ("value".into(), Type::String)].into()),
+                Type::Table(
+                    vec![("key".into(), Type::String), ("value".into(), Type::String)].into(),
+                ),
             )])
             .category(Category::Network)
     }
@@ -98,9 +100,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(UrlSplitQuery {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(UrlSplitQuery)
     }
 }

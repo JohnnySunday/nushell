@@ -1,6 +1,8 @@
 use fancy_regex::{Regex, escape};
 use nu_engine::command_prelude::*;
 
+use super::split;
+
 #[derive(Clone)]
 pub struct SplitColumn;
 
@@ -28,8 +30,13 @@ impl Command for SplitColumn {
             .named(
                 "number",
                 SyntaxShape::Int,
-                "Split into maximum number of items.",
+                "Split into maximum number of columns.",
                 Some('n'),
+            )
+            .switch(
+                "right",
+                "When `--number` is used, collect the remainder in the leftmost column.",
+                None,
             )
             .switch("regex", "Separator is a regular expression.", Some('r'))
             .rest(
@@ -98,7 +105,7 @@ impl Command for SplitColumn {
             },
             Example {
                 description: "Split into columns, last column may contain the delimiter.",
-                example: r"['author: Salina Yoon' r#'title: Where's Ellie?: A Hide-and-Seek Book'#] | split column --number 2 ': ' key value",
+                example: "['author: Salina Yoon' r#'title: Where's Ellie?: A Hide-and-Seek Book'#] | split column --number 2 ': ' key value",
                 result: Some(Value::test_list(vec![
                     Value::test_record(record! {
                         "key" => Value::test_string("author"),
@@ -107,6 +114,24 @@ impl Command for SplitColumn {
                     Value::test_record(record! {
                         "key" => Value::test_string("title"),
                         "value" => Value::test_string("Where's Ellie?: A Hide-and-Seek Book"),
+                    }),
+                ])),
+            },
+            Example {
+                description: "Split into columns, first column may contain the delimiter.",
+                example: "['some-package-1.2.3' 'pkg2-1.0' 'do-smart-things-0.9.1'] | split column --number 2 --right '-' name version",
+                result: Some(Value::test_list(vec![
+                    Value::test_record(record! {
+                        "name" => Value::test_string("some-package"),
+                        "version" => Value::test_string("1.2.3"),
+                    }),
+                    Value::test_record(record! {
+                        "name" => Value::test_string("pkg2"),
+                        "version" => Value::test_string("1.0"),
+                    }),
+                    Value::test_record(record! {
+                        "name" => Value::test_string("do-smart-things"),
+                        "version" => Value::test_string("0.9.1"),
                     }),
                 ])),
             },
@@ -128,6 +153,7 @@ impl Command for SplitColumn {
         let rest: Vec<Spanned<String>> = call.rest(engine_state, stack, 1)?;
         let collapse_empty = call.has_flag(engine_state, stack, "collapse-empty")?;
         let max_split: Option<usize> = call.get_flag(engine_state, stack, "number")?;
+        let split_from_right = call.has_flag(engine_state, stack, "right")?;
         let has_regex = call.has_flag(engine_state, stack, "regex")?;
 
         let args = Arguments {
@@ -135,6 +161,7 @@ impl Command for SplitColumn {
             rest,
             collapse_empty,
             max_split,
+            split_from_right,
             has_regex,
         };
         split_column(engine_state, call, input, args)
@@ -143,20 +170,23 @@ impl Command for SplitColumn {
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let separator: Spanned<String> = call.req_const(working_set, 0)?;
-        let rest: Vec<Spanned<String>> = call.rest_const(working_set, 1)?;
-        let collapse_empty = call.has_flag_const(working_set, "collapse-empty")?;
-        let max_split: Option<usize> = call.get_flag_const(working_set, "number")?;
-        let has_regex = call.has_flag_const(working_set, "regex")?;
+        let separator: Spanned<String> = call.req_const(working_set, stack, 0)?;
+        let rest: Vec<Spanned<String>> = call.rest_const(working_set, stack, 1)?;
+        let collapse_empty = call.has_flag_const(working_set, stack, "collapse-empty")?;
+        let max_split: Option<usize> = call.get_flag_const(working_set, stack, "number")?;
+        let split_from_right = call.has_flag_const(working_set, stack, "right")?;
+        let has_regex = call.has_flag_const(working_set, stack, "regex")?;
 
         let args = Arguments {
             separator,
             rest,
             collapse_empty,
             max_split,
+            split_from_right,
             has_regex,
         };
         split_column(working_set.permanent(), call, input, args)
@@ -168,6 +198,7 @@ struct Arguments {
     rest: Vec<Spanned<String>>,
     collapse_empty: bool,
     max_split: Option<usize>,
+    split_from_right: bool,
     has_regex: bool,
 }
 
@@ -178,19 +209,12 @@ fn split_column(
     args: Arguments,
 ) -> Result<PipelineData, ShellError> {
     let name_span = call.head;
-    let regex = if args.has_regex {
-        Regex::new(&args.separator.item)
+    let pattern = if args.has_regex {
+        std::borrow::Cow::Borrowed(args.separator.item.as_str())
     } else {
-        let escaped = escape(&args.separator.item);
-        Regex::new(&escaped)
-    }
-    .map_err(|e| ShellError::GenericError {
-        error: "Error with regular expression".into(),
-        msg: e.to_string(),
-        span: Some(args.separator.span),
-        help: None,
-        inner: vec![],
-    })?;
+        escape(&args.separator.item)
+    };
+    let regex = engine_state.compile_regex(&pattern, args.separator.span)?;
 
     input.flat_map(
         move |x| {
@@ -200,6 +224,7 @@ fn split_column(
                 &args.rest,
                 args.collapse_empty,
                 args.max_split,
+                args.split_from_right,
                 name_span,
             )
         },
@@ -213,16 +238,27 @@ fn split_column_helper(
     rest: &[Spanned<String>],
     collapse_empty: bool,
     max_split: Option<usize>,
+    split_from_right: bool,
     head: Span,
 ) -> Vec<Value> {
     if let Ok(s) = v.as_str() {
-        let split_result: Vec<_> = match max_split {
-            Some(max_split) => separator
+        let split_result: Vec<_> = match (max_split, split_from_right) {
+            (Some(0), _) => vec![],
+            (Some(max_split), true) => {
+                let sep_bounds: Vec<_> = separator
+                    .find_iter(s)
+                    .filter_map(|x| x.ok())
+                    .map(|x| (x.start(), x.end()))
+                    .collect();
+                // get the last `max_split` separators and split `s` with them
+                split(s, sep_bounds.into_iter().rev().take(max_split - 1).rev()).collect()
+            }
+            (Some(max_split), false) => separator
                 .splitn(s, max_split)
                 .filter_map(|x| x.ok())
                 .filter(|x| !(collapse_empty && x.is_empty()))
                 .collect(),
-            None => separator
+            (None, _) => separator
                 .split(s)
                 .filter_map(|x| x.ok())
                 .filter(|x| !(collapse_empty && x.is_empty()))
@@ -273,9 +309,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SplitColumn {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(SplitColumn)
     }
 }

@@ -4,6 +4,7 @@ use nu_engine::{
 use nu_protocol::{
     ast::{Expr, Expression},
     engine::CommandType,
+    shell_error::generic::GenericError,
 };
 
 #[derive(Clone)]
@@ -21,18 +22,24 @@ impl Command for ExportUse {
     fn signature(&self) -> nu_protocol::Signature {
         Signature::build("export use")
             .input_output_types(vec![(Type::Nothing, Type::Nothing)])
-            .required("module", SyntaxShape::String, "Module or module file.")
-            .rest(
-                "members",
-                SyntaxShape::Any,
-                "Which members of the module to import.",
-            )
+            .param(Parameter::Required(
+                PositionalArg::new("module", SyntaxShape::String)
+                    .desc("Module or module file.")
+                    .completion(Completion::Builtin(BuiltinCompletion::NuFile {
+                        std_virtual_path: true,
+                    })),
+            ))
+            .param(Parameter::Rest(
+                PositionalArg::new("members", SyntaxShape::Any)
+                    .desc("Which members of the module to import.")
+                    .completion(Completion::Builtin(BuiltinCompletion::ModuleExports)),
+            ))
             .category(Category::Core)
     }
 
     fn extra_description(&self) -> &str {
-        r#"This command is a parser keyword. For details, check:
-  https://www.nushell.sh/book/thinking_in_nu.html"#
+        "This command is a parser keyword. For details, check:
+  https://www.nushell.sh/book/thinking_in_nu.html"
     }
 
     fn command_type(&self) -> CommandType {
@@ -54,13 +61,11 @@ impl Command for ExportUse {
             ..
         }) = call.get_parser_info(caller_stack, "import_pattern")
         else {
-            return Err(ShellError::GenericError {
-                error: "Unexpected import".into(),
-                msg: "import pattern not supported".into(),
-                span: Some(call.head),
-                help: None,
-                inner: vec![],
-            });
+            return Err(ShellError::Generic(GenericError::new(
+                "Unexpected import",
+                "import pattern not supported",
+                call.head,
+            )));
         };
 
         // Necessary so that we can modify the stack.
@@ -139,16 +144,14 @@ impl Command for ExportUse {
                 redirect_env(engine_state, caller_stack, &callee_stack);
             }
         } else {
-            return Err(ShellError::GenericError {
-                error: format!(
+            return Err(ShellError::Generic(GenericError::new(
+                format!(
                     "Could not import from '{}'",
                     String::from_utf8_lossy(&import_pattern.head.name)
                 ),
-                msg: "module does not exist".to_string(),
-                span: Some(import_pattern.head.span),
-                help: None,
-                inner: vec![],
-            });
+                "module does not exist",
+                import_pattern.head.span,
+            )));
         }
 
         Ok(PipelineData::empty())

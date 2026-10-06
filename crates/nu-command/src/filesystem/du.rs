@@ -1,6 +1,6 @@
-use crate::{DirBuilder, DirInfo, FileInfo};
+use crate::{DirBuilder, DirInfo, ExcludeGlob, FileInfo};
 use nu_engine::command_prelude::*;
-use nu_glob::{MatchOptions, Pattern};
+use nu_glob::MatchOptions;
 use nu_protocol::{NuGlob, PipelineMetadata, Signals};
 use serde::Deserialize;
 use std::path::Path;
@@ -28,6 +28,10 @@ impl Command for Du {
 
     fn description(&self) -> &str {
         "Find disk usage sizes of specified items."
+    }
+
+    fn search_terms(&self) -> Vec<&str> {
+        vec!["disk", "usage", "size", "space"]
     }
 
     fn signature(&self) -> Signature {
@@ -182,14 +186,10 @@ fn du_for_one_pattern(
     span: Span,
     signals: Signals,
 ) -> Result<impl Iterator<Item = Value> + Send + use<>, ShellError> {
-    let exclude = args.exclude.map_or(Ok(None), move |x| {
-        Pattern::new(x.item.as_ref())
-            .map(Some)
-            .map_err(|e| ShellError::InvalidGlobPattern {
-                msg: e.msg.into(),
-                span: x.span,
-            })
-    })?;
+    let exclude = args
+        .exclude
+        .map(|x| build_exclude_glob(x.item.as_ref(), x.span))
+        .transpose()?;
     let glob_options = if args.all {
         None
     } else {
@@ -206,7 +206,7 @@ fn du_for_one_pattern(
         None => nu_engine::glob_from(
             &Spanned {
                 item: NuGlob::Expand("*".into()),
-                span: Span::unknown(),
+                span,
             },
             current_dir,
             span,
@@ -247,13 +247,29 @@ fn du_for_one_pattern(
     }))
 }
 
+fn build_exclude_glob(pattern: &str, span: Span) -> Result<ExcludeGlob, ShellError> {
+    match nu_experimental::DC_GLOB.get() {
+        true => nu_glob::dc_glob::DcPattern::new(pattern)
+            .map(ExcludeGlob::DcGlob)
+            .map_err(|e| ShellError::InvalidGlobPattern {
+                msg: e.to_string(),
+                span,
+            }),
+        false => nu_glob::Pattern::new(pattern)
+            .map(ExcludeGlob::Legacy)
+            .map_err(|e| ShellError::InvalidGlobPattern {
+                msg: e.msg.into(),
+                span,
+            }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Du;
 
     #[test]
-    fn examples_work_as_expected() {
-        use crate::test_examples;
-        test_examples(Du {})
+    fn examples_work_as_expected() -> nu_test_support::Result {
+        nu_test_support::test().examples(Du)
     }
 }

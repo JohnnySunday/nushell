@@ -65,12 +65,12 @@ impl Command for EachWhile {
         engine_state: &EngineState,
         stack: &mut Stack,
         call: &Call,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let head = call.head;
         let closure: Closure = call.req(engine_state, stack, 0)?;
 
-        let metadata = input.metadata();
+        let metadata = input.take_metadata();
         match input {
             PipelineData::Empty => Ok(PipelineData::empty()),
             PipelineData::Value(Value::Range { .. }, ..)
@@ -85,7 +85,7 @@ impl Command for EachWhile {
                             .and_then(|data| data.into_value(head))
                         {
                             Ok(value) => (!value.is_nothing()).then_some(value),
-                            Err(_) => None,
+                            Err(error) => Some(Value::error(error, head)),
                         }
                     })
                     .fuse()
@@ -96,15 +96,15 @@ impl Command for EachWhile {
                 if let Some(chunks) = stream.chunks() {
                     let mut closure = ClosureEval::new(engine_state, stack, closure);
                     Ok(chunks
-                        .map_while(move |value| {
-                            let value = value.ok()?;
-                            match closure
+                        .map_while(move |value| match value {
+                            Ok(value) => match closure
                                 .run_with_value(value)
                                 .and_then(|data| data.into_value(span))
                             {
                                 Ok(value) => (!value.is_nothing()).then_some(value),
-                                Err(_) => None,
-                            }
+                                Err(error) => Some(Value::error(error, span)),
+                            },
+                            Err(error) => Some(Value::error(error, span)),
                         })
                         .fuse()
                         .into_pipeline_data(head, engine_state.signals().clone()))
@@ -127,9 +127,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(EachWhile {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(EachWhile)
     }
 }

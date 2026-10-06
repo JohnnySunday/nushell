@@ -83,6 +83,9 @@ impl fmt::Display for FmtInstruction<'_> {
             Instruction::Collect { src_dst } => {
                 write!(f, "{:WIDTH$} {src_dst}", "collect")
             }
+            Instruction::TryCollect { src_dst } => {
+                write!(f, "{:WIDTH$} {src_dst}", "try-collect")
+            }
             Instruction::Span { src_dst } => {
                 write!(f, "{:WIDTH$} {src_dst}", "span")
             }
@@ -95,9 +98,17 @@ impl fmt::Display for FmtInstruction<'_> {
             Instruction::DrainIfEnd { src } => {
                 write!(f, "{:WIDTH$} {src}", "drain-if-end")
             }
-            Instruction::LoadVariable { dst, var_id } => {
+            Instruction::LoadVariable {
+                dst,
+                var_id,
+                preserve_origin,
+            } => {
                 let var = FmtVar::new(self.engine_state, *var_id);
-                write!(f, "{:WIDTH$} {dst}, {var}", "load-variable")
+                if *preserve_origin {
+                    write!(f, "{:WIDTH$} {dst}, {var}", "load-variable-origin")
+                } else {
+                    write!(f, "{:WIDTH$} {dst}, {var}", "load-variable")
+                }
             }
             Instruction::StoreVariable { var_id, src } => {
                 let var = FmtVar::new(self.engine_state, *var_id);
@@ -217,8 +228,23 @@ impl fmt::Display for FmtInstruction<'_> {
                     "upsert-cell-path"
                 )
             }
+            Instruction::UpdateVarCellPath {
+                var_id,
+                cell_path,
+                new_value,
+            } => {
+                let var = FmtVar::new(self.engine_state, *var_id);
+                write!(
+                    f,
+                    "{:WIDTH$} {var}, {cell_path}, {new_value}",
+                    "update-var-cell-path"
+                )
+            }
             Instruction::Jump { index } => {
                 write!(f, "{:WIDTH$} {index}", "jump")
+            }
+            Instruction::UnwindJump { index, handlers } => {
+                write!(f, "{:WIDTH$} {index}, handlers {handlers}", "unwind-jump")
             }
             Instruction::BranchIf { cond, index } => {
                 write!(f, "{:WIDTH$} {cond}, {index}", "branch-if")
@@ -250,9 +276,6 @@ impl fmt::Display for FmtInstruction<'_> {
             Instruction::OnError { index } => {
                 write!(f, "{:WIDTH$} {index}", "on-error")
             }
-            Instruction::Finally { index } => {
-                write!(f, "{:WIDTH$} {index}", "finally")
-            }
             Instruction::FinallyInto { index, dst } => {
                 write!(f, "{:WIDTH$} {index}, {dst}", "finally-into")
             }
@@ -262,8 +285,11 @@ impl fmt::Display for FmtInstruction<'_> {
             Instruction::PopErrorHandler => {
                 write!(f, "{:WIDTH$}", "pop-error-handler")
             }
-            Instruction::PopFinallyRun => {
-                write!(f, "{:WIDTH$}", "pop-finally")
+            Instruction::BeginFinally => {
+                write!(f, "{:WIDTH$}", "begin-finally")
+            }
+            Instruction::EndFinally => {
+                write!(f, "{:WIDTH$}", "end-finally")
             }
             Instruction::ReturnEarly { src } => {
                 write!(f, "{:WIDTH$} {src}", "return-early")
@@ -402,7 +428,10 @@ impl fmt::Display for FmtPattern<'_> {
         match self.pattern {
             Pattern::Record(bindings) => {
                 f.write_str("{")?;
-                for (name, pattern) in bindings {
+                for (index, (name, pattern)) in bindings.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
                     write!(
                         f,
                         "{}: {}",
@@ -417,7 +446,10 @@ impl fmt::Display for FmtPattern<'_> {
             }
             Pattern::List(bindings) => {
                 f.write_str("[")?;
-                for pattern in bindings {
+                for (index, pattern) in bindings.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
                     write!(
                         f,
                         "{}",

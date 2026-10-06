@@ -58,6 +58,7 @@ impl Command for PathSplit {
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        _stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
@@ -119,7 +120,7 @@ impl Command for PathSplit {
         vec![
             Example {
                 description: "Split a path into parts.",
-                example: r"'/home/viking/spam.txt' | path split",
+                example: "'/home/viking/spam.txt' | path split",
                 result: Some(Value::list(
                     vec![
                         Value::test_string("/"),
@@ -132,7 +133,7 @@ impl Command for PathSplit {
             },
             Example {
                 description: "Split paths in list into parts.",
-                example: r"[ /home/viking/spam.txt /home/viking/eggs.txt ] | path split",
+                example: "[ /home/viking/spam.txt /home/viking/eggs.txt ] | path split",
                 result: Some(Value::list(
                     vec![
                         Value::test_list(vec![
@@ -190,9 +191,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(PathSplit {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(PathSplit)
     }
 }

@@ -20,11 +20,11 @@ impl Command for Echo {
     }
 
     fn extra_description(&self) -> &str {
-        r#"Unlike `print`, which prints unstructured text to stdout, `echo` is like an
+        "Unlike `print`, which prints unstructured text to stdout, `echo` is like an
 identity function and simply returns its arguments. When given no arguments,
 it returns an empty string. When given one argument, it returns it as a
 nushell value. Otherwise, it returns a list of the arguments. There is usually
-little reason to use this over just writing the values as-is."#
+little reason to use this over just writing the values as-is."
     }
 
     fn run(
@@ -41,10 +41,11 @@ little reason to use this over just writing the values as-is."#
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let args = call.rest_const(working_set, 0)?;
+        let args = call.rest_const(working_set, stack, 0)?;
         echo_impl(args, call.head)
     }
 
@@ -83,9 +84,8 @@ fn echo_impl(mut args: Vec<Value>, head: Span) -> Result<PipelineData, ShellErro
 #[cfg(test)]
 mod test {
     #[test]
-    fn test_examples() {
+    fn test_examples() -> nu_test_support::Result {
         use super::Echo;
-        use crate::test_examples;
-        test_examples(Echo {})
+        nu_test_support::test().examples(Echo)
     }
 }

@@ -152,7 +152,7 @@ mod tests {
                     Value::test_int(2),
                     Value::test_int(42),
                     RangeInclusion::Inclusive,
-                    Span::unknown(),
+                    Span::test_data(),
                 )
                 .unwrap(),
             ))),
@@ -384,7 +384,7 @@ mod tests {
     #[test]
     fn cell_path() {
         nuon_end_to_end(
-            r#"$.foo.bar.0"#,
+            "$.foo.bar.0",
             Some(Value::test_cell_path(CellPath {
                 members: vec![
                     PathMember::string(
@@ -512,7 +512,7 @@ mod tests {
     #[test]
     fn raw_string_parses_with_hashes() {
         // String containing '# parses correctly with more hashes
-        let input = r"r##'contains '# in middle'##";
+        let input = "r##'contains '# in middle'##";
         let val = from_nuon(input, None).unwrap();
         assert_eq!(val, Value::test_string("contains '# in middle"));
     }
@@ -634,5 +634,73 @@ mod tests {
         .unwrap();
         // Has '# so needs r##'...'##
         assert_eq!(result, r#"r##'contains '# and "quote"'##"#);
+    }
+
+    #[test]
+    fn raw_strings_need_more_hashes_when_content_starts_with_hash() {
+        let engine_state = EngineState::new();
+        let val = Value::test_string("# example.toml\nname = \"my-app\"\nversion = \"1.0.0\"\n");
+        let result = to_nuon(
+            &engine_state,
+            &val,
+            ToNuonConfig::default().raw_strings(true),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            r##"r##'# example.toml
+name = "my-app"
+version = "1.0.0"
+'##"##
+        );
+    }
+
+    #[test]
+    fn raw_strings_roundtrip_when_content_starts_with_hash() {
+        let input = r##"r##'# example.toml
+name = "my-app"
+version = "1.0.0"
+'##"##;
+        let parsed = from_nuon(input, None).unwrap();
+
+        assert_eq!(
+            parsed,
+            Value::test_string("# example.toml\nname = \"my-app\"\nversion = \"1.0.0\"\n")
+        );
+    }
+
+    #[test]
+    fn table_column_alignment_with_indent() {
+        let engine_state = EngineState::new();
+        let val = Value::test_list(vec![
+            Value::test_record(record!(
+                "name" => Value::test_string("alice"),
+                "age" => Value::test_int(22),
+                "active" => Value::test_bool(true)
+            )),
+            Value::test_record(record!(
+                "name" => Value::test_string("bob"),
+                "age" => Value::test_int(20),
+                "active" => Value::test_bool(false)
+            )),
+            Value::test_record(record!(
+                "name" => Value::test_string("charlie"),
+                "age" => Value::test_int(20),
+                "active" => Value::test_bool(false)
+            )),
+        ]);
+        let result = to_nuon(
+            &engine_state,
+            &val,
+            ToNuonConfig::default().style(ToStyle::Spaces(2)),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            "[\n  [name,    age, active];\n  [alice,   22,  true],\n  [bob,     20,  false],\n  [charlie, 20,  false]\n]"
+        );
+        // roundtrip: aligned output parses back to the same value
+        assert_eq!(val, from_nuon(&result, None).unwrap());
     }
 }

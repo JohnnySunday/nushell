@@ -20,12 +20,23 @@ mod macos;
 #[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
 mod netbsd;
 pub mod os_info;
+#[cfg(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+mod process;
 #[cfg(target_family = "unix")]
 mod unix;
 #[cfg(target_os = "windows")]
 mod windows;
 
 pub use self::exit_status::ExitStatus;
+pub use self::foreground::prepare_background_command;
 #[cfg(unix)]
 pub use self::foreground::stdin_fd;
 pub use self::foreground::{
@@ -33,6 +44,17 @@ pub use self::foreground::{
 };
 
 pub use self::util::*;
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+pub use self::process::ProcessInfo;
 
 #[cfg(target_os = "freebsd")]
 pub use self::freebsd::*;

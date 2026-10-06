@@ -98,18 +98,19 @@ impl Command for StrIndexOf {
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let substring: Spanned<String> = call.req_const(working_set, 0)?;
-        let cell_paths: Vec<CellPath> = call.rest_const(working_set, 1)?;
+        let substring: Spanned<String> = call.req_const(working_set, stack, 0)?;
+        let cell_paths: Vec<CellPath> = call.rest_const(working_set, stack, 1)?;
         let cell_paths = (!cell_paths.is_empty()).then_some(cell_paths);
         let args = Arguments {
             substring: substring.item,
-            range: call.get_flag_const(working_set, "range")?,
-            end: call.has_flag_const(working_set, "end")?,
+            range: call.get_flag_const(working_set, stack, "range")?,
+            end: call.has_flag_const(working_set, stack, "end")?,
             cell_paths,
-            graphemes: grapheme_flags_const(working_set, call)?,
+            graphemes: grapheme_flags_const(working_set, stack, call)?,
         };
         operate(
             action,
@@ -131,6 +132,11 @@ impl Command for StrIndexOf {
                 description: "Count length using grapheme clusters.",
                 example: "'🇯🇵ほげ ふが ぴよ' | str index-of --grapheme-clusters 'ふが'",
                 result: Some(Value::test_int(4)),
+            },
+            Example {
+                description: "A match that falls inside a grapheme cluster is reported as not found.",
+                example: "'🇯🇵' | str index-of --grapheme-clusters '🇵'",
+                result: Some(Value::test_int(-1)),
             },
             Example {
                 description: "Returns index of string in input within a`rhs open range`.",
@@ -217,11 +223,10 @@ fn action(
                         s.grapheme_indices(true)
                             .enumerate()
                             .find(|e| e.1.0 >= result)
-                            .expect("No grapheme index for substring")
-                            .0
+                            .map_or(-1, |e| e.0 as i64)
                     } else {
-                        result
-                    } as i64,
+                        result as i64
+                    },
                     head,
                 )
             } else {
@@ -249,10 +254,8 @@ mod tests {
     use super::{Arguments, StrIndexOf, action};
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(StrIndexOf {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(StrIndexOf)
     }
 
     #[test]

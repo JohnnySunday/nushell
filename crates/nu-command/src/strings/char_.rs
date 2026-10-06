@@ -1,7 +1,7 @@
 use indexmap::{IndexMap, indexmap};
 use nu_engine::command_prelude::*;
 use nu_protocol::{Parameter, Signals};
-use nu_utils::consts::{ENV_PATH_SEPARATOR_CHAR, LINE_SEPARATOR_CHAR};
+use nu_utils::consts::{ENV_PATH_SEPARATOR_CHAR, LINE_SEPARATOR_STR};
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
@@ -49,12 +49,17 @@ static CHAR_MAP: LazyLock<IndexMap<&'static str, String>> = LazyLock::new(|| {
         "double_quote" => '\"'.to_string(),
         "dquote" => '\"'.to_string(),
         "dq" => '\"'.to_string(),
+        "forward_slash" => '/'.to_string(),
+        "slash" => '/'.to_string(),
+        "fslash" => '/'.to_string(),
+        "back_slash" => '\\'.to_string(),
+        "bslash" => '\\'.to_string(),
         "path_sep" => std::path::MAIN_SEPARATOR.to_string(),
         "psep" => std::path::MAIN_SEPARATOR.to_string(),
         "separator" => std::path::MAIN_SEPARATOR.to_string(),
-        "eol" => LINE_SEPARATOR_CHAR.to_string(),
-        "lsep" => LINE_SEPARATOR_CHAR.to_string(),
-        "line_sep" => LINE_SEPARATOR_CHAR.to_string(),
+        "eol" => LINE_SEPARATOR_STR.to_string(),
+        "lsep" => LINE_SEPARATOR_STR.to_string(),
+        "line_sep" => LINE_SEPARATOR_STR.to_string(),
         "esep" => ENV_PATH_SEPARATOR_CHAR.to_string(),
         "env_sep" => ENV_PATH_SEPARATOR_CHAR.to_string(),
         "tilde" => '~'.to_string(),                                // ~
@@ -210,32 +215,32 @@ impl Command for Char {
         vec![
             Example {
                 description: "Output newline",
-                example: r#"char newline"#,
+                example: "char newline",
                 result: Some(Value::test_string("\n")),
             },
             Example {
                 description: "List available characters",
-                example: r#"char --list"#,
+                example: "char --list",
                 result: None,
             },
             Example {
                 description: "Output prompt character, newline and a hamburger menu character",
-                example: r#"(char prompt) + (char newline) + (char hamburger)"#,
+                example: "(char prompt) + (char newline) + (char hamburger)",
                 result: Some(Value::test_string("\u{25b6}\n\u{2261}")),
             },
             Example {
                 description: "Output Unicode character",
-                example: r#"char --unicode 1f378"#,
+                example: "char --unicode 1f378",
                 result: Some(Value::test_string("\u{1f378}")),
             },
             Example {
                 description: "Create Unicode from integer codepoint values",
-                example: r#"char --integer (0x60 + 1) (0x60 + 2)"#,
+                example: "char --integer (0x60 + 1) (0x60 + 2)",
                 result: Some(Value::test_string("ab")),
             },
             Example {
                 description: "Output multi-byte Unicode character",
-                example: r#"char --unicode 1F468 200D 1F466 200D 1F466"#,
+                example: "char --unicode 1F468 200D 1F466 200D 1F466",
                 result: Some(Value::test_string(
                     "\u{1F468}\u{200D}\u{1F466}\u{200D}\u{1F466}",
                 )),
@@ -246,13 +251,14 @@ impl Command for Char {
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let call_span = call.head;
-        let list = call.has_flag_const(working_set, "list")?;
-        let integer = call.has_flag_const(working_set, "integer")?;
-        let unicode = call.has_flag_const(working_set, "unicode")?;
+        let list = call.has_flag_const(working_set, stack, "list")?;
+        let integer = call.has_flag_const(working_set, stack, "integer")?;
+        let unicode = call.has_flag_const(working_set, stack, "unicode")?;
 
         // handle -l flag
         if list {
@@ -264,17 +270,17 @@ impl Command for Char {
 
         // handle -i flag
         if integer {
-            let int_args = call.rest_const(working_set, 0)?;
+            let int_args = call.rest_const(working_set, stack, 0)?;
             handle_integer_flag(int_args, call_span)
         }
         // handle -u flag
         else if unicode {
-            let string_args = call.rest_const(working_set, 0)?;
+            let string_args = call.rest_const(working_set, stack, 0)?;
             handle_unicode_flag(string_args, call_span)
         }
         // handle the rest
         else {
-            let string_args = call.rest_const(working_set, 0)?;
+            let string_args = call.rest_const(working_set, stack, 0)?;
             handle_the_rest(string_args, call_span)
         }
     }
@@ -442,9 +448,7 @@ mod tests {
     use super::Char;
 
     #[test]
-    fn examples_work_as_expected() {
-        use crate::test_examples;
-
-        test_examples(Char {})
+    fn examples_work_as_expected() -> nu_test_support::Result {
+        nu_test_support::test().examples(Char)
     }
 }

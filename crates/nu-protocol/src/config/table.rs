@@ -9,6 +9,7 @@ pub enum TableMode {
     Thin,
     Light,
     Compact,
+    Frameless,
     WithLove,
     CompactDouble,
     #[default]
@@ -35,6 +36,7 @@ impl FromStr for TableMode {
             "thin" => Ok(Self::Thin),
             "light" => Ok(Self::Light),
             "compact" => Ok(Self::Compact),
+            "frameless" => Ok(Self::Frameless),
             "with_love" => Ok(Self::WithLove),
             "compact_double" => Ok(Self::CompactDouble),
             "default" => Ok(TableMode::default()),
@@ -51,9 +53,54 @@ impl FromStr for TableMode {
             "single" => Ok(Self::Single),
             "double" => Ok(Self::Double),
             _ => Err(
-                "'basic', 'thin', 'light', 'compact', 'with_love', 'compact_double', 'rounded', 'reinforced', 'heavy', 'none', 'psql', 'markdown', 'dots', 'restructured', 'ascii_rounded', 'basic_compact', 'single', or 'double'",
+                "'basic', 'thin', 'light', 'compact', 'frameless', 'with_love', 'compact_double', 'rounded', 'reinforced', 'heavy', 'none', 'psql', 'markdown', 'dots', 'restructured', 'ascii_rounded', 'basic_compact', 'single', or 'double'",
             ),
         }
+    }
+}
+
+impl TableMode {
+    /// Every name `table --theme` and `$env.config.table.mode` accept.
+    pub const NAMES: &'static [&'static str] = &[
+        "basic",
+        "compact",
+        "compact_double",
+        "default",
+        "frameless",
+        "heavy",
+        "light",
+        "none",
+        "reinforced",
+        "rounded",
+        "thin",
+        "with_love",
+        "psql",
+        "markdown",
+        "dots",
+        "restructured",
+        "ascii_rounded",
+        "basic_compact",
+        "single",
+        "double",
+    ];
+
+    /// The names a `tui` border (`--border`, `$env.config.tui.border_type`)
+    /// accepts: every [`Self::NAMES`] entry but `none`, since a tui border
+    /// always takes one cell, and `default`, which is `rounded` for `table`
+    /// while tui borders default to `single`.
+    pub fn tui_border_names() -> impl Iterator<Item = &'static str> {
+        Self::NAMES
+            .iter()
+            .copied()
+            .filter(|name| !matches!(*name, "none" | "default"))
+    }
+
+    /// Parse a `tui` border name, ignoring case like [`TableMode::from_str`].
+    /// `None` when `name` is not one of [`Self::tui_border_names`].
+    pub fn from_tui_border(name: &str) -> Option<Self> {
+        Self::tui_border_names()
+            .find(|valid| valid.eq_ignore_ascii_case(name))
+            .and_then(|valid| valid.parse().ok())
     }
 }
 

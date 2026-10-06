@@ -76,7 +76,7 @@ impl Command for DetectColumns {
         vec![
             Example {
                 description: "use --guess if you find default algorithm not working",
-                example: r"
+                example: "
 'Filesystem     1K-blocks      Used Available Use% Mounted on
 none             8150224         4   8150220   1% /mnt/c' | detect columns --guess",
                 result: Some(Value::test_list(vec![Value::test_record(record! {
@@ -191,13 +191,14 @@ none             8150224         4   8150220   1% /mnt/c' | detect columns --gue
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let num_rows_to_skip: Option<usize> = call.get_flag_const(working_set, "skip")?;
-        let noheader = call.has_flag_const(working_set, "no-headers")?;
-        let range: Option<Range> = call.get_flag_const(working_set, "combine-columns")?;
-        let ignore_box_chars = call.has_flag_const(working_set, "ignore-box-chars")?;
+        let num_rows_to_skip: Option<usize> = call.get_flag_const(working_set, stack, "skip")?;
+        let noheader = call.has_flag_const(working_set, stack, "no-headers")?;
+        let range: Option<Range> = call.get_flag_const(working_set, stack, "combine-columns")?;
+        let ignore_box_chars = call.has_flag_const(working_set, stack, "ignore-box-chars")?;
         let config = working_set.get_config().clone();
 
         let args = Arguments {
@@ -208,7 +209,7 @@ none             8150224         4   8150220   1% /mnt/c' | detect columns --gue
             ignore_box_chars,
         };
 
-        if call.has_flag_const(working_set, "guess")? {
+        if call.has_flag_const(working_set, stack, "guess")? {
             guess_width(working_set.permanent(), call, input, args)
         } else {
             detect_columns(working_set.permanent(), call, input, args)
@@ -314,7 +315,7 @@ fn detect_columns(
     args: Arguments,
 ) -> Result<PipelineData, ShellError> {
     let name_span = call.head;
-    let input_span = input.span().unwrap_or(Span::unknown());
+    let input_span = input.span().unwrap_or(name_span);
 
     // Handle different input types
     match input {
@@ -1006,13 +1007,13 @@ fn merge_record_impl(
         .skip(start_index)
         .map(|v| v.coerce_str().unwrap_or_default())
         .join(" ");
-    let binding = Value::string(combined, Span::unknown());
+    let binding = Value::string(combined, input_span);
     let last_seg = vals.split_off(end_index);
     vals.truncate(start_index);
     vals.push(binding);
     vals.extend(last_seg);
 
-    Record::from_raw_cols_vals(cols, vals, Span::unknown(), input_span)
+    Record::from_raw_cols_vals(cols, vals, input_span, input_span)
 }
 
 #[cfg(test)]
@@ -1020,8 +1021,8 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        crate::test_examples(DetectColumns)
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(DetectColumns)
     }
 
     /// Ensure that splitting a line using a header offset that falls inside a

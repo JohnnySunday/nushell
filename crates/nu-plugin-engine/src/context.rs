@@ -1,11 +1,12 @@
 use crate::util::MutableCow;
 use nu_engine::{ClosureEvalOnce, get_eval_block_with_early_return, get_full_help};
-use nu_plugin_protocol::EvaluatedCall;
+use nu_plugin_protocol::{DynamicCompletionCall, EvaluatedCall};
 use nu_protocol::{
-    BlockId, Config, DeclId, IntoSpanned, OutDest, PipelineData, PluginIdentity, ShellError,
-    Signals, Span, Spanned, Value,
+    BlockId, Config, DeclId, DynamicCompletionCallRef, IntoSpanned, OutDest, PipelineData,
+    PluginIdentity, ShellError, Signals, Span, Spanned, Value,
     engine::{Call, Closure, EngineState, Redirection, Stack},
     ir::{self, IrBlock},
+    shell_error::generic::GenericError,
 };
 use std::{
     borrow::Cow,
@@ -105,27 +106,13 @@ impl PluginExecutionContext for PluginExecutionCommandContext<'_> {
     }
 
     fn get_plugin_config(&self) -> Result<Option<Value>, ShellError> {
-        // Fetch the configuration for a plugin
-        //
-        // The `plugin` must match the registered name of a plugin.  For `plugin add
-        // nu_plugin_example` the plugin config lookup uses `"example"`
-        Ok(self
-            .get_config()?
-            .plugins
-            .get(self.identity.name())
-            .cloned()
-            .map(|value| {
-                let span = value.span();
-                match value {
-                    Value::Closure { val, .. } => {
-                        ClosureEvalOnce::new(&self.engine_state, &self.stack, *val)
-                            .run_with_input(PipelineData::empty())
-                            .and_then(|data| data.into_value(span))
-                            .unwrap_or_else(|err| Value::error(err, self.call.head))
-                    }
-                    _ => value.clone(),
-                }
-            }))
+        Ok(plugin_config(
+            self.get_config()?,
+            self.identity.name(),
+            &self.engine_state,
+            &self.stack,
+            self.call.head,
+        ))
     }
 
     fn get_env_var(&self, name: &str) -> Result<Option<&Value>, ShellError> {
@@ -150,10 +137,13 @@ impl PluginExecutionContext for PluginExecutionCommandContext<'_> {
     fn get_help(&self) -> Result<Spanned<String>, ShellError> {
         let decl = self.engine_state.get_decl(self.call.decl_id);
 
-        Ok(
-            get_full_help(decl, &self.engine_state, &mut self.stack.clone())
-                .into_spanned(self.call.head),
+        Ok(get_full_help(
+            decl,
+            &self.engine_state,
+            &mut self.stack.clone(),
+            self.call.head,
         )
+        .into_spanned(self.call.head))
     }
 
     fn get_span_contents(&self, span: Span) -> Result<Spanned<Vec<u8>>, ShellError> {
@@ -175,15 +165,15 @@ impl PluginExecutionContext for PluginExecutionCommandContext<'_> {
         let block = self
             .engine_state
             .try_get_block(closure.item.block_id)
-            .ok_or_else(|| ShellError::GenericError {
-                error: "Plugin misbehaving".into(),
-                msg: format!(
-                    "Tried to evaluate unknown block id: {}",
-                    closure.item.block_id.get()
-                ),
-                span: Some(closure.span),
-                help: None,
-                inner: vec![],
+            .ok_or_else(|| {
+                ShellError::Generic(GenericError::new(
+                    "Plugin misbehaving",
+                    format!(
+                        "Tried to evaluate unknown block id: {}",
+                        closure.item.block_id.get()
+                    ),
+                    closure.span,
+                ))
             })?;
 
         let mut stack = self
@@ -221,30 +211,26 @@ impl PluginExecutionContext for PluginExecutionCommandContext<'_> {
     }
 
     fn get_block_ir(&self, block_id: BlockId) -> Result<IrBlock, ShellError> {
-        let block =
-            self.engine_state
-                .try_get_block(block_id)
-                .ok_or_else(|| ShellError::GenericError {
-                    error: "Plugin misbehaving".into(),
-                    msg: format!("Tried to get IR for unknown block id: {}", block_id.get()),
-                    span: Some(self.call.head),
-                    help: None,
-                    inner: vec![],
-                })?;
+        let block = self.engine_state.try_get_block(block_id).ok_or_else(|| {
+            ShellError::Generic(GenericError::new(
+                "Plugin misbehaving",
+                format!("Tried to get IR for unknown block id: {}", block_id.get()),
+                self.call.head,
+            ))
+        })?;
 
-        block
-            .ir_block
-            .clone()
-            .ok_or_else(|| ShellError::GenericError {
-                error: "Block has no IR".into(),
-                msg: format!("Block {} was not compiled to IR", block_id.get()),
-                span: Some(self.call.head),
-                help: Some(
-                    "This block may be a declaration or built-in that has no IR representation"
-                        .into(),
+        block.ir_block.clone().ok_or_else(|| {
+            ShellError::Generic(
+                GenericError::new(
+                    "Block has no IR",
+                    format!("Block {} was not compiled to IR", block_id.get()),
+                    self.call.head,
+                )
+                .with_help(
+                    "This block may be a declaration or built-in that has no IR representation",
                 ),
-                inner: vec![],
-            })
+            )
+        })
     }
 
     fn call_decl(
@@ -256,13 +242,11 @@ impl PluginExecutionContext for PluginExecutionCommandContext<'_> {
         redirect_stderr: bool,
     ) -> Result<PipelineData, ShellError> {
         if decl_id.get() >= self.engine_state.num_decls() {
-            return Err(ShellError::GenericError {
-                error: "Plugin misbehaving".into(),
-                msg: format!("Tried to call unknown decl id: {}", decl_id.get()),
-                span: Some(call.head),
-                help: None,
-                inner: vec![],
-            });
+            return Err(ShellError::Generic(GenericError::new(
+                "Plugin misbehaving",
+                format!("Tried to call unknown decl id: {}", decl_id.get()),
+                call.head,
+            )));
         }
 
         let decl = self.engine_state.get_decl(decl_id);
@@ -293,6 +277,171 @@ impl PluginExecutionContext for PluginExecutionCommandContext<'_> {
 
     fn boxed(&self) -> Box<dyn PluginExecutionContext + 'static> {
         Box::new(PluginExecutionCommandContext {
+            identity: self.identity.clone(),
+            engine_state: Cow::Owned(self.engine_state.clone().into_owned()),
+            stack: self.stack.owned(),
+            call: self.call.to_owned(),
+        })
+    }
+}
+
+// Fetch the configuration for a plugin
+//
+// The `plugin` must match the registered name of a plugin.  For `plugin add nu_plugin_example` the
+// plugin config lookup uses `"example"`
+fn plugin_config(
+    config: Arc<Config>,
+    plugin_name: &str,
+    engine_state: &EngineState,
+    stack: &Stack,
+    head: Span,
+) -> Option<Value> {
+    config.plugins.get(plugin_name).cloned().map(|value| {
+        let span = value.span();
+        match value {
+            Value::Closure { val, .. } => ClosureEvalOnce::new(engine_state, stack, *val)
+                .run_with_input(PipelineData::empty())
+                .and_then(|data| data.into_value(span))
+                .unwrap_or_else(|err| Value::error(err, head)),
+            _ => value.clone(),
+        }
+    })
+}
+
+/// The execution context of plugin completion.
+///
+/// This supports limited interactions suitable for generating completions from nushell
+/// configuration, the environment, current working directory, or existing help.
+pub struct PluginGetDynamicCompletionContext<'a> {
+    identity: Arc<PluginIdentity>,
+    engine_state: Cow<'a, EngineState>,
+    stack: MutableCow<'a, Stack>,
+    call: DynamicCompletionCall,
+}
+
+impl<'a> PluginGetDynamicCompletionContext<'a> {
+    pub fn new(
+        identity: Arc<PluginIdentity>,
+        engine_state: &'a EngineState,
+        stack: &'a mut Stack,
+        call: &DynamicCompletionCallRef<'a>,
+    ) -> Self {
+        Self {
+            identity,
+            engine_state: Cow::Borrowed(engine_state),
+            stack: MutableCow::Borrowed(stack),
+            call: call.into(),
+        }
+    }
+}
+
+impl PluginExecutionContext for PluginGetDynamicCompletionContext<'_> {
+    fn span(&self) -> Span {
+        self.call.call.head
+    }
+
+    fn signals(&self) -> &Signals {
+        &Signals::EMPTY
+    }
+
+    fn pipeline_externals_state(&self) -> Option<&Arc<(AtomicU32, AtomicU32)>> {
+        Some(&self.engine_state.pipeline_externals_state)
+    }
+
+    fn get_config(&self) -> Result<Arc<Config>, ShellError> {
+        Ok(self.stack.get_config(&self.engine_state))
+    }
+
+    fn get_plugin_config(&self) -> Result<Option<Value>, ShellError> {
+        Ok(plugin_config(
+            self.get_config()?,
+            self.identity.name(),
+            &self.engine_state,
+            &self.stack,
+            self.call.call.head,
+        ))
+    }
+
+    fn get_env_var(&self, name: &str) -> Result<Option<&Value>, ShellError> {
+        Ok(self.stack.get_env_var(&self.engine_state, name))
+    }
+
+    fn get_env_vars(&self) -> Result<HashMap<String, Value>, ShellError> {
+        Ok(self.stack.get_env_vars(&self.engine_state))
+    }
+
+    fn get_current_dir(&self) -> Result<Spanned<String>, ShellError> {
+        let cwd = self.engine_state.cwd_as_string(Some(&self.stack))?;
+        // The span is not really used, so just give it call.head
+        Ok(cwd.into_spanned(self.call.call.head))
+    }
+
+    fn add_env_var(&mut self, _name: String, _value: Value) -> Result<(), ShellError> {
+        Err(ShellError::NushellFailed {
+            msg: "add_env_var not implemented for PluginGetDynamicCompletionContext".into(),
+        })
+    }
+
+    fn get_help(&self) -> Result<Spanned<String>, ShellError> {
+        let decl = self.engine_state.get_decl(self.call.call.decl_id);
+
+        Ok(get_full_help(
+            decl,
+            &self.engine_state,
+            &mut self.stack.clone(),
+            self.call.call.head,
+        )
+        .into_spanned(self.call.call.head))
+    }
+
+    fn get_span_contents(&self, span: Span) -> Result<Spanned<Vec<u8>>, ShellError> {
+        Ok(self
+            .engine_state
+            .get_span_contents(span)
+            .to_vec()
+            .into_spanned(self.call.call.head))
+    }
+
+    fn eval_closure(
+        &self,
+        _closure: Spanned<Closure>,
+        _positional: Vec<Value>,
+        _input: PipelineData,
+        _redirect_stdout: bool,
+        _redirect_stderr: bool,
+    ) -> Result<PipelineData, ShellError> {
+        Err(ShellError::NushellFailed {
+            msg: "eval_closure not implemented for PluginGetDynamicCompletionContext".into(),
+        })
+    }
+
+    fn find_decl(&self, _name: &str) -> Result<Option<DeclId>, ShellError> {
+        Err(ShellError::NushellFailed {
+            msg: "find_decl not implemented for PluginGetDynamicCompletionContext".into(),
+        })
+    }
+
+    fn get_block_ir(&self, _block_id: BlockId) -> Result<IrBlock, ShellError> {
+        Err(ShellError::NushellFailed {
+            msg: "get_block_ir not implemented for PluginGetDynamicCompletionContext".into(),
+        })
+    }
+
+    fn call_decl(
+        &mut self,
+        _decl_id: DeclId,
+        _call: EvaluatedCall,
+        _input: PipelineData,
+        _redirect_stdout: bool,
+        _redirect_stderr: bool,
+    ) -> Result<PipelineData, ShellError> {
+        Err(ShellError::NushellFailed {
+            msg: "call_decl not implemented for PluginGetDynamicCompletionContext".into(),
+        })
+    }
+
+    fn boxed(&self) -> Box<dyn PluginExecutionContext + 'static> {
+        Box::new(PluginGetDynamicCompletionContext {
             identity: self.identity.clone(),
             engine_state: Cow::Owned(self.engine_state.clone().into_owned()),
             stack: self.stack.owned(),

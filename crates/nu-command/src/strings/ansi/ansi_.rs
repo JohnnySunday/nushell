@@ -1,7 +1,7 @@
 use nu_ansi_term::*;
 use nu_engine::command_prelude::*;
 use nu_protocol::Parameter;
-use nu_protocol::{Signals, engine::StateWorkingSet};
+use nu_protocol::{Signals, engine::StateWorkingSet, shell_error::generic::GenericError};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -649,31 +649,31 @@ Operating system commands:
         vec![
             Example {
                 description: "Change color to green (see how the next example text will be green!)",
-                example: r#"ansi green"#,
+                example: "ansi green",
                 result: Some(Value::test_string("\u{1b}[32m")),
             },
             Example {
                 description: "Reset all styles and colors",
-                example: r#"ansi reset"#,
+                example: "ansi reset",
                 result: Some(Value::test_string("\u{1b}[0m")),
             },
             Example {
                 description: "Use different colors and styles in the same text",
-                example: r#"$'(ansi red_bold)Hello(ansi reset) (ansi green_dimmed)Nu(ansi reset) (ansi purple_italic)World(ansi reset)'"#,
+                example: "$'(ansi red_bold)Hello(ansi reset) (ansi green_dimmed)Nu(ansi reset) (ansi purple_italic)World(ansi reset)'",
                 result: Some(Value::test_string(
                     "\u{1b}[1;31mHello\u{1b}[0m \u{1b}[2;32mNu\u{1b}[0m \u{1b}[3;35mWorld\u{1b}[0m",
                 )),
             },
             Example {
                 description: "The same example as above with short names",
-                example: r#"$'(ansi rb)Hello(ansi rst) (ansi gd)Nu(ansi rst) (ansi pi)World(ansi rst)'"#,
+                example: "$'(ansi rb)Hello(ansi rst) (ansi gd)Nu(ansi rst) (ansi pi)World(ansi rst)'",
                 result: Some(Value::test_string(
                     "\u{1b}[1;31mHello\u{1b}[0m \u{1b}[2;32mNu\u{1b}[0m \u{1b}[3;35mWorld\u{1b}[0m",
                 )),
             },
             Example {
                 description: "Avoid resetting color when setting/resetting different style codes",
-                example: r#"$'Set color to (ansi g)GREEN then style to (ansi bo)BOLD(ansi rst_bo) or (ansi d)DIMMED(ansi rst_d) or (ansi i)ITALICS(ansi rst_i) or (ansi u)UNDERLINE(ansi rst_u) or (ansi re)REVERSE(ansi rst_re) or (ansi h)HIDDEN(ansi rst_h) or (ansi s)STRIKE(ansi rst_s) then (ansi rst)reset everything'"#,
+                example: "$'Set color to (ansi g)GREEN then style to (ansi bo)BOLD(ansi rst_bo) or (ansi d)DIMMED(ansi rst_d) or (ansi i)ITALICS(ansi rst_i) or (ansi u)UNDERLINE(ansi rst_u) or (ansi re)REVERSE(ansi rst_re) or (ansi h)HIDDEN(ansi rst_h) or (ansi s)STRIKE(ansi rst_s) then (ansi rst)reset everything'",
                 result: Some(Value::test_string(
                     "Set color to \u{1b}[32mGREEN then style to \u{1b}[1mBOLD\u{1b}[22m or \u{1b}[2mDIMMED\u{1b}[22m or \u{1b}[3mITALICS\u{1b}[23m or \u{1b}[4mUNDERLINE\u{1b}[24m or \u{1b}[7mREVERSE\u{1b}[27m or \u{1b}[8mHIDDEN\u{1b}[28m or \u{1b}[9mSTRIKE\u{1b}[29m then \u{1b}[0mreset everything",
                 )),
@@ -810,12 +810,13 @@ Operating system commands:
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let list: bool = call.has_flag_const(working_set, "list")?;
-        let escape: bool = call.has_flag_const(working_set, "escape")?;
-        let osc: bool = call.has_flag_const(working_set, "osc")?;
+        let list: bool = call.has_flag_const(working_set, stack, "list")?;
+        let escape: bool = call.has_flag_const(working_set, stack, "escape")?;
+        let osc: bool = call.has_flag_const(working_set, stack, "osc")?;
         let use_ansi_coloring = working_set
             .get_config()
             .use_ansi_coloring
@@ -832,7 +833,7 @@ Operating system commands:
         // The code can now be one of the ansi abbreviations like green_bold
         // or it can be a record like this: { fg: "#ff0000" bg: "#00ff00" attr: bli }
         // this record is defined in nu-color-config crate
-        let code: Value = match call.opt_const(working_set, 0)? {
+        let code: Value = match call.opt_const(working_set, stack, 0)? {
             Some(c) => c,
             None => {
                 return Err(ShellError::MissingParameter {
@@ -921,13 +922,11 @@ fn heavy_lifting(
                     None => Color::White.prefix().to_string(),
                 },
                 Err(err) => {
-                    return Err(ShellError::GenericError {
-                        error: "error parsing hex color".into(),
-                        msg: format!("{err}"),
-                        span: Some(code.span()),
-                        help: None,
-                        inner: vec![],
-                    });
+                    return Err(ShellError::Generic(GenericError::new(
+                        "error parsing hex color",
+                        format!("{err}"),
+                        code.span(),
+                    )));
                 }
             }
         } else {
@@ -997,7 +996,7 @@ fn generate_ansi_code_list(
                 // The first 409 items in the ansi array are previewable
                 let preview = if i < 409 {
                     Value::string(
-                        format!("\u{1b}[0m{}NUSHELL\u{1b}[0m", &ansi_code.code),
+                        format!("\u{1b}[0m{}NUSHELL\u{1b}[0m", ansi_code.code),
                         call_span,
                     )
                 } else {
@@ -1037,20 +1036,18 @@ fn build_ansi_hashmap(v: &[AnsiCode]) -> HashMap<&str, &str> {
 
 #[cfg(test)]
 mod tests {
-    use crate::strings::ansi::ansi_::Ansi;
+    use crate::strings::ansi::ansi_::{Ansi, CODE_LIST};
+    use nu_test_support::prelude::*;
+    use rstest::rstest;
+    use std::collections::HashSet;
 
     #[test]
-    fn examples_work_as_expected() {
-        use crate::test_examples;
-
-        test_examples(Ansi {})
+    fn examples_work_as_expected() -> Result {
+        test().examples(Ansi)
     }
 
     #[test]
     fn no_duplicate_short_names() {
-        use crate::strings::ansi::ansi_::CODE_LIST;
-        use std::collections::HashSet;
-
         let mut seen = HashSet::new();
         let mut duplicates = Vec::new();
 
@@ -1070,9 +1067,6 @@ mod tests {
 
     #[test]
     fn no_duplicate_long_names() {
-        use crate::strings::ansi::ansi_::CODE_LIST;
-        use std::collections::HashSet;
-
         let mut seen = HashSet::new();
         let mut duplicates = Vec::new();
 
@@ -1089,43 +1083,56 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_attr_field_parsing() {
-        use nu_test_support::nu;
-
-        // Test single attribute code
-        let result = nu!("ansi --escape { fg: \"#0000ff\" attr: b }");
-        assert!(result.status.success());
-        assert!(result.out.contains("\x1b[1;38;2;0;0;255m")); // Bold + blue foreground (true color)
-
-        // Test single attribute name
-        let result = nu!("ansi --escape { fg: \"#0000ff\" attr: underline }");
-        assert!(result.status.success());
-        assert!(result.out.contains("\x1b[4;38;2;0;0;255m")); // Underline + blue foreground (true color)
-
-        // Test different field orders
-        let result = nu!("ansi --escape { attr: b fg: \"#0000ff\" }");
-        assert!(result.status.success());
-        assert!(result.out.contains("\x1b[1;38;2;0;0;255m")); // Bold + blue foreground (true color)
-
-        let result = nu!("ansi --escape { bg: \"#ff0000\" attr: b fg: \"#0000ff\" }");
-        assert!(result.status.success());
-        assert!(result.out.contains("\x1b[1;48;2;255;0;0;38;2;0;0;255m")); // Bold + red bg + blue fg (true color)
+    #[rstest]
+    #[case::single_attribute_code(
+        "ansi --escape { fg: \"#0000ff\" attr: b }",
+        "\x1b[1;38;2;0;0;255m"
+    )]
+    #[case::single_attribute_name(
+        "ansi --escape { fg: \"#0000ff\" attr: underline }",
+        "\x1b[4;38;2;0;0;255m"
+    )]
+    #[case::different_field_order(
+        "ansi --escape { attr: b fg: \"#0000ff\" }",
+        "\x1b[1;38;2;0;0;255m"
+    )]
+    #[case::foreground_background_and_attribute(
+        "ansi --escape { bg: \"#ff0000\" attr: b fg: \"#0000ff\" }",
+        "\x1b[1;48;2;255;0;0;38;2;0;0;255m"
+    )]
+    fn test_attr_field_parsing(#[case] code: &str, #[case] expected: &str) -> Result {
+        test().run(code).expect_value_eq(expected)
     }
 
-    #[test]
-    fn test_attr_field_rejection() {
-        use nu_test_support::nu;
+    #[rstest]
+    #[case::comma_separated_string(
+        "ansi --escape { fg: \"#0000ff\" attr: \"b,underline\" }",
+        "Invalid ANSI attribute format",
+        Some(
+            "Use attr: [code1, code2] or attr: [name1, name2] instead of comma-separated strings."
+        )
+    )]
+    #[case::invalid_attribute(
+        "ansi --escape { fg: \"#0000ff\" attr: invalid }",
+        "Invalid ANSI attribute name",
+        Some(
+            "Valid names are: bold, italic, underline, strike, dimmed, reverse, hidden, blink, normal"
+        )
+    )]
+    fn test_attr_field_rejection(
+        #[case] code: &str,
+        #[case] expected_error: &str,
+        #[case] expected_help: Option<&str>,
+    ) -> Result {
+        let err = test().run(code).expect_shell_error()?;
 
-        // Test comma-separated string rejection
-        let result = nu!("ansi --escape { fg: \"#0000ff\" attr: \"b,underline\" }");
-        assert!(result.err.contains("Invalid ANSI attribute format"));
-        assert!(result.err.contains(
-            "Use attr: [code1, code2] or attr: [name1, name2] instead of comma-separated strings"
-        ));
+        let ShellError::Generic(err) = err else {
+            panic!("expected generic error, got {err:?}");
+        };
 
-        // Test invalid attribute
-        let result = nu!("ansi --escape { fg: \"#0000ff\" attr: invalid }");
-        assert!(result.err.contains("Invalid ANSI attribute name"));
+        assert_eq!(err.error, expected_error);
+        assert_eq!(err.help.as_deref(), expected_help);
+
+        Ok(())
     }
 }

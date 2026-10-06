@@ -40,7 +40,7 @@ let target = $env.TARGET
 # Repo source dir like `/home/runner/work/nushell/nushell`
 let src = $env.GITHUB_WORKSPACE
 let dist = $'($env.GITHUB_WORKSPACE)/output'
-let version = (open Cargo.toml | get package.version)
+let version = (open Cargo.toml | get workspace.package.version)
 
 print $'Debugging info:'
 print { version: $version, bin: $bin, os: $os, target: $target, src: $src, dist: $dist }; hr-line -b
@@ -235,9 +235,10 @@ def fetch-less [
 
 def 'cargo-build-nu' [] {
     if $os =~ 'windows' {
-        cargo build --release --all --target $target
+        cargo build --release --workspace --exclude nu-test-support --target $target
     } else {
-        cargo build --release --all --target $target --features=static-link-openssl
+        # Exclude nu-test-support for loongarch64 to avoid build error
+        cargo build --release --workspace --exclude nu-test-support --target $target --features=static-link-openssl
     }
 }
 

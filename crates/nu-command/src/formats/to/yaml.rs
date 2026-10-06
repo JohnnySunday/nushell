@@ -1,5 +1,5 @@
 use nu_engine::command_prelude::*;
-use nu_protocol::ast::PathMember;
+use nu_heavy_utils::yaml::{NonRoundtrip, SerializeOptions};
 
 #[derive(Clone)]
 pub struct ToYamlLike(&'static str);
@@ -19,6 +19,46 @@ impl Command for ToYamlLike {
                 "Serialize nushell types that cannot be deserialized.",
                 Some('s'),
             )
+            .param(
+                Flag::new("non-roundtrip")
+                    .arg(SyntaxShape::OneOf(vec![
+                        SyntaxShape::String,
+                        SyntaxShape::Nothing,
+                    ]))
+                    .desc("How to handle values that are non-roundtrippable.")
+                    .completion(Completion::new_list(&["error", "null", "lossy"])),
+            )
+            .param(
+                Flag::new("spec")
+                    .arg(SyntaxShape::String)
+                    .desc("YAML spec version ('1.1' or '1.2' (default)).")
+                    .completion(Completion::new_list(&["1.1", "1.2"])),
+            )
+            .switch("add-directives", "Add YAML document directives.", Some('d'))
+            .switch(
+                "multiple",
+                "Given a list, serialize a multi document stream.",
+                Some('m'),
+            )
+            .named(
+                "indent",
+                SyntaxShape::Int,
+                "Configure the indent.",
+                Some('i'),
+            )
+            .param(
+                Flag::new("list-indent")
+                    .arg(SyntaxShape::String)
+                    .desc("Nested list indentation style ('compact' (default) or 'indented')")
+                    .completion(Completion::new_list(&["compact", "indented"])),
+            )
+            .param(
+                Flag::new("quote")
+                    .short('q')
+                    .arg(SyntaxShape::String)
+                    .desc("String quote style ('auto' (default), 'single' or 'double')")
+                    .completion(Completion::new_list(&["auto", "single", "double"])),
+            )
             .category(Category::Formats)
     }
 
@@ -27,15 +67,26 @@ impl Command for ToYamlLike {
     }
 
     fn examples(&self) -> Vec<Example<'_>> {
-        vec![Example {
-            description: "Outputs a YAML string representing the contents of this table.",
-            example: match self.name() {
-                "to yaml" => r#"[[foo bar]; ["1" "2"]] | to yaml"#,
-                "to yml" => r#"[[foo bar]; ["1" "2"]] | to yml"#,
-                _ => unreachable!("only implemented for `yaml` and `yml`"),
+        vec![
+            Example {
+                description: "Outputs a YAML string representing the contents of this table.",
+                example: match self.name() {
+                    "to yaml" => r#"[[foo bar]; ["1" "2"]] | to yaml"#,
+                    "to yml" => r#"[[foo bar]; ["1" "2"]] | to yml"#,
+                    _ => unreachable!("only implemented for `yaml` and `yml`"),
+                },
+                result: Some(Value::test_string("- foo: \"1\"\n  bar: \"2\"\n")),
             },
-            result: Some(Value::test_string("- foo: '1'\n  bar: '2'\n")),
-        }]
+            Example {
+                description: "Convert a nushell specific type into YAML.",
+                example: match self.name() {
+                    "to yaml" => "$.1.abc | to yaml",
+                    "to yml" => "$.1.abc | to yml",
+                    _ => unreachable!("only implemented for `yaml` and `yml`"),
+                },
+                result: Some(Value::test_string("!cell-path $.1.abc\n")),
+            },
+        ]
     }
 
     fn run(
@@ -43,166 +94,94 @@ impl Command for ToYamlLike {
         engine_state: &EngineState,
         stack: &mut Stack,
         call: &Call,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let head = call.head;
-        let serialize_types = call.has_flag(engine_state, stack, "serialize")?;
-        let input = input.try_expand_range()?;
-
-        to_yaml(engine_state, input, head, serialize_types)
-    }
-}
-
-pub fn value_to_yaml_value(
-    engine_state: &EngineState,
-    v: &Value,
-    serialize_types: bool,
-) -> Result<serde_yaml::Value, ShellError> {
-    Ok(match &v {
-        Value::Bool { val, .. } => serde_yaml::Value::Bool(*val),
-        Value::Int { val, .. } => serde_yaml::Value::Number(serde_yaml::Number::from(*val)),
-        Value::Filesize { val, .. } => {
-            serde_yaml::Value::Number(serde_yaml::Number::from(val.get()))
-        }
-        Value::Duration { val, .. } => serde_yaml::Value::String(val.to_string()),
-        Value::Date { val, .. } => serde_yaml::Value::String(val.to_string()),
-        Value::Range { .. } => serde_yaml::Value::Null,
-        Value::Float { val, .. } => serde_yaml::Value::Number(serde_yaml::Number::from(*val)),
-        Value::String { val, .. } | Value::Glob { val, .. } => {
-            serde_yaml::Value::String(val.clone())
-        }
-        Value::Record { val, .. } => {
-            let mut m = serde_yaml::Mapping::new();
-            for (k, v) in &**val {
-                m.insert(
-                    serde_yaml::Value::String(k.clone()),
-                    value_to_yaml_value(engine_state, v, serialize_types)?,
-                );
-            }
-            serde_yaml::Value::Mapping(m)
-        }
-        Value::List { vals, .. } => {
-            let mut out = vec![];
-
-            for value in vals {
-                out.push(value_to_yaml_value(engine_state, value, serialize_types)?);
-            }
-
-            serde_yaml::Value::Sequence(out)
-        }
-        Value::Closure { val, .. } => {
-            if serialize_types {
-                let block = engine_state.get_block(val.block_id);
-                if let Some(span) = block.span {
-                    let contents_bytes = engine_state.get_span_contents(span);
-                    let contents_string = String::from_utf8_lossy(contents_bytes);
-                    serde_yaml::Value::String(contents_string.to_string())
-                } else {
-                    serde_yaml::Value::String(format!(
-                        "unable to retrieve block contents for yaml block_id {}",
-                        val.block_id.get()
-                    ))
-                }
-            } else {
-                serde_yaml::Value::Null
-            }
-        }
-        Value::Nothing { .. } => serde_yaml::Value::Null,
-        Value::Error { error, .. } => return Err(*error.clone()),
-        Value::Binary { val, .. } => serde_yaml::Value::Sequence(
-            val.iter()
-                .map(|x| serde_yaml::Value::Number(serde_yaml::Number::from(*x)))
-                .collect(),
-        ),
-        Value::CellPath { val, .. } => serde_yaml::Value::Sequence(
-            val.members
-                .iter()
-                .map(|x| match &x {
-                    PathMember::String { val, .. } => Ok(serde_yaml::Value::String(val.clone())),
-                    PathMember::Int { val, .. } => {
-                        Ok(serde_yaml::Value::Number(serde_yaml::Number::from(*val)))
-                    }
-                })
-                .collect::<Result<Vec<serde_yaml::Value>, ShellError>>()?,
-        ),
-        Value::Custom { .. } => serde_yaml::Value::Null,
-    })
-}
-
-fn to_yaml(
-    engine_state: &EngineState,
-    input: PipelineData,
-    head: Span,
-    serialize_types: bool,
-) -> Result<PipelineData, ShellError> {
-    let metadata = input
-        .metadata()
-        .unwrap_or_default()
-        // Per RFC-9512, application/yaml should be used
-        .with_content_type(Some("application/yaml".into()));
-    let value = input.into_value(head)?;
-
-    let yaml_value = value_to_yaml_value(engine_state, &value, serialize_types)?;
-    match serde_yaml::to_string(&yaml_value) {
-        Ok(serde_yaml_string) => {
-            Ok(Value::string(serde_yaml_string, head)
-                .into_pipeline_data_with_metadata(Some(metadata)))
-        }
-        _ => Ok(Value::error(
-            ShellError::CantConvert {
-                to_type: "YAML".into(),
-                from_type: value.get_type().to_string(),
-                span: head,
-                help: None,
+        let metadata = input
+            .take_metadata()
+            .unwrap_or_default()
+            .with_content_type(Some(String::from("application/yaml")));
+        let value = input.into_value(call.head)?;
+        let spec = call.get_flag(engine_state, stack, "spec")?;
+        let add_directives = call.has_flag(engine_state, stack, "add-directives")?;
+        let multiple = call.has_flag(engine_state, stack, "multiple")?;
+        let indent = call.get_flag(engine_state, stack, "indent")?;
+        let list_indent_style = call.get_flag(engine_state, stack, "list-indent")?;
+        let quote_style = call.get_flag(engine_state, stack, "quote")?;
+        let non_roundtrip =
+            call.get_flag::<Spanned<Option<String>>>(engine_state, stack, "non-roundtrip")?;
+        let non_roundtrip = match (
+            call.has_flag(engine_state, stack, "serialize")?,
+            non_roundtrip
+                .as_ref()
+                .map(|nr| nr.item.as_ref().map(|nr| nr.as_ref())),
+        ) {
+            // matching the spanned is way less comprehendible here, so we expect spans instead
+            (false, None | Some(Some("error"))) => NonRoundtrip::Error,
+            (true, None | Some(Some("lossy"))) => NonRoundtrip::Lossy {
+                engine_state: Box::new(engine_state.clone()),
             },
-            head,
-        )
-        .into_pipeline_data_with_metadata(Some(metadata))),
+            (false, Some(Some("null") | None)) => NonRoundtrip::Null,
+            (false, Some(_)) => {
+                return Err(ShellError::IncompatibleParametersSingle {
+                    msg: "expected `error`, `null` or `lossy`".into(),
+                    span: non_roundtrip.expect("non_roundtrip is some").span,
+                });
+            }
+            (true, Some(_)) => {
+                return Err(ShellError::IncompatibleParameters {
+                    left_message: "this is a shorthand to".into(),
+                    left_span: call
+                        .get_flag_span(stack, "serialize")
+                        .expect("serialize is some"),
+                    right_message: "this with `lossy`".into(),
+                    right_span: non_roundtrip.expect("non_roundtrip is some").span,
+                });
+            }
+        };
+
+        match call.has_flag(engine_state, stack, "serialize")? {
+            true => NonRoundtrip::Lossy {
+                engine_state: Box::new(engine_state.clone()),
+            },
+            false => NonRoundtrip::Null,
+        };
+
+        let defaults = SerializeOptions::default();
+        let options = SerializeOptions::default()
+            .with_spec(spec.unwrap_or(defaults.spec))
+            .with_non_roundtrip(non_roundtrip)
+            .with_add_directives(add_directives)
+            .with_multiple(multiple)
+            .with_indent(indent.unwrap_or(defaults.indent))
+            .with_list_indent_style(list_indent_style.unwrap_or(defaults.list_indent_style))
+            .with_quote_style(quote_style.unwrap_or(defaults.quote_style));
+
+        nu_heavy_utils::yaml::serialize(&value, call.head, options)
+            .map(|s| PipelineData::value(Value::string(s, call.head), metadata))
     }
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
-    use crate::{Get, Metadata};
-    use nu_cmd_lang::eval_pipeline_without_terminal_expression;
+    use nu_test_support::prelude::{Result, *};
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(TO_YAML);
-        test_examples(TO_YML);
+    fn test_examples() -> Result {
+        test().examples(TO_YAML)?;
+        test().examples(TO_YML)?;
+        Ok(())
     }
 
     #[test]
-    fn test_content_type_metadata() {
-        let mut engine_state = Box::new(EngineState::new());
-        let delta = {
-            // Base functions that are needed for testing
-            // Try to keep this working set small to keep tests running as fast as possible
-            let mut working_set = StateWorkingSet::new(&engine_state);
+    fn test_content_type_metadata() -> Result {
+        let code = "
+            {a: 1, b: 2}
+            | to yaml
+            | metadata
+            | get content_type
+        ";
 
-            working_set.add_decl(Box::new(TO_YAML));
-            working_set.add_decl(Box::new(Metadata {}));
-            working_set.add_decl(Box::new(Get {}));
-
-            working_set.render()
-        };
-
-        engine_state
-            .merge_delta(delta)
-            .expect("Error merging delta");
-
-        let cmd = "{a: 1 b: 2} | to yaml  | metadata | get content_type | $in";
-        let result = eval_pipeline_without_terminal_expression(
-            cmd,
-            std::env::temp_dir().as_ref(),
-            &mut engine_state,
-        );
-        assert_eq!(
-            Value::test_string("application/yaml"),
-            result.expect("There should be a result")
-        );
+        test().run(code).expect_value_eq("application/yaml")
     }
 }

@@ -9,6 +9,7 @@ use crate::{
 use super::super::super::values::NuDataFrame;
 
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
+use nu_protocol::shell_error::generic::GenericError;
 use nu_protocol::{Category, Example, LabeledError, PipelineData, ShellError, Signature, Span};
 use polars::{
     prelude::{DatetimeMethods, IntoSeries, NamedFrom, col},
@@ -42,6 +43,10 @@ impl PluginCommand for GetHour {
                 ),
                 (
                     PolarsPluginType::NuExpression.into(),
+                    PolarsPluginType::NuExpression.into(),
+                ),
+                (
+                    PolarsPluginType::NuSelector.into(),
                     PolarsPluginType::NuExpression.into(),
                 ),
             ])
@@ -100,9 +105,9 @@ impl PluginCommand for GetHour {
         plugin: &Self::Plugin,
         engine: &EngineInterface,
         call: &EvaluatedCall,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
-        let metadata = input.metadata();
+        let metadata = input.take_metadata();
         command(plugin, engine, call, input)
             .map_err(LabeledError::from)
             .map(|pd| pd.set_metadata(metadata))
@@ -130,6 +135,7 @@ fn command(
                 PolarsPluginType::NuDataFrame,
                 PolarsPluginType::NuLazyFrame,
                 PolarsPluginType::NuExpression,
+                PolarsPluginType::NuSelector,
             ],
         )),
     }
@@ -153,12 +159,12 @@ fn command_eager(
 ) -> Result<PipelineData, ShellError> {
     let series = df.as_series(call.head)?;
 
-    let casted = series.datetime().map_err(|e| ShellError::GenericError {
-        error: "Error casting to datetime type".into(),
-        msg: e.to_string(),
-        span: Some(call.head),
-        help: None,
-        inner: vec![],
+    let casted = series.datetime().map_err(|e| {
+        ShellError::Generic(GenericError::new(
+            "Error casting to datetime type",
+            e.to_string(),
+            call.head,
+        ))
     })?;
 
     let res = casted.hour().into_series();

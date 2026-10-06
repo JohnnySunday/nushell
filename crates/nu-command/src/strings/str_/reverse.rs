@@ -56,10 +56,11 @@ impl Command for StrReverse {
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let cell_paths: Vec<CellPath> = call.rest_const(working_set, 0)?;
+        let cell_paths: Vec<CellPath> = call.rest_const(working_set, stack, 0)?;
         let args = CellPathOnlyArgs::from(cell_paths);
         operate(
             action,
@@ -114,9 +115,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(StrReverse {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(StrReverse)
     }
 }

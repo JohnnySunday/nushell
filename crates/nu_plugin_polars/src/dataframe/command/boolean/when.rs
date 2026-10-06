@@ -41,9 +41,10 @@ impl PluginCommand for ExprWhen {
                     PolarsPluginType::NuExpression.into(),
                     PolarsPluginType::NuExpression.into(),
                 ),
-                // FIXME Type::Any input added to disable pipeline input type checking, as run-time checks can raise undesirable type errors
-                // which aren't caught by the parser. see https://github.com/nushell/nushell/pull/14922 for more details
-                (Type::Any, PolarsPluginType::NuExpression.into()),
+                (
+                    PolarsPluginType::NuSelector.into(),
+                    PolarsPluginType::NuExpression.into(),
+                ),
             ])
             .category(Category::Custom("expression".into()))
     }
@@ -92,6 +93,7 @@ impl PluginCommand for ExprWhen {
                             ),
                         ],
                         None,
+                        Span::test_data(),
                     )
                     .expect("simple df for test should not fail")
                     .into_value(Span::test_data()),
@@ -109,15 +111,15 @@ impl PluginCommand for ExprWhen {
         plugin: &Self::Plugin,
         engine: &EngineInterface,
         call: &EvaluatedCall,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
-        let metadata = input.metadata();
         let when_predicate: Value = call.req(0)?;
         let when_predicate = NuExpression::try_from_value(plugin, &when_predicate)?;
 
         let then_predicate: Value = call.req(1)?;
         let then_predicate = NuExpression::try_from_value(plugin, &then_predicate)?;
 
+        let metadata = input.take_metadata();
         let value = input.into_value(call.head)?;
         let when_then: NuWhen = match value {
             Value::Nothing { .. } => when(when_predicate.into_polars())

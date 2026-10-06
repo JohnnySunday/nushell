@@ -1,31 +1,16 @@
 use nu_test_support::fs::Stub::{EmptyFile, FileWithContent, FileWithContentToBeTrimmed};
-use nu_test_support::nu;
-use nu_test_support::playground::Playground;
+use nu_test_support::prelude::*;
+use pretty_assertions::assert_matches;
+use rstest::{Context, rstest};
 
-#[should_panic]
 #[test]
-fn sources_also_files_under_custom_lib_dirs_path() {
+fn source_env_resolves_nested_source_relative_to_sourced_file() -> Result {
     Playground::setup("source_test_1", |dirs, nu| {
-        let file = dirs.test().join("config.toml");
-        let library_path = dirs.test().join("lib");
-
-        nu.with_config(file);
-        nu.with_files(&[FileWithContent(
-            "config.toml",
-            &format!(
-                r#"
-                lib_dirs = ["{}"]
-                skip_welcome_message = true
-            "#,
-                library_path.as_os_str().to_str().unwrap(),
-            ),
-        )]);
-
         nu.within("lib").with_files(&[FileWithContent(
             "my_library.nu",
-            r#"
+            "
                 source-env my_library/main.nu
-            "#,
+            ",
         )]);
         nu.within("lib/my_library").with_files(&[FileWithContent(
             "main.nu",
@@ -34,102 +19,53 @@ fn sources_also_files_under_custom_lib_dirs_path() {
             "#,
         )]);
 
-        let actual = nu!("
-            source-env my_library.nu ;
-        
-            hello
-        ");
-
-        assert_eq!(actual.out, "hello nu");
+        let mut tester = test().cwd(dirs.test());
+        let () = tester.run("source-env lib/my_library.nu")?;
+        tester.run("$env.hello").expect_value_eq("hello nu")
     })
 }
 
-fn try_source_foo_with_double_quotes_in(testdir: &str, playdir: &str) {
-    Playground::setup(playdir, |dirs, sandbox| {
-        let testdir = String::from(testdir);
-        let mut foo_file = testdir.clone();
-        foo_file.push_str("/foo.nu");
+#[rstest]
+#[case::normal_dir_single_quotes("foo", "'")]
+#[case::normal_dir_double_quotes("foo", "\"")]
+#[case::normal_dir_without_quotes("foo", "")]
+#[case::unicode_dir_single_quotes("🚒", "'")]
+#[case::unicode_dir_double_quotes("🚒", "\"")]
+#[case::unicode_dir_without_quotes("🚒", "")]
+#[case::unicode_spaced_dir_single_quotes("e-$ èрт🚒♞中片-j", "'")]
+#[case::unicode_spaced_dir_double_quotes("e-$ èрт🚒♞中片-j", "\"")]
+fn sources_unicode_file(#[context] ctx: Context, #[case] dir: &str, #[case] quote: &str) -> Result {
+    Playground::setup(ctx.description.unwrap(), |dirs, sandbox| {
+        let file = String::from_iter([dir, "/foo.nu"]);
+        sandbox.mkdir(dir);
+        sandbox.with_files(&[FileWithContent(&file, "echo foo")]);
 
-        sandbox.mkdir(&testdir);
-        sandbox.with_files(&[FileWithContent(&foo_file, "echo foo")]);
-
-        let cmd = String::from("source-env ") + r#"""# + foo_file.as_str() + r#"""#;
-
-        let actual = nu!(cwd: dirs.test(), &cmd);
-
-        assert_eq!(actual.out, "foo");
-    });
-}
-
-fn try_source_foo_with_single_quotes_in(testdir: &str, playdir: &str) {
-    Playground::setup(playdir, |dirs, sandbox| {
-        let testdir = String::from(testdir);
-        let mut foo_file = testdir.clone();
-        foo_file.push_str("/foo.nu");
-
-        sandbox.mkdir(&testdir);
-        sandbox.with_files(&[FileWithContent(&foo_file, "echo foo")]);
-
-        let cmd = String::from("source-env ") + r#"'"# + foo_file.as_str() + r#"'"#;
-
-        let actual = nu!(cwd: dirs.test(), &cmd);
-
-        assert_eq!(actual.out, "foo");
-    });
-}
-
-fn try_source_foo_without_quotes_in(testdir: &str, playdir: &str) {
-    Playground::setup(playdir, |dirs, sandbox| {
-        let testdir = String::from(testdir);
-        let mut foo_file = testdir.clone();
-        foo_file.push_str("/foo.nu");
-
-        sandbox.mkdir(&testdir);
-        sandbox.with_files(&[FileWithContent(&foo_file, "echo foo")]);
-
-        let cmd = String::from("source-env ") + foo_file.as_str();
-
-        let actual = nu!(cwd: dirs.test(), &cmd);
-
-        assert_eq!(actual.out, "foo");
-    });
-}
-
-#[test]
-fn sources_unicode_file_in_normal_dir() {
-    try_source_foo_with_single_quotes_in("foo", "source_test_1");
-    try_source_foo_with_double_quotes_in("foo", "source_test_2");
-    try_source_foo_without_quotes_in("foo", "source_test_3");
-}
-
-#[test]
-fn sources_unicode_file_in_unicode_dir_without_spaces_1() {
-    try_source_foo_with_single_quotes_in("🚒", "source_test_4");
-    try_source_foo_with_double_quotes_in("🚒", "source_test_5");
-    try_source_foo_without_quotes_in("🚒", "source_test_6");
+        let cmd = format!("source-env {quote}{file}{quote}");
+        test().cwd(dirs.test()).run(&cmd).expect_value_eq("foo")
+    })
 }
 
 #[cfg(not(windows))] // ':' is not allowed in Windows paths
-#[test]
-fn sources_unicode_file_in_unicode_dir_without_spaces_2() {
-    try_source_foo_with_single_quotes_in(":fire_engine:", "source_test_7");
-    try_source_foo_with_double_quotes_in(":fire_engine:", "source_test_8");
-    try_source_foo_without_quotes_in(":fire_engine:", "source_test_9");
-}
+#[rstest]
+#[case::colon_dir_single_quotes(":fire_engine:", "'")]
+#[case::colon_dir_double_quotes(":fire_engine:", "\"")]
+#[case::colon_dir_without_quotes(":fire_engine:", "")]
+#[case::colon_spaced_dir_single_quotes("e-$ èрт:fire_engine:♞中片-j", "'")]
+#[case::colon_spaced_dir_double_quotes("e-$ èрт:fire_engine:♞中片-j", "\"")]
+#[nu_test_support::test]
+fn sources_unicode_file_in_colon_dir(
+    #[context] ctx: Context,
+    #[case] dir: &str,
+    #[case] quote: &str,
+) -> Result {
+    Playground::setup(ctx.description.unwrap(), |dirs, sandbox| {
+        let file = String::from_iter([dir, "/foo.nu"]);
+        sandbox.mkdir(dir);
+        sandbox.with_files(&[FileWithContent(&file, "echo foo")]);
 
-#[test]
-fn sources_unicode_file_in_unicode_dir_with_spaces_1() {
-    // this one fails
-    try_source_foo_with_single_quotes_in("e-$ èрт🚒♞中片-j", "source_test_8");
-    // this one passes
-    try_source_foo_with_double_quotes_in("e-$ èрт🚒♞中片-j", "source_test_9");
-}
-
-#[cfg(not(windows))] // ':' is not allowed in Windows paths
-#[test]
-fn sources_unicode_file_in_unicode_dir_with_spaces_2() {
-    try_source_foo_with_single_quotes_in("e-$ èрт:fire_engine:♞中片-j", "source_test_10");
-    try_source_foo_with_double_quotes_in("e-$ èрт:fire_engine:♞中片-j", "source_test_11");
+        let cmd = format!("source-env {quote}{file}{quote}");
+        test().cwd(dirs.test()).run(&cmd).expect_value_eq("foo")
+    })
 }
 
 #[ignore]
@@ -140,212 +76,185 @@ fn sources_unicode_file_in_non_utf8_dir() {
 
 #[ignore]
 #[test]
-fn can_source_dynamic_path() {
+fn can_source_dynamic_path() -> Result {
     Playground::setup("can_source_dynamic_path", |dirs, sandbox| {
         let foo_file = "foo.nu";
-
         sandbox.with_files(&[FileWithContent(foo_file, "echo foo")]);
 
         let cmd = format!("let file = `{foo_file}`; source-env $file");
-        let actual = nu!(cwd: dirs.test(), &cmd);
-
-        assert_eq!(actual.out, "foo");
-    });
+        test().cwd(dirs.test()).run(&cmd).expect_value_eq("foo")
+    })
 }
 
 #[test]
-fn source_env_eval_export_env() {
+fn source_env_eval_export_env() -> Result {
     Playground::setup("source_env_eval_export_env", |dirs, sandbox| {
         sandbox.with_files(&[FileWithContentToBeTrimmed(
             "spam.nu",
-            r#"
+            "
                 export-env { $env.FOO = 'foo' }
-            "#,
+            ",
         )]);
 
-        let inp = &[r#"source-env spam.nu"#, r#"$env.FOO"#];
-
-        let actual = nu!(cwd: dirs.test(), &inp.join("; "));
-
-        assert_eq!(actual.out, "foo");
+        test()
+            .cwd(dirs.test())
+            .run("source-env spam.nu; $env.FOO")
+            .expect_value_eq("foo")
     })
 }
 
 #[test]
-fn source_env_eval_export_env_hide() {
+fn source_env_eval_export_env_hide() -> Result {
     Playground::setup("source_env_eval_export_env", |dirs, sandbox| {
         sandbox.with_files(&[FileWithContentToBeTrimmed(
             "spam.nu",
-            r#"
+            "
                 export-env { hide-env FOO }
-            "#,
+            ",
         )]);
 
-        let inp = &[
-            r#"$env.FOO = 'foo'"#,
-            r#"source-env spam.nu"#,
-            r#"$env.FOO"#,
-        ];
-
-        let actual = nu!(cwd: dirs.test(), &inp.join("; "));
-
-        assert!(actual.err.contains("not_found"));
+        test()
+            .cwd(dirs.test())
+            .run("$env.FOO = 'foo'; source-env spam.nu; $env.FOO")
+            .expect_error_code_eq("nu::shell::column_not_found")
     })
 }
 
 #[test]
-fn source_env_do_cd() {
+fn source_env_do_cd() -> Result {
     Playground::setup("source_env_do_cd", |dirs, sandbox| {
         sandbox
             .mkdir("test1/test2")
             .with_files(&[FileWithContentToBeTrimmed(
                 "test1/test2/spam.nu",
-                r#"
+                "
                     cd test1/test2
-                "#,
+                ",
             )]);
 
-        let inp = &[
-            r#"source-env test1/test2/spam.nu"#,
-            r#"$env.PWD | path basename"#,
-        ];
-
-        let actual = nu!(cwd: dirs.test(), &inp.join("; "));
-
-        assert_eq!(actual.out, "test2");
+        test()
+            .cwd(dirs.test())
+            .run("source-env test1/test2/spam.nu; $env.PWD | path basename")
+            .expect_value_eq("test2")
     })
 }
 
 #[test]
-fn source_env_do_cd_file_relative() {
+fn source_env_do_cd_file_relative() -> Result {
     Playground::setup("source_env_do_cd_file_relative", |dirs, sandbox| {
         sandbox
             .mkdir("test1/test2")
             .with_files(&[FileWithContentToBeTrimmed(
                 "test1/test2/spam.nu",
-                r#"
+                "
                     cd ($env.FILE_PWD | path join '..')
-                "#,
+                ",
             )]);
 
-        let inp = &[
-            r#"source-env test1/test2/spam.nu"#,
-            r#"$env.PWD | path basename"#,
-        ];
-
-        let actual = nu!(cwd: dirs.test(), &inp.join("; "));
-
-        assert_eq!(actual.out, "test1");
+        test()
+            .cwd(dirs.test())
+            .run("source-env test1/test2/spam.nu; $env.PWD | path basename")
+            .expect_value_eq("test1")
     })
 }
 
 #[test]
-fn source_env_dont_cd_overlay() {
+fn source_env_dont_cd_overlay() -> Result {
     Playground::setup("source_env_dont_cd_overlay", |dirs, sandbox| {
         sandbox
             .mkdir("test1/test2")
             .with_files(&[FileWithContentToBeTrimmed(
                 "test1/test2/spam.nu",
-                r#"
+                "
                     overlay new spam
                     cd test1/test2
                     overlay hide spam
-                "#,
+                ",
             )]);
 
-        let inp = &[
-            r#"source-env test1/test2/spam.nu"#,
-            r#"$env.PWD | path basename"#,
-        ];
-
-        let actual = nu!(cwd: dirs.test(), &inp.join("; "));
-
-        assert_eq!(actual.out, "source_env_dont_cd_overlay");
+        test()
+            .cwd(dirs.test())
+            .run("source-env test1/test2/spam.nu; $env.PWD | path basename")
+            .expect_value_eq("source_env_dont_cd_overlay")
     })
 }
 
 #[test]
-fn source_env_is_scoped() {
+fn source_env_is_scoped() -> Result {
     Playground::setup("source_env_is_scoped", |dirs, sandbox| {
         sandbox.with_files(&[FileWithContentToBeTrimmed(
             "spam.nu",
-            r#"
+            "
                 def no-name-similar-to-this [] { 'no-name-similar-to-this' }
                 alias nor-similar-to-this = echo 'nor-similar-to-this'
-            "#,
+            ",
         )]);
 
-        let inp = &[r#"source-env spam.nu"#, r#"no-name-similar-to-this"#];
-
-        let actual = nu!(cwd: dirs.test(), &inp.join("; "));
-
-        assert!(
-            actual
-                .err
-                .contains("Command `no-name-similar-to-this` not found")
+        let err = test()
+            .cwd(dirs.test())
+            .run("source-env spam.nu; no-name-similar-to-this")
+            .expect_shell_error()?;
+        assert_matches!(
+            err,
+            ShellError::ExternalCommand { label, .. }
+                if label == "Command `no-name-similar-to-this` not found"
         );
 
-        let inp = &[r#"source-env spam.nu"#, r#"nor-similar-to-this"#];
-
-        let actual = nu!(cwd: dirs.test(), &inp.join("; "));
-
-        assert!(
-            actual
-                .err
-                .contains("Command `nor-similar-to-this` not found")
+        let err = test()
+            .cwd(dirs.test())
+            .run("source-env spam.nu; nor-similar-to-this")
+            .expect_shell_error()?;
+        assert_matches!(
+            err,
+            ShellError::ExternalCommand { label, .. }
+                if label == "Command `nor-similar-to-this` not found"
         );
+
+        Ok(())
     })
 }
 
 #[test]
-fn source_env_const_file() {
+fn source_env_const_file() -> Result {
     Playground::setup("source_env_const_file", |dirs, sandbox| {
         sandbox.with_files(&[FileWithContentToBeTrimmed(
             "spam.nu",
-            r#"
+            "
                 $env.FOO = 'foo'
-            "#,
+            ",
         )]);
 
-        let inp = &[
-            r#"const file = 'spam.nu'"#,
-            r#"source-env $file"#,
-            r#"$env.FOO"#,
-        ];
-
-        let actual = nu!(cwd: dirs.test(), &inp.join("; "));
-
-        assert_eq!(actual.out, "foo");
+        test()
+            .cwd(dirs.test())
+            .run("const file = 'spam.nu'; source-env $file; $env.FOO")
+            .expect_value_eq("foo")
     })
 }
 
 #[test]
-fn source_respects_early_return() {
-    let actual = nu!(cwd: "tests/fixtures/formats", "
-        source early_return.nu
-    ");
-
-    assert!(actual.err.is_empty());
+fn source_respects_early_return() -> Result {
+    let _: Value = test()
+        .cwd("tests/fixtures/formats")
+        .run("source early_return.nu")?;
+    Ok(())
 }
 
 #[test]
-fn source_after_use_should_not_error() {
+fn source_after_use_should_not_error() -> Result {
     Playground::setup("source_after_use", |dirs, sandbox| {
         sandbox.with_files(&[EmptyFile("spam.nu")]);
 
-        let inp = &[r#"use spam.nu"#, r#"source spam.nu"#];
-        let actual = nu!(cwd: dirs.test(), &inp.join("; "));
-        assert!(actual.err.is_empty());
+        let () = test().cwd(dirs.test()).run("use spam.nu; source spam.nu")?;
+        Ok(())
     })
 }
 
 #[test]
-fn use_after_source_should_not_error() {
+fn use_after_source_should_not_error() -> Result {
     Playground::setup("use_after_source", |dirs, sandbox| {
         sandbox.with_files(&[EmptyFile("spam.nu")]);
 
-        let inp = &[r#"source spam.nu"#, r#"use spam.nu"#];
-        let actual = nu!(cwd: dirs.test(), &inp.join("; "));
-        assert!(actual.err.is_empty());
+        let () = test().cwd(dirs.test()).run("source spam.nu; use spam.nu")?;
+        Ok(())
     })
 }

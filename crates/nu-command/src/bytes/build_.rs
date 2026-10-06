@@ -52,7 +52,10 @@ impl Command for BytesBuild {
         for val in call.rest::<Value>(engine_state, stack, 0)? {
             let val_span = val.span();
             match val {
-                Value::Binary { mut val, .. } => output.append(&mut val),
+                Value::Binary { val, .. } => {
+                    let mut val = val.into_owned();
+                    output.append(&mut val);
+                }
                 Value::Int { val, .. } => {
                     let byte: u8 = val.try_into().map_err(|_| ShellError::IncorrectValue {
                         msg: format!("{val} is out of range for byte"),
@@ -81,9 +84,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(BytesBuild {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(BytesBuild)
     }
 }

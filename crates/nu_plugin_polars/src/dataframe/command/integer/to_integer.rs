@@ -43,10 +43,16 @@ impl PluginCommand for ToInteger {
                 SyntaxShape::Any,
                 "Data type to cast to (defaults is i64).",
                 )
-            .input_output_type(
-                PolarsPluginType::NuExpression.into(),
-                PolarsPluginType::NuExpression.into(),
-            )
+            .input_output_types(vec![
+                (
+                    PolarsPluginType::NuExpression.into(),
+                    PolarsPluginType::NuExpression.into(),
+                ),
+                (
+                    PolarsPluginType::NuSelector.into(),
+                    PolarsPluginType::NuExpression.into(),
+                ),
+            ])
             .category(Category::Custom("dataframe".into()))
     }
 
@@ -58,6 +64,7 @@ impl PluginCommand for ToInteger {
                 NuDataFrame::try_from_columns(
                     vec![Column::new("b".to_string(), vec![Value::test_int(2)])],
                     None,
+                    Span::test_data(),
                 )
                 .expect("simple df for test should not fail")
                 .into_value(Span::test_data()),
@@ -70,13 +77,16 @@ impl PluginCommand for ToInteger {
         plugin: &Self::Plugin,
         engine: &EngineInterface,
         call: &EvaluatedCall,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
-        let metadata = input.metadata();
+        let metadata = input.take_metadata();
         let value = input.into_value(call.head)?;
         match PolarsPluginObject::try_from_value(plugin, &value)? {
             PolarsPluginObject::NuExpression(expr) => command(plugin, engine, call, expr),
-            _ => Err(cant_convert_err(&value, &[PolarsPluginType::NuExpression])),
+            _ => Err(cant_convert_err(
+                &value,
+                &[PolarsPluginType::NuExpression, PolarsPluginType::NuSelector],
+            )),
         }
         .map_err(LabeledError::from)
         .map(|pd| pd.set_metadata(metadata))

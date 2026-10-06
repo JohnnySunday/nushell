@@ -91,8 +91,12 @@ impl Command for Input {
         .any(|x| *x);
 
         if !use_reedline {
+            // `legacy_input` guards the terminal itself via `RawModeGuard`.
             return self.legacy_input(engine_state, stack, call, input);
         }
+
+        // Reedline grabs the terminal itself, so check the precondition here.
+        stack.require_stdin(call.head)?;
 
         let prompt_str: Option<String> = call.opt(engine_state, stack, 0)?;
         let default_val: Option<String> = call.get_flag(engine_state, stack, "default")?;
@@ -183,7 +187,7 @@ impl Command for Input {
         let mut buf = String::new();
 
         match line_editor.read_line(&prompt) {
-            Ok(Signal::Success(buffer)) => {
+            Ok(Signal::Success(buffer) | Signal::HostCommand(buffer)) => {
                 buf.push_str(&buffer);
             }
             Ok(Signal::CtrlC) => {
@@ -198,6 +202,8 @@ impl Command for Input {
                 // Do nothing on ctrl-d
                 return Ok(Value::nothing(call.head).into_pipeline_data());
             }
+            // TODO: handle other signals like Signal::ExternalBreak
+            Ok(_) => {}
             Err(event_error) => {
                 let from_io_error = IoError::factory(call.head, None);
                 return Err(from_io_error(event_error).into());
@@ -264,9 +270,8 @@ mod tests {
     use reedline::Reedline;
 
     #[test]
-    fn examples_work_as_expected() {
-        use crate::test_examples;
-        test_examples(Input {})
+    fn examples_work_as_expected() -> nu_test_support::Result {
+        nu_test_support::test().examples(Input)
     }
 
     #[test]

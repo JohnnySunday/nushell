@@ -30,9 +30,9 @@ pub(crate) fn compile_if(
         span: call.head,
     };
 
-    let condition = call.positional_nth(0).ok_or_else(invalid)?;
-    let true_block_arg = call.positional_nth(1).ok_or_else(invalid)?;
-    let else_arg = call.positional_nth(2);
+    let (condition, true_block_arg, else_arg) = Some(call.positional_iter())
+        .and_then(|mut iter| Some((iter.next()?, iter.next()?, iter.next())))
+        .ok_or_else(invalid)?;
 
     let true_block_id = true_block_arg.as_block().ok_or_else(invalid)?;
     let true_block = working_set.get_block(true_block_id);
@@ -74,6 +74,7 @@ pub(crate) fn compile_if(
         working_set,
         builder,
         true_block,
+        true,
         redirect_modes.clone(),
         Some(io_reg),
         io_reg,
@@ -109,6 +110,7 @@ pub(crate) fn compile_if(
                     working_set,
                     builder,
                     false_block,
+                    true,
                     redirect_modes,
                     Some(io_reg),
                     io_reg,
@@ -171,9 +173,10 @@ pub(crate) fn compile_match(
         span: call.head,
     };
 
-    let match_expr = call.positional_nth(0).ok_or_else(invalid)?;
+    let (match_expr, match_block_arg) = Some(call.positional_iter())
+        .and_then(|mut iter| Some((iter.next()?, iter.next()?)))
+        .ok_or_else(invalid)?;
 
-    let match_block_arg = call.positional_nth(1).ok_or_else(invalid)?;
     let match_block = match_block_arg.as_match_block().ok_or_else(invalid)?;
 
     let match_reg = builder.next_register()?;
@@ -263,6 +266,7 @@ pub(crate) fn compile_match(
                 working_set,
                 builder,
                 block,
+                true,
                 redirect_modes.clone(),
                 Some(io_reg),
                 io_reg,
@@ -331,45 +335,49 @@ pub(crate) fn compile_let(
         span: call.head,
     };
 
-    let var_decl_arg = call.positional_nth(0).ok_or_else(invalid)?;
+    let (var_decl_arg, block_arg) = Some(call.positional_iter())
+        .and_then(|mut iter| Some((iter.next()?, iter.next())))
+        .ok_or_else(invalid)?;
+
     let var_id = var_decl_arg.as_var().ok_or_else(invalid)?;
 
     // Handle the two syntax forms:
     // 1. `let var = expr`: compile expr and store result
     // 2. `let var` (no =): use input_reg as the value
-    let has_initial_value = call.positional_nth(1).is_some();
-    if has_initial_value {
-        // Safe to use expect here since we just checked is_some()
-        let block_arg = call.positional_nth(1).expect("checked above");
-        let block_id = block_arg.as_block().ok_or_else(invalid)?;
-        let block = working_set.get_block(block_id);
+    match (block_arg, input_reg) {
+        (Some(block_arg), _) => {
+            let block_id = block_arg.as_block().ok_or_else(invalid)?;
+            let block = working_set.get_block(block_id);
 
-        // Pass the input_reg to the block so expressions like `let x = (str length)`
-        // can access the pipeline input from the enclosing context
-        compile_block(
-            working_set,
-            builder,
-            block,
-            RedirectModes::value(call.head),
-            input_reg,
-            io_reg,
-        )?;
-    } else if let Some(input_reg) = input_reg {
-        // For `let var` without =, assign the input value
-        builder.push(Instruction::Collect { src_dst: input_reg }.into_spanned(call.head))?;
-        if input_reg != io_reg {
-            builder.push(
-                Instruction::Move {
-                    dst: io_reg,
-                    src: input_reg,
-                }
-                .into_spanned(call.head),
+            // Pass the input_reg to the block so expressions like `let x = (str length)`
+            // can access the pipeline input from the enclosing context
+            compile_block(
+                working_set,
+                builder,
+                block,
+                true,
+                RedirectModes::value(call.head),
+                input_reg,
+                io_reg,
             )?;
         }
+        (None, Some(input_reg)) => {
+            // For `let var` without =, assign the input value
+            builder.push(Instruction::Collect { src_dst: input_reg }.into_spanned(call.head))?;
+            if input_reg != io_reg {
+                builder.push(
+                    Instruction::Move {
+                        dst: io_reg,
+                        src: input_reg,
+                    }
+                    .into_spanned(call.head),
+                )?;
+            }
+        }
+        (None, None) => {
+            // If no initial_value and no input_reg, io_reg should already be empty (this shouldn't normally occur)
+        }
     }
-    // If no initial_value and no input_reg, io_reg should already be empty (this shouldn't normally occur)
-
-    let variable = working_set.get_variable(var_id);
 
     // If the variable is annotated with type `glob`, convert the value to
     // a `Glob` (expandable) *before* storing.  We use `GlobFrom { no_expand: false }`
@@ -377,7 +385,7 @@ pub(crate) fn compile_let(
     // runtime (e.g. `let g: glob = "*.toml"; ls $g` should expand).  This
     // mirrors the `into glob` conversion and matches interpreter coercion in
     // `nu-cmd-lang::let` (see tests in `nu-command`).
-    if variable.ty == Type::Glob {
+    if working_set.get_variable(var_id).ty == Type::Glob {
         builder.push(
             Instruction::GlobFrom {
                 src_dst: io_reg,
@@ -396,7 +404,7 @@ pub(crate) fn compile_let(
     )?;
     builder.add_comment("let");
 
-    if has_initial_value {
+    if block_arg.is_some() {
         // `let var = expr`: suppress output (traditional assignment, no display)
         builder.load_empty(io_reg)?;
     } else {
@@ -405,6 +413,7 @@ pub(crate) fn compile_let(
             Instruction::LoadVariable {
                 dst: io_reg,
                 var_id,
+                preserve_origin: false,
             }
             .into_spanned(call.head),
         )?;
@@ -422,72 +431,81 @@ pub(crate) fn compile_try(
     _input_reg: Option<RegId>,
     io_reg: RegId,
 ) -> Result<(), CompileError> {
-    // Pseudocode (literal block):
+    // Pseudocode (literal block). Instructions marked with a condition are only emitted when
+    // the corresponding clause is present. Handlers are pushed outermost first, so that an
+    // error in the body reaches `catch` before `finally`:
     //
-    //       on-error-into ERR, %io_reg           // or without
-    //       finally-into  FINALLY, $io_reg       // or without
+    //       finally-into  FINALLY, %io_reg          // `finally`
+    //       on-error-into ERR, %io_reg              // `catch` (`on-error ERR` when there is neither)
     //       %io_reg <- <...block...> <- %io_reg
-    //       write-to-out-dests %io_reg
-    //       pop-error-handler
-    //       jump END
-    // ERR:  clone %err_reg, %io_reg
-    //       store-variable $err_var, %err_reg         // or without
-    //       %io_reg <- <...catch block...> <- %io_reg // set to empty if no catch block
-    //       pop-finally
+    //       try-collect %io_reg                     // `drain-if-end` when there is neither
+    //       pop-error-handler                       // `catch`, or neither
+    //       begin-finally                           // `finally`
+    //       jump FINALLY                            // `catch`, or neither (`jump END` without `finally`)
+    // ERR:  clone %err_reg, %io_reg                 // `catch` with a parameter
+    //       store-variable $err_var, %err_reg
+    //       %io_reg <- <...catch block...> <- %io_reg // set to empty if there is neither
+    //       try-collect %io_reg                     // `finally`
+    //       begin-finally                           // `finally`
+    // FINALLY:                                      // `finally`; unwinding jumps here as well
+    //       clone %result_reg, %io_reg
+    //       store-variable $finally_var, %io_reg    // `finally` with a parameter (via a clone)
+    //       %io_reg <- <...finally block...> <- %io_reg
+    //       move %io_reg, %result_reg
+    //       end-finally
     // END:
     //
-    // with expression that can't be inlined:
+    // with a catch expression that can't be inlined, the ERR section becomes:
     //
-    //       %closure_reg <- <catch_expr>
-    //       on-error-into ERR, %io_reg
-    //       finally-into  FINALLY, $io_reg
-    //       %io_reg <- <...block...> <- %io_reg
-    //       write-to-out-dests %io_reg
-    //       pop-error-handler
-    //       jump END
-    // ERR:  clone %err_reg, %io_reg
     //       push-positional %closure_reg
     //       push-positional %err_reg
     //       call "do", %io_reg
-    //       pop-finally
-    // END:
+    //
+    // where %closure_reg was evaluated before the handlers were pushed.
+    //
+    // At runtime, `begin-finally` swaps the `finally` handler for a "running" marker, and
+    // `end-finally` pops that marker. When control unwinds into the `finally` block instead (an
+    // error, `return`, `exit`, `break`, or `continue`), the evaluator does the swap itself and
+    // resumes the unwinding at `end-finally`.
     let invalid = || CompileError::InvalidKeywordCall {
         keyword: "try".into(),
         span: call.head,
     };
 
-    let block_arg = call.positional_nth(0).ok_or_else(invalid)?;
-    let block_id = block_arg.as_block().ok_or_else(invalid)?;
-    let block = working_set.get_block(block_id);
+    let (try_block, catch_or_finally, finally) = Some(call.positional_iter())
+        .and_then(|mut iter| Some((iter.next()?, iter.next(), iter.next())))
+        .ok_or_else(invalid)?;
 
-    // manually parsing for `catch` or `finally`.
-    let mut catch_expr = None;
-    let mut finally_expr = None;
-    if let Some(kw_expr) = call.positional_nth(1) {
-        let (keyword, expr) = kw_expr.as_keyword_with_name().ok_or_else(invalid)?;
-        if keyword == b"catch" {
-            catch_expr = Some(expr);
-        } else if keyword == b"finally" {
-            finally_expr = Some(expr);
-        }
-    };
-    if let Some(kw_expr) = call.positional_nth(2) {
-        let (keyword, expr) = kw_expr.as_keyword_with_name().ok_or_else(invalid)?;
-        if keyword == b"catch" {
-            // just deny it, because it should only be valid in 1st positional arguments.
-            return Err(invalid());
-        } else if keyword == b"finally" {
-            // deny duplicate finally.
-            if finally_expr.is_some() {
+    let try_block_id = try_block.as_block().ok_or_else(invalid)?;
+    let block = working_set.get_block(try_block_id);
+
+    let (catch_expr, finally_expr) = {
+        let catch_or_finally = catch_or_finally
+            .map(|expr| expr.as_keyword_with_name().ok_or_else(invalid))
+            .transpose()?;
+
+        let finally = finally
+            .map(|expr| expr.as_keyword_with_name().ok_or_else(invalid))
+            .transpose()?;
+
+        match (catch_or_finally, finally) {
+            (None, None) => (None, None),
+            (Some((b"catch", catch_expr)), None) => (Some(catch_expr), None),
+            (Some((b"finally", finally_expr)), None) => (None, Some(finally_expr)),
+            (Some((b"catch", catch_expr)), Some((b"finally", finally_expr))) => {
+                (Some(catch_expr), Some(finally_expr))
+            }
+            _ => {
+                // Should be unreachable
                 return Err(invalid());
             }
-            finally_expr = Some(expr);
         }
     };
 
     let catch_span = catch_expr.map(|e| e.span).unwrap_or(call.head);
 
     let err_label = builder.label(None);
+    let finally_label = builder.label(None);
     let end_label = builder.label(None);
 
     // We have two ways of executing `catch`: if it was provided as a literal, we can inline it.
@@ -540,51 +558,47 @@ pub(crate) fn compile_try(
         })
         .transpose()?;
 
-    // Put the error handler instruction. If we have a catch expression then we should capture the
-    // error.
-    let mut has_try_comment = false;
-    if catch_type.is_some() {
+    let has_finally = finally_type.is_some();
+    // A plain `try { }` still needs an error handler so that `try { 1 / 0 }` swallows the error.
+    // `try { } finally { }` does not: the error is meant to propagate after `finally` runs.
+    let pushed_error_handler = catch_type.is_some() || !has_finally;
+
+    // Push the handlers. `finally` always captures into `io_reg` so that the register holds a
+    // well-defined value (the error, or empty) when unwinding enters the block.
+    if has_finally {
         builder.push(
-            Instruction::OnErrorInto {
-                index: err_label.0,
+            Instruction::FinallyInto {
+                index: finally_label.0,
                 dst: io_reg,
             }
             .into_spanned(call.head),
         )?;
         builder.add_comment("try");
-        has_try_comment = true;
-    } else if finally_expr.is_none() {
-        // Simply try, without `catch` and `finally` block, need to set up OnErrorHandler.
-        // so `try { 1 / 0 }` works
-        builder.push(Instruction::OnError { index: err_label.0 }.into_spanned(call.head))?;
-        builder.add_comment("try");
-        has_try_comment = true;
-    };
-
-    builder.begin_try();
-
-    if let Some(finally_info) = &finally_type {
-        if finally_info.var_id.is_some() {
+    }
+    if pushed_error_handler {
+        if catch_type.is_some() {
             builder.push(
-                Instruction::FinallyInto {
-                    index: end_label.0,
+                Instruction::OnErrorInto {
+                    index: err_label.0,
                     dst: io_reg,
                 }
                 .into_spanned(call.head),
             )?;
         } else {
-            builder.push(Instruction::Finally { index: end_label.0 }.into_spanned(call.head))?;
+            builder.push(Instruction::OnError { index: err_label.0 }.into_spanned(call.head))?;
         }
-        if !has_try_comment {
+        if !has_finally {
             builder.add_comment("try");
         }
     }
 
-    // Compile the block
+    // Compile the block. Both handlers are live while it runs.
+    builder.begin_try(usize::from(has_finally) + usize::from(pushed_error_handler));
     compile_block(
         working_set,
         builder,
         block,
+        true,
         redirect_modes.clone(),
         Some(io_reg),
         io_reg,
@@ -601,82 +615,104 @@ pub(crate) fn compile_try(
         builder.push(mode.map(|mode| Instruction::RedirectErr { mode }))?;
     }
 
-    if finally_type.is_none() {
+    if has_finally || catch_type.is_some() {
+        // For `catch` clause and `finally` clause, we need to know if the `try` block
+        // runs successfully first, so we need to collect the output first to check if there
+        // is an error.
+        builder.push(Instruction::TryCollect { src_dst: io_reg }.into_spanned(call.head))?;
+    } else {
         builder.push(Instruction::DrainIfEnd { src: io_reg }.into_spanned(call.head))?;
     }
-    if catch_expr.is_some() {
+
+    if pushed_error_handler {
         builder.push(Instruction::PopErrorHandler.into_spanned(call.head))?;
     }
-
     builder.end_try()?;
 
-    // Jump over the failure case
-    builder.jump(end_label, catch_span)?;
+    if has_finally {
+        builder.push(Instruction::BeginFinally.into_spanned(call.head))?;
+    }
 
-    // This is the error handler
-    builder.set_label(err_label, builder.here())?;
+    if pushed_error_handler {
+        // Jump over the error handler
+        builder.jump(
+            if has_finally {
+                finally_label
+            } else {
+                end_label
+            },
+            catch_span,
+        )?;
 
-    // Mark out register as likely not clean - state in error handler is not well defined
-    builder.mark_register(io_reg)?;
+        // This is the error handler
+        builder.set_label(err_label, builder.here())?;
 
-    // Now compile whatever is necessary for the error handler
-    match catch_type {
-        Some(CatchType::Block { block, var_id }) => {
-            // Error will be in io_reg
-            builder.mark_register(io_reg)?;
-            if let Some(var_id) = var_id {
-                // Take a copy of the error as $err, since it will also be input
-                let err_reg = builder.next_register()?;
-                builder.push(
-                    Instruction::Clone {
-                        dst: err_reg,
-                        src: io_reg,
-                    }
-                    .into_spanned(catch_span),
-                )?;
-                builder.push(
-                    Instruction::StoreVariable {
-                        var_id,
-                        src: err_reg,
-                    }
-                    .into_spanned(catch_span),
+        // Mark out register as likely not clean - state in error handler is not well defined
+        builder.mark_register(io_reg)?;
+
+        // The error handler was popped on the way here, but the `finally` handler still stands.
+        builder.begin_try(usize::from(has_finally));
+        match catch_type {
+            Some(CatchType::Block { block, var_id }) => {
+                if let Some(var_id) = var_id {
+                    // Take a copy of the error as $err, since it will also be input
+                    let err_reg = builder.next_register()?;
+                    builder.push(
+                        Instruction::Clone {
+                            dst: err_reg,
+                            src: io_reg,
+                        }
+                        .into_spanned(catch_span),
+                    )?;
+                    builder.push(
+                        Instruction::StoreVariable {
+                            var_id,
+                            src: err_reg,
+                        }
+                        .into_spanned(catch_span),
+                    )?;
+                }
+                // Compile the block, now that the variable is set
+                compile_block(
+                    working_set,
+                    builder,
+                    block,
+                    true,
+                    redirect_modes.clone(),
+                    Some(io_reg),
+                    io_reg,
                 )?;
             }
-            // Compile the block, now that the variable is set
-            compile_block(
-                working_set,
-                builder,
-                block,
-                redirect_modes.clone(),
-                Some(io_reg),
-                io_reg,
-            )?;
+            Some(CatchType::Closure { closure_reg }) => {
+                compile_closure_call(working_set, builder, call, io_reg, closure_reg, catch_span)?
+            }
+            None => {
+                // Just set out to empty.
+                builder.load_empty(io_reg)?;
+            }
         }
-        Some(CatchType::Closure { closure_reg }) => {
-            compile_closure_call(working_set, builder, call, io_reg, closure_reg, catch_span)?
+        builder.end_try()?;
+
+        if has_finally {
+            // `finally` must not start until the `catch` block has finished producing its output.
+            builder.push(Instruction::TryCollect { src_dst: io_reg }.into_spanned(call.head))?;
+            builder.push(Instruction::BeginFinally.into_spanned(call.head))?;
         }
-        None => {
-            // Just set out to empty.
-            builder.load_empty(io_reg)?;
-        }
-    }
-    if finally_type.is_some() {
-        builder.push(Instruction::PopFinallyRun.into_spanned(call.head))?;
     }
 
-    // This is the end - whatever we succeeded or not, should jump here for finally clause.
-    builder.set_label(end_label, builder.here())?;
-    // This is the finally part.
+    // This is the finally part. Whether we succeeded or not, control ends up here.
     if let Some(finally_part) = finally_type {
+        builder.set_label(finally_label, builder.here())?;
+        builder.mark_register(io_reg)?;
+
+        // Only the running marker of this `finally` is on the handler stack while it runs.
+        builder.begin_try(1);
+
+        // Preserve the value produced by `try`/`catch`: `finally` can observe it
+        // but its own pipeline result should not replace the overall `try` expression result.
+        let preserved_result_reg = builder.clone_reg(io_reg, call.head)?;
         if let Some(var_id) = finally_part.var_id {
-            let value_reg = builder.next_register()?;
-            builder.push(
-                Instruction::Clone {
-                    dst: value_reg,
-                    src: io_reg,
-                }
-                .into_spanned(call.head),
-            )?;
+            let value_reg = builder.clone_reg(io_reg, call.head)?;
             builder.push(
                 Instruction::StoreVariable {
                     var_id,
@@ -689,11 +725,23 @@ pub(crate) fn compile_try(
             working_set,
             builder,
             finally_part.block,
+            true,
             redirect_modes,
             Some(io_reg),
             io_reg,
         )?;
+        builder.push(
+            Instruction::Move {
+                dst: io_reg,
+                src: preserved_result_reg,
+            }
+            .into_spanned(call.head),
+        )?;
+        builder.end_try()?;
+        builder.push(Instruction::EndFinally.into_spanned(call.head))?;
     }
+
+    builder.set_label(end_label, builder.here())?;
 
     Ok(())
 }
@@ -763,8 +811,11 @@ pub(crate) fn compile_loop(
         span: call.head,
     };
 
-    let block_arg = call.positional_nth(0).ok_or_else(invalid)?;
-    let block_id = block_arg.as_block().ok_or_else(invalid)?;
+    let block_id = call
+        .positional_iter()
+        .next()
+        .and_then(Expression::as_block)
+        .ok_or_else(invalid)?;
     let block = working_set.get_block(block_id);
 
     let loop_ = builder.begin_loop();
@@ -776,6 +827,7 @@ pub(crate) fn compile_loop(
         working_set,
         builder,
         block,
+        true,
         RedirectModes::default(),
         None,
         io_reg,
@@ -821,8 +873,10 @@ pub(crate) fn compile_while(
         span: call.head,
     };
 
-    let cond_arg = call.positional_nth(0).ok_or_else(invalid)?;
-    let block_arg = call.positional_nth(1).ok_or_else(invalid)?;
+    let (cond_arg, block_arg) = Some(call.positional_iter())
+        .and_then(|mut iter| Some((iter.next()?, iter.next()?)))
+        .ok_or_else(invalid)?;
+
     let block_id = block_arg.as_block().ok_or_else(invalid)?;
     let block = working_set.get_block(block_id);
 
@@ -853,6 +907,7 @@ pub(crate) fn compile_while(
         working_set,
         builder,
         block,
+        true,
         RedirectModes::default(),
         None,
         io_reg,
@@ -903,13 +958,12 @@ pub(crate) fn compile_for(
         return Err(invalid());
     }
 
-    let var_decl_arg = call.positional_nth(0).ok_or_else(invalid)?;
+    let (var_decl_arg, in_arg, block_arg) = Some(call.positional_iter())
+        .and_then(|mut iter| Some((iter.next()?, iter.next()?, iter.next()?)))
+        .ok_or_else(invalid)?;
+
     let var_id = var_decl_arg.as_var().ok_or_else(invalid)?;
-
-    let in_arg = call.positional_nth(1).ok_or_else(invalid)?;
     let in_expr = in_arg.as_keyword().ok_or_else(invalid)?;
-
-    let block_arg = call.positional_nth(2).ok_or_else(invalid)?;
     let block_id = block_arg.as_block().ok_or_else(invalid)?;
     let block = working_set.get_block(block_id);
 
@@ -959,6 +1013,7 @@ pub(crate) fn compile_for(
         working_set,
         builder,
         block,
+        true,
         RedirectModes::default(),
         None,
         io_reg,
@@ -999,9 +1054,6 @@ pub(crate) fn compile_break(
         });
     }
     builder.load_empty(io_reg)?;
-    for _ in 0..builder.context_stack.try_block_depth_from_loop() {
-        builder.push(Instruction::PopErrorHandler.into_spanned(call.head))?;
-    }
     builder.push_break(call.head)?;
     builder.add_comment("break");
     Ok(())
@@ -1023,9 +1075,6 @@ pub(crate) fn compile_continue(
         });
     }
     builder.load_empty(io_reg)?;
-    for _ in 0..builder.context_stack.try_block_depth_from_loop() {
-        builder.push(Instruction::PopErrorHandler.into_spanned(call.head))?;
-    }
     builder.push_continue(call.head)?;
     builder.add_comment("continue");
     Ok(())
@@ -1046,7 +1095,7 @@ pub(crate) fn compile_return(
     //
     // %io_reg <- <arg_expr>
     // return-early %io_reg
-    if let Some(arg_expr) = call.positional_nth(0) {
+    if let Some(arg_expr) = call.positional_iter().next() {
         compile_expression(
             working_set,
             builder,
@@ -1059,8 +1108,10 @@ pub(crate) fn compile_return(
         builder.load_empty(io_reg)?;
     }
 
-    // TODO: It would be nice if this could be `return` instead, but there is a little bit of
-    // behaviour remaining that still depends on `ShellError::Return`
+    // This is distinct from the terminal `return` instruction: it runs pending `finally`
+    // handlers, and flags the result as an early return. Custom command and closure calls clear
+    // that flag; top-level file evaluation reads it (e.g. so a top-level `return` in a script
+    // prevents `main` from running).
     builder.push(Instruction::ReturnEarly { src: io_reg }.into_spanned(call.head))?;
 
     // io_reg is supposed to remain allocated
@@ -1095,7 +1146,7 @@ pub(crate) fn compile_collect(
 
     builder.push(Instruction::Collect { src_dst: io_reg }.into_spanned(call.head))?;
 
-    if let Some(arg_expr) = call.positional_nth(0) {
+    if let Some(arg_expr) = call.positional_iter().next() {
         // We have to compile the expression into a closure,
         // then compile a closure call
         let closure_reg = builder.next_register()?;

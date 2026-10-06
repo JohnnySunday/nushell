@@ -16,7 +16,7 @@ impl Command for ScopeEngineStats {
     }
 
     fn description(&self) -> &str {
-        "Output stats on the engine in the current state."
+        "Output stats on the engine in the current state, including interactive last-result size info."
     }
 
     fn run(
@@ -35,7 +35,7 @@ impl Command for ScopeEngineStats {
 
     fn examples(&self) -> Vec<Example<'_>> {
         vec![Example {
-            description: "Show the stats on the current engine state.",
+            description: "Show the stats on the current engine state (includes last_result size limit and memory use).",
             example: "scope engine-stats",
             result: None,
         }]
@@ -47,9 +47,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(ScopeEngineStats {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(ScopeEngineStats)
     }
 }

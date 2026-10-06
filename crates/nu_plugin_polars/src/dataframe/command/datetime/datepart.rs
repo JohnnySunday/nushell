@@ -39,10 +39,16 @@ impl PluginCommand for ExprDatePart {
                 SyntaxShape::String,
                 "Part of the date to capture.  Possible values are year, quarter, month, week, weekday, day, hour, minute, second, millisecond, microsecond, nanosecond.",
             )
-            .input_output_type(
-                PolarsPluginType::NuExpression.into(),
-                PolarsPluginType::NuExpression.into(),
-            )
+            .input_output_types(vec![
+                (
+                    PolarsPluginType::NuExpression.into(),
+                    PolarsPluginType::NuExpression.into()
+                ),
+                (
+                    PolarsPluginType::NuSelector.into(),
+                    PolarsPluginType::NuExpression.into()
+                ),
+            ])
             .category(Category::Custom("expression".into()))
     }
 
@@ -69,6 +75,7 @@ impl PluginCommand for ExprDatePart {
                             ),
                             Field::new("datetime_year".into(), DataType::Int64),
                         ])))),
+                        Span::test_data(),
                     )
                     .expect("simple df for test should not fail")
                     .into_value(Span::test_data()),
@@ -129,11 +136,11 @@ impl PluginCommand for ExprDatePart {
         plugin: &Self::Plugin,
         engine: &EngineInterface,
         call: &EvaluatedCall,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
-        let metadata = input.metadata();
         let part: Spanned<String> = call.req(0)?;
 
+        let metadata = input.take_metadata();
         let expr = NuExpression::try_from_pipeline(plugin, input, call.head)?;
         let expr_dt = expr.into_polars().dt();
         let expr: NuExpression  = match part.item.as_str() {

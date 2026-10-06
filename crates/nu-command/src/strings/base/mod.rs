@@ -17,9 +17,9 @@ pub use hex::{DecodeHex, EncodeHex};
 pub fn decode(
     encoding: Encoding,
     call_span: Span,
-    input: PipelineData,
+    mut input: PipelineData,
 ) -> Result<PipelineData, ShellError> {
-    let metadata = input.metadata();
+    let metadata = input.take_metadata();
     let (input_str, input_span) = get_string(input, call_span)?;
     let output = match encoding.decode(input_str.as_bytes()) {
         Ok(output) => output,
@@ -38,9 +38,9 @@ pub fn decode(
 pub fn encode(
     encoding: Encoding,
     call_span: Span,
-    input: PipelineData,
+    mut input: PipelineData,
 ) -> Result<PipelineData, ShellError> {
-    let metadata = input.metadata();
+    let metadata = input.take_metadata();
     let (input_bytes, _) = get_binary(input, call_span)?;
     let output = encoding.encode(&input_bytes);
 
@@ -80,7 +80,7 @@ fn get_binary(input: PipelineData, call_span: Span) -> Result<(Vec<u8>, Span), S
         PipelineData::Value(val, ..) => {
             let span = val.span();
             match val {
-                Value::Binary { val, .. } => Ok((val, span)),
+                Value::Binary { val, .. } => Ok((val.into_owned(), span)),
                 Value::String { val, .. } => Ok((val.into_bytes(), span)),
 
                 value => Err(ShellError::TypeMismatch {

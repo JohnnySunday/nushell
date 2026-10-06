@@ -12,6 +12,10 @@ impl Command for LoadEnv {
         "Loads an environment update from a record."
     }
 
+    fn extra_description(&self) -> &str {
+        "Environment conversions are not applied automatically. To apply the conversions configured in $env.ENV_CONVERSIONS after loading an update, assign $env.ENV_CONVERSIONS to itself."
+    }
+
     fn signature(&self) -> nu_protocol::Signature {
         Signature::build("load-env")
             .input_output_types(vec![
@@ -24,7 +28,7 @@ impl Command for LoadEnv {
             .allow_variants_without_examples(true)
             .optional(
                 "update",
-                SyntaxShape::Record(vec![]),
+                SyntaxShape::record(),
                 "The record to use for updates.",
             )
             .category(Category::FileSystem)
@@ -74,13 +78,21 @@ impl Command for LoadEnv {
         vec![
             Example {
                 description: "Load variables from an input stream.",
-                example: r#"{NAME: ABE, AGE: UNKNOWN} | load-env; $env.NAME"#,
+                example: "{NAME: ABE, AGE: UNKNOWN} | load-env; $env.NAME",
                 result: Some(Value::test_string("ABE")),
             },
             Example {
                 description: "Load variables from an argument.",
-                example: r#"load-env {NAME: ABE, AGE: UNKNOWN}; $env.NAME"#,
+                example: "load-env {NAME: ABE, AGE: UNKNOWN}; $env.NAME",
                 result: Some(Value::test_string("ABE")),
+            },
+            Example {
+                description: "Load a variable, then apply its environment conversion.",
+                example: "$env.ENV_CONVERSIONS = {MY_ENV_VAR: {from_string: { split row ':' }}}; load-env {MY_ENV_VAR: 'foo:bar'}; $env.ENV_CONVERSIONS = $env.ENV_CONVERSIONS; $env.MY_ENV_VAR",
+                result: Some(Value::test_list(vec![
+                    Value::test_string("foo"),
+                    Value::test_string("bar"),
+                ])),
             },
         ]
     }
@@ -91,9 +103,7 @@ mod tests {
     use super::LoadEnv;
 
     #[test]
-    fn examples_work_as_expected() {
-        use crate::test_examples;
-
-        test_examples(LoadEnv {})
+    fn examples_work_as_expected() -> nu_test_support::Result {
+        nu_test_support::test().examples(LoadEnv)
     }
 }

@@ -1,8 +1,7 @@
-use std::io::Read;
-
 #[cfg(feature = "sqlite")]
-use crate::database::SQLiteQueryBuilder;
+use crate::database::QueryPlan;
 use nu_engine::command_prelude::*;
+use std::io::Read;
 
 #[derive(Clone)]
 pub struct Length;
@@ -73,11 +72,11 @@ fn length_row(call: &Call, input: PipelineData) -> Result<PipelineData, ShellErr
     let span = input.span().unwrap_or(call.head);
 
     #[cfg(feature = "sqlite")]
-    // Pushdown optimization: handle 'length' on SQLiteQueryBuilder using COUNT(*)
+    // Pushdown optimization: handle 'length' via QueryPlan using COUNT(*)
     if let PipelineData::Value(Value::Custom { val, .. }, ..) = &input
-        && let Some(table) = val.as_any().downcast_ref::<SQLiteQueryBuilder>()
+        && let Some(plan) = QueryPlan::try_from_any(val.as_any())
     {
-        let count = table.count(call.head)?;
+        let count = plan.count(call.head)?;
         return Ok(Value::int(count, call.head).into_pipeline_data());
     }
 
@@ -87,17 +86,6 @@ fn length_row(call: &Call, input: PipelineData) -> Result<PipelineData, ShellErr
         }
         PipelineData::Value(Value::Binary { val, .. }, ..) => {
             Ok(Value::int(val.len() as i64, call.head).into_pipeline_data())
-        }
-        #[cfg(feature = "sqlite")]
-        PipelineData::Value(Value::Custom { val, .. }, ..)
-            if val.as_any().downcast_ref::<SQLiteQueryBuilder>().is_some() =>
-        {
-            let table = val
-                .as_any()
-                .downcast_ref::<SQLiteQueryBuilder>()
-                .expect("already checked");
-            let count = table.count(call.head)?;
-            Ok(Value::int(count, call.head).into_pipeline_data())
         }
         #[cfg(feature = "sqlite")]
         PipelineData::Value(
@@ -115,7 +103,13 @@ fn length_row(call: &Call, input: PipelineData) -> Result<PipelineData, ShellErr
             Ok(Value::int(vals.len() as i64, call.head).into_pipeline_data())
         }
         PipelineData::ListStream(stream, ..) => {
-            Ok(Value::int(stream.into_iter().count() as i64, call.head).into_pipeline_data())
+            let mut count = 0;
+            for value in stream {
+                // Propagate error values instead of silently counting them (see #18928).
+                value.unwrap_error()?;
+                count += 1;
+            }
+            Ok(Value::int(count, call.head).into_pipeline_data())
         }
         PipelineData::ByteStream(stream, ..) if stream.type_().is_binary_coercible() => {
             Ok(Value::int(
@@ -141,9 +135,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Length {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Length)
     }
 }

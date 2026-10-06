@@ -2,6 +2,7 @@ use super::{InputNumType, NumberBytes, get_input_num_type, get_number_bytes};
 use itertools::Itertools;
 use nu_cmd_base::input_handler::{CmdArgument, operate};
 use nu_engine::command_prelude::*;
+use nu_protocol::shell_error::generic::GenericError;
 
 use std::iter;
 
@@ -49,7 +50,7 @@ impl Command for BitsShl {
             .named(
                 "number-bytes",
                 SyntaxShape::Int,
-                "The word size in number of bytes. Must be `1`, `2`, `4`, or `8` (defaults to the smallest of those that fits the input number).",
+                "The word size in number of bytes. Must be `1`, `2`, `4`, or `8` (defaults to `8`).",
                 Some('n'),
             )
             .category(Category::Bits)
@@ -77,7 +78,7 @@ impl Command for BitsShl {
         let signed = call.has_flag(engine_state, stack, "signed")?;
         let number_bytes: Option<Spanned<usize>> =
             call.get_flag(engine_state, stack, "number-bytes")?;
-        let number_size = get_number_bytes(number_bytes, head)?;
+        let number_size = get_number_bytes(number_bytes, head, NumberBytes::Eight)?;
 
         // This doesn't match explicit nulls
         if let PipelineData::Empty = input {
@@ -98,7 +99,7 @@ impl Command for BitsShl {
             Example {
                 description: "Shift left a number by 7 bits",
                 example: "2 | bits shl 7",
-                result: Some(Value::test_int(0)),
+                result: Some(Value::test_int(256)),
             },
             Example {
                 description: "Shift left a number with 2 byte by 7 bits",
@@ -107,7 +108,7 @@ impl Command for BitsShl {
             },
             Example {
                 description: "Shift left a signed number by 1 bit",
-                example: "0x7F | bits shl 1 --signed",
+                example: "0x7F | bits shl 1 --signed --number-bytes 1",
                 result: Some(Value::test_int(-2)),
             },
             Example {
@@ -163,17 +164,16 @@ fn action(input: &Value, args: &Arguments, span: Span) -> Value {
                 Eight => {
                     let Ok(i) = i64::try_from((val as u64) << bits) else {
                         return Value::error(
-                            ShellError::GenericError {
-                                error: "result out of range for int".into(),
-                                msg: format!(
-                                    "shifting left by {bits} is out of range for the value {val}"
-                                ),
-                                span: Some(span),
-                                help: Some(
-                                    "Ensure the result fits in a 64-bit signed integer.".into(),
-                                ),
-                                inner: vec![],
-                            },
+                            ShellError::Generic(
+                                GenericError::new(
+                                    "result out of range for int",
+                                    format!(
+                                        "shifting left by {bits} is out of range for the value {val}"
+                                    ),
+                                    span,
+                                )
+                                .with_help("Ensure the result fits in a 64-bit signed integer."),
+                            ),
                             span,
                         );
                     };
@@ -236,7 +236,6 @@ fn shift_bytes_left(data: &[u8], byte_shift: usize) -> Vec<u8> {
 }
 
 fn shift_bytes_and_bits_left(data: &[u8], byte_shift: usize, bit_shift: usize) -> Vec<u8> {
-    use itertools::Position::*;
     debug_assert!(
         (1..8).contains(&bit_shift),
         "Bit shifts of 0 can't be handled by this impl and everything else should be part of the byteshift"
@@ -246,9 +245,9 @@ fn shift_bytes_and_bits_left(data: &[u8], byte_shift: usize, bit_shift: usize) -
         .skip(byte_shift)
         .circular_tuple_windows::<(u8, u8)>()
         .with_position()
-        .map(|(pos, (lhs, rhs))| match pos {
-            Last | Only => lhs << bit_shift,
-            _ => (lhs << bit_shift) | (rhs >> (8 - bit_shift)),
+        .map(|(pos, (lhs, rhs))| match pos.is_last() {
+            true => lhs << bit_shift,
+            false => (lhs << bit_shift) | (rhs >> (8 - bit_shift)),
         })
         .chain(iter::repeat_n(0, byte_shift))
         .collect::<Vec<u8>>()
@@ -259,9 +258,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(BitsShl {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(BitsShl)
     }
 }

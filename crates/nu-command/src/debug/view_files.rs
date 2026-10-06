@@ -21,7 +21,7 @@ impl Command for ViewFiles {
             .input_output_types(vec![(
                 Type::Nothing,
                 Type::Table(
-                    [
+                    vec![
                         ("filename".into(), Type::String),
                         ("start".into(), Type::Int),
                         ("end".into(), Type::Int),
@@ -63,12 +63,12 @@ impl Command for ViewFiles {
         vec![
             Example {
                 description: "View the files registered in Nushell's EngineState memory.",
-                example: r#"view files"#,
+                example: "view files",
                 result: None,
             },
             Example {
                 description: "View how Nushell was originally invoked.",
-                example: r#"view files | get 0"#,
+                example: "view files | get 0",
                 result: None,
             },
         ]

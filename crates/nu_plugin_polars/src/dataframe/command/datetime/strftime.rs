@@ -8,6 +8,7 @@ use crate::{
 use super::super::super::values::{Column, NuDataFrame};
 
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
+use nu_protocol::shell_error::generic::GenericError;
 use nu_protocol::{
     Category, Example, LabeledError, PipelineData, ShellError, Signature, Span, SyntaxShape, Value,
 };
@@ -33,6 +34,10 @@ impl PluginCommand for StrFTime {
             .input_output_types(vec![
                 (
                     PolarsPluginType::NuExpression.into(),
+                    PolarsPluginType::NuExpression.into(),
+                ),
+                (
+                    PolarsPluginType::NuSelector.into(),
                     PolarsPluginType::NuExpression.into(),
                 ),
                 (
@@ -62,6 +67,7 @@ impl PluginCommand for StrFTime {
                             vec![Value::test_string("2020/08/04")],
                         )],
                         None,
+                        Span::test_data(),
                     )
                     .expect("simple df for test should not fail")
                     .into_value(Span::test_data()),
@@ -82,6 +88,7 @@ impl PluginCommand for StrFTime {
                             ],
                         )],
                         None,
+                        Span::test_data(),
                     )
                     .expect("simple df for test should not fail")
                     .into_value(Span::test_data()),
@@ -95,9 +102,9 @@ impl PluginCommand for StrFTime {
         plugin: &Self::Plugin,
         engine: &EngineInterface,
         call: &EvaluatedCall,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
-        let metadata = input.metadata();
+        let metadata = input.take_metadata();
         let value = input.into_value(call.head)?;
         match PolarsPluginObject::try_from_value(plugin, &value)? {
             PolarsPluginObject::NuDataFrame(df) => command_df(plugin, engine, call, df),
@@ -111,6 +118,7 @@ impl PluginCommand for StrFTime {
                     PolarsPluginType::NuDataFrame,
                     PolarsPluginType::NuLazyFrame,
                     PolarsPluginType::NuExpression,
+                    PolarsPluginType::NuSelector,
                 ],
             )),
         }
@@ -140,22 +148,21 @@ fn command_df(
 
     let series = df.as_series(call.head)?;
 
-    let casted = series.datetime().map_err(|e| ShellError::GenericError {
-        error: "Error casting to date".into(),
-        msg: e.to_string(),
-        span: Some(call.head),
-        help: Some("The str-slice command can only be used with string columns".into()),
-        inner: vec![],
+    let casted = series.datetime().map_err(|e| {
+        ShellError::Generic(
+            GenericError::new("Error casting to date", e.to_string(), call.head)
+                .with_help("The str-slice command can only be used with string columns"),
+        )
     })?;
 
     let res = casted
         .strftime(&fmt)
-        .map_err(|e| ShellError::GenericError {
-            error: "Error formatting datetime".into(),
-            msg: e.to_string(),
-            span: Some(call.head),
-            help: None,
-            inner: vec![],
+        .map_err(|e| {
+            ShellError::Generic(GenericError::new(
+                "Error formatting datetime",
+                e.to_string(),
+                call.head,
+            ))
         })?
         .into_series();
 

@@ -1,25 +1,27 @@
 use crate::history::History;
 use miette::{Diagnostic, SourceCode, SourceSpan};
 use nu_protocol::{
-    PipelineData, PipelineExecutionData, Signals, Span, Value,
+    FromValue, PipelineData, PipelineExecutionData, Signals, Span, Value,
     debugger::WithoutDebug,
-    engine::{EngineState, Stack, StateWorkingSet},
+    engine::{EngineState, Job, Jobs, Mail, Stack, StateWorkingSet, ThreadJob},
 };
+use rmcp::model::{CallToolResult, ContentBlock};
+use serde_json::{Value as JsonValue, json};
 use std::{
-    sync::{Arc, atomic::AtomicBool},
-    time::{SystemTime, UNIX_EPOCH},
+    fmt::Write,
+    sync::{Arc, Mutex as SyncMutex, atomic::AtomicBool, mpsc, mpsc::Sender},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
 const OUTPUT_LIMIT_ENV_VAR: &str = "NU_MCP_OUTPUT_LIMIT";
 const DEFAULT_OUTPUT_LIMIT: usize = 10 * 1024; // 10kb
 
-/// Formats a miette Diagnostic error as a NUON record for MCP.
+/// Formats a miette Diagnostic error as NUON text plus a JSON mirror for MCP.
 ///
 /// Extracts structured error information (code, message, help, labels with spans)
-/// and formats it as NUON - a machine-readable format that's more useful for LLMs
-/// than the human-readable display format.
+/// and formats it as machine-readable NUON text and JSON.
 ///
 /// The output includes:
 /// - `code`: Error code (e.g., "nu::parser::parse_mismatch")
@@ -36,7 +38,8 @@ fn format_mcp_error(
     working_set: &StateWorkingSet,
     error: &dyn Diagnostic,
     default_code: Option<&'static str>,
-) -> String {
+    span: Span,
+) -> (String, Option<JsonValue>) {
     let mut record = nu_protocol::record! {};
 
     // Error code (e.g., "nu::parser::parse_mismatch")
@@ -45,11 +48,11 @@ fn format_mcp_error(
         .map(|c| c.to_string())
         .or_else(|| default_code.map(String::from));
     if let Some(code) = code {
-        record.push("code", Value::string(code, Span::unknown()));
+        record.push("code", Value::string(code, span));
     }
 
     // Error message from Display trait
-    record.push("msg", Value::string(error.to_string(), Span::unknown()));
+    record.push("msg", Value::string(error.to_string(), span));
 
     // Severity level (error, warning, advice)
     if let Some(severity) = error.severity() {
@@ -58,17 +61,17 @@ fn format_mcp_error(
             miette::Severity::Warning => "warning",
             miette::Severity::Advice => "advice",
         };
-        record.push("severity", Value::string(severity_str, Span::unknown()));
+        record.push("severity", Value::string(severity_str, span));
     }
 
     // Help/hint text if available
     if let Some(help) = error.help() {
-        record.push("help", Value::string(help.to_string(), Span::unknown()));
+        record.push("help", Value::string(help.to_string(), span));
     }
 
     // Documentation URL if available
     if let Some(url) = error.url() {
-        record.push("url", Value::string(url.to_string(), Span::unknown()));
+        record.push("url", Value::string(url.to_string(), span));
     }
 
     // Labels with span information, line/column, and source context
@@ -79,39 +82,44 @@ fn format_mcp_error(
 
                 // Label text/message (what it's pointing at, e.g., "expected duration")
                 if let Some(text) = label.label() {
-                    label_record.push("text", Value::string(text, Span::unknown()));
+                    label_record.push("text", Value::string(text, span));
                 }
 
                 // Extract source context with line/column info
-                let span: SourceSpan = *label.inner();
-                if let Some((span_text, line, column)) = extract_source_context(working_set, &span)
+                let source_span: SourceSpan = *label.inner();
+                if let Some((span_text, line, column)) =
+                    extract_source_context(working_set, &source_span)
                 {
                     // The exact source text at the error span
-                    label_record.push("span", Value::string(span_text, Span::unknown()));
+                    label_record.push("span", Value::string(span_text, span));
                     // 1-indexed line and column for human readability
-                    label_record.push("line", Value::int(line as i64, Span::unknown()));
-                    label_record.push("column", Value::int(column as i64, Span::unknown()));
+                    label_record.push("line", Value::int(line as i64, span));
+                    label_record.push("column", Value::int(column as i64, span));
                 }
 
-                Value::record(label_record, Span::unknown())
+                Value::record(label_record, span)
             })
             .collect();
 
         if !labels_list.is_empty() {
-            record.push("labels", Value::list(labels_list, Span::unknown()));
+            record.push("labels", Value::list(labels_list, span));
         }
     }
 
-    // Convert to NUON format
-    let value = Value::record(record, Span::unknown());
-    nuon::to_nuon(
+    let value = Value::record(record, span);
+    let structured_content = nu_json::Value::from_value(value.clone())
+        .ok()
+        .and_then(|value| serde_json::to_value(value).ok());
+    let message = nuon::to_nuon(
         working_set.permanent(),
         &value,
         nuon::ToNuonConfig::default()
             .style(nuon::ToStyle::Raw)
-            .span(Some(Span::unknown())),
+            .span(Some(span)),
     )
-    .unwrap_or_else(|_| error.to_string())
+    .unwrap_or_else(|_| error.to_string());
+
+    (message, structured_content)
 }
 
 /// Extract the source code context around a span for error display.
@@ -141,34 +149,43 @@ fn extract_source_context(
 /// Creates an invalid_params MCP error for user input errors (parse/compile errors).
 ///
 /// Uses error code -32602 (Invalid params) since these are user input errors, not server errors.
-/// Error is formatted as NUON for machine-readable structured output.
+/// Error text is formatted as NUON and mirrored as JSON error data.
 fn user_input_error(
     working_set: &StateWorkingSet,
     error: &dyn Diagnostic,
     default_code: Option<&'static str>,
+    span: Span,
 ) -> rmcp::ErrorData {
-    rmcp::ErrorData::invalid_params(format_mcp_error(working_set, error, default_code), None)
+    let (message, data) = format_mcp_error(working_set, error, default_code, span);
+    rmcp::ErrorData::invalid_params(message, data)
 }
 
 /// Creates an internal MCP error for runtime errors.
 ///
 /// Uses error code -32603 (Internal error) since these are server-side execution errors.
-/// Error is formatted as NUON for machine-readable structured output.
+/// Error text is formatted as NUON and mirrored as JSON error data.
 pub(crate) fn shell_error_to_mcp_error(
     error: nu_protocol::ShellError,
     engine_state: &EngineState,
+    span: Span,
 ) -> rmcp::ErrorData {
     let working_set = StateWorkingSet::new(engine_state);
-    rmcp::ErrorData::internal_error(
-        format_mcp_error(&working_set, &error, Some("nu::shell::error")),
-        None,
-    )
+    let (message, data) = format_mcp_error(&working_set, &error, Some("nu::shell::error"), span);
+    rmcp::ErrorData::internal_error(message, data)
 }
 
-/// MCP error for cancelled operations.
-fn cancelled_error() -> rmcp::ErrorData {
-    rmcp::ErrorData::internal_error("Operation cancelled by client".to_string(), None)
-}
+/// Maximum length for job descriptions shown in `job list`.
+const JOB_DESCRIPTION_MAX_LEN: usize = 40;
+
+/// How long an evaluation can run before being auto-promoted to a background
+/// job. Overridden via the `NU_MCP_PROMOTE_AFTER` env var on the persistent
+/// stack.
+///
+/// 2 minutes is deliberate: a shorter default (we had 10s) made Claude Opus 4.7
+/// give up on nushell because everyday commands kept getting shoved into the
+/// background. Keep the happy path synchronous; callers who know a command is
+/// long-running can widen the window by setting `$env.NU_MCP_PROMOTE_AFTER`.
+const DEFAULT_PROMOTE_AFTER: Duration = Duration::from_secs(120);
 
 /// Evaluates Nushell code in a persistent REPL-style context for MCP.
 ///
@@ -182,12 +199,13 @@ fn cancelled_error() -> rmcp::ErrorData {
 ///
 /// Step 2 ensures parsed blocks (including closures) are registered and available.
 ///
-/// # Cancellation Support
+/// # Cancellation & Job Promotion
 ///
 /// The evaluator supports cancellation via `CancellationToken`. When cancelled:
-/// 1. The evaluation is interrupted via nushell's `Signals` mechanism
-/// 2. Any forked state changes are discarded
-/// 3. The original state remains unchanged
+/// 1. The evaluation is promoted to a background job (not interrupted)
+/// 2. Results are delivered to the main thread's mailbox when complete
+/// 3. The original state remains unchanged (forked state is not committed)
+/// 4. The caller can retrieve results via `job recv`
 ///
 /// # State Persistence
 ///
@@ -269,65 +287,64 @@ impl Evaluator {
         }
     }
 
-    /// Evaluates nushell source code with cancellation support.
+    /// Evaluates Nushell source for the MCP tool.
     ///
-    /// This method:
-    /// 1. Forks the current state (cheap due to Arc-based copy-on-write)
-    /// 2. Runs the evaluation on the forked state in a blocking task
-    /// 3. Races the evaluation against the cancellation token
-    /// 4. On success: merges changes back to the main state
-    /// 5. On cancellation: discards the forked state, original unchanged
-    pub async fn eval_async(
+    /// Runs on a forked state and promotes to a background job if the request is
+    /// cancelled or exceeds the promote-after timeout.
+    ///
+    /// The returned tool result keeps the human-readable NUON text in `content`
+    /// and mirrors the same response as JSON `structuredContent` for MCP clients.
+    pub async fn eval_async(&self, nu_source: &str, ct: CancellationToken) -> CallToolResult {
+        match self.eval_async_output(nu_source, ct).await {
+            Ok(output) => output.into_call_tool_result(),
+            Err(err) => error_call_tool_result(err),
+        }
+    }
+
+    async fn eval_async_output(
         &self,
         nu_source: &str,
         ct: CancellationToken,
-    ) -> Result<String, rmcp::ErrorData> {
-        // Fork the state for isolated evaluation
-        let (forked_state, interrupt) = {
+    ) -> Result<EvalOutput, rmcp::ErrorData> {
+        let (forked_state, interrupt, promote_after) = {
             let state = self.state.lock().await;
-            state.fork()
+            let timeout = promote_timeout(&state.engine_state, &state.stack);
+            let (forked, interrupt) = state.fork();
+            (forked, interrupt, timeout)
         };
 
+        let jobs = forked_state.engine_state.jobs.clone();
+        let root_job_sender = forked_state.engine_state.root_job_sender.clone();
+
         let source = nu_source.to_string();
+        let description = job_description(&source);
 
-        // Run evaluation in a blocking task since eval_block is synchronous
-        let eval_handle = tokio::task::spawn_blocking(move || eval_inner(forked_state, &source));
+        let (result_tx, mut result_rx) = oneshot::channel();
 
-        // Set up cancellation monitoring
-        let abort_handle = eval_handle.abort_handle();
-
-        // Spawn a task to trigger interrupt on cancellation
-        let interrupt_clone = interrupt.clone();
-        let ct_clone = ct.clone();
-        tokio::spawn(async move {
-            ct_clone.cancelled().await;
-            // Trigger nushell's interrupt signal to stop any running commands
-            interrupt_clone.store(true, std::sync::atomic::Ordering::Relaxed);
-            // Abort the blocking task
-            abort_handle.abort();
+        tokio::task::spawn_blocking(move || {
+            if result_tx.send(eval_inner(forked_state, &source)).is_err() {
+                tracing::debug!("evaluation result receiver dropped before completion");
+            }
         });
 
-        // Wait for evaluation to complete
-        match eval_handle.await {
-            Ok((new_state, eval_result)) => {
-                // Check if we were cancelled
-                if ct.is_cancelled() {
-                    return Err(cancelled_error());
-                }
-                // Commit the forked state back to main state
-                let mut state = self.state.lock().await;
-                *state = new_state;
-                eval_result
+        tokio::select! {
+            biased;
+            _ = ct.cancelled() => {
+                promote_to_background_job(result_rx, interrupt, jobs, root_job_sender, description)
             }
-            Err(join_error) => {
-                if join_error.is_cancelled() {
-                    Err(cancelled_error())
-                } else {
-                    Err(rmcp::ErrorData::internal_error(
-                        format!("Evaluation task panicked: {join_error}"),
-                        None,
-                    ))
+            result = &mut result_rx => match result {
+                Ok((new_state, eval_result)) => {
+                    let mut state = self.state.lock().await;
+                    *state = new_state;
+                    eval_result
                 }
+                Err(_) => Err(rmcp::ErrorData::internal_error(
+                    "Evaluation task panicked".to_string(),
+                    None,
+                )),
+            },
+            _ = tokio::time::sleep(promote_after) => {
+                promote_to_background_job(result_rx, interrupt, jobs, root_job_sender, description)
             }
         }
     }
@@ -338,8 +355,232 @@ impl Evaluator {
     #[cfg(test)]
     pub fn eval(&self, nu_source: &str) -> Result<String, rmcp::ErrorData> {
         // Create a runtime for sync evaluation in tests
-        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-        rt.block_on(self.eval_async(nu_source, CancellationToken::new()))
+        let rt = tokio::runtime::Runtime::new().map_err(|err| {
+            rmcp::ErrorData::internal_error(
+                format!("failed to create tokio runtime for test evaluation: {err}"),
+                None,
+            )
+        })?;
+        rt.block_on(self.eval_async_output(nu_source, CancellationToken::new()))
+            .map(|output| output.response)
+    }
+
+    pub async fn list_available_commands(&self, find: Option<String>) -> Result<String, String> {
+        let state = self.state.lock().await;
+        let commands: Vec<String> = state
+            .engine_state
+            .get_signatures_and_declids(false)
+            .into_iter()
+            .filter(|(sig, _)| {
+                if let Some(find) = &find {
+                    let find = find.to_lowercase();
+                    let name = sig.name.to_lowercase();
+                    let description = sig.description.to_lowercase();
+                    let search_terms = sig
+                        .search_terms
+                        .iter()
+                        .any(|term| term.to_lowercase().contains(&find));
+
+                    name.contains(&find) || description.contains(&find) || search_terms
+                } else {
+                    true
+                }
+            })
+            .map(|(sig, _)| format!("{} - {}", sig.call_signature(), sig.description))
+            .collect();
+
+        if commands.is_empty() {
+            return Err("No matching commands found".to_string());
+        }
+
+        Ok(commands.join("\n"))
+    }
+
+    pub async fn command_help(&self, command_name: &str) -> Result<String, String> {
+        let state = self.state.lock().await;
+
+        let signature = state
+            .engine_state
+            .get_signatures_and_declids(false)
+            .into_iter()
+            .find_map(|(sig, _)| {
+                if sig.name == command_name {
+                    Some(sig)
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| format!("command `{}` not found", command_name))?;
+
+        Ok(format_command_help(&signature))
+    }
+}
+
+fn format_command_help(signature: &nu_protocol::Signature) -> String {
+    let mut output = String::new();
+    let usage = signature.call_signature();
+
+    writeln!(output, "Command: {}", signature.name).ok();
+    writeln!(output, "Usage: {}", usage).ok();
+
+    if !signature.description.is_empty() {
+        writeln!(output, "\nDescription: {}", signature.description).ok();
+    }
+
+    if !signature.extra_description.is_empty() {
+        writeln!(output, "\nDetails: {}", signature.extra_description).ok();
+    }
+
+    if !signature.search_terms.is_empty() {
+        writeln!(
+            output,
+            "\nSearch terms: {}",
+            signature.search_terms.join(", ")
+        )
+        .ok();
+    }
+
+    if !signature.named.is_empty() {
+        writeln!(output, "\nFlags:").ok();
+        for flag in &signature.named {
+            let short = flag.short.map(|s| format!("-{}, ", s)).unwrap_or_default();
+            let arg = flag
+                .arg
+                .as_ref()
+                .map(|shape| format!(" <{shape}>", shape = shape))
+                .unwrap_or_default();
+            writeln!(output, "  {}--{}{}: {}", short, flag.long, arg, flag.desc).ok();
+        }
+    }
+
+    if !signature.required_positional.is_empty()
+        || !signature.optional_positional.is_empty()
+        || signature.rest_positional.is_some()
+    {
+        writeln!(output, "\nParameters:").ok();
+
+        for positional in &signature.required_positional {
+            writeln!(output, "  {}: {}", positional.name, positional.desc).ok();
+        }
+
+        for positional in &signature.optional_positional {
+            writeln!(output, "  [{}]: {}", positional.name, positional.desc).ok();
+        }
+
+        if let Some(rest) = &signature.rest_positional {
+            writeln!(output, "  ...{}: {}", rest.name, rest.desc).ok();
+        }
+    }
+
+    output.trim_end().to_string()
+}
+
+/// Result of a successful evaluation, containing both the MCP response
+/// (which may truncate large output with a `$history` reference) and the
+/// full untruncated output for use by promoted background jobs.
+#[derive(Debug)]
+struct EvalOutput {
+    /// The formatted MCP response (NUON record with cwd, history_index, output/note).
+    response: String,
+    /// JSON mirror of `response` for MCP clients that support structured output.
+    structured_content: JsonValue,
+    /// The full output NUON string, never truncated.
+    full_output: String,
+}
+
+impl EvalOutput {
+    fn into_call_tool_result(self) -> CallToolResult {
+        call_tool_result(self.response, self.structured_content, false)
+    }
+}
+
+fn call_tool_result(text: String, structured_content: JsonValue, is_error: bool) -> CallToolResult {
+    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+    result.is_error = Some(is_error);
+    result.structured_content = Some(structured_content);
+    result
+}
+
+fn error_call_tool_result(err: rmcp::ErrorData) -> CallToolResult {
+    let message = err.message.to_string();
+    let structured_content = err
+        .data
+        .unwrap_or_else(|| json!({ "msg": message.clone() }));
+
+    call_tool_result(message, structured_content, true)
+}
+
+/// Registers a [`ThreadJob`] for a still-running evaluation and spawns a task
+/// that delivers results to the main thread's mailbox (job 0) on completion.
+/// Shares the forked evaluation's interrupt signal so `job kill` works.
+///
+/// The promoted path sends the **full** (non-truncated) output through the
+/// mailbox so `job recv` returns usable data instead of a dangling `$history`
+/// reference.
+fn promote_to_background_job(
+    result_rx: oneshot::Receiver<(EvalState, Result<EvalOutput, rmcp::ErrorData>)>,
+    interrupt: Arc<AtomicBool>,
+    jobs: Arc<SyncMutex<Jobs>>,
+    root_job_sender: Sender<Mail>,
+    description: String,
+) -> Result<EvalOutput, rmcp::ErrorData> {
+    let signals = Signals::new(interrupt);
+    let (sender, _receiver) = mpsc::channel();
+    let thread_job = ThreadJob::new(signals, Some(description), sender);
+
+    let job_id = match jobs.lock() {
+        Ok(mut jobs) => jobs.add_job(Job::Thread(thread_job)),
+        Err(err) => {
+            return Err(rmcp::ErrorData::internal_error(
+                format!("failed to register background job: jobs lock poisoned ({err})"),
+                None,
+            ));
+        }
+    };
+
+    tokio::spawn(async move {
+        let output = match result_rx.await {
+            Ok((_state, Ok(eval_output))) => eval_output.full_output,
+            Ok((_state, Err(err))) => format!("Error: {}", err.message),
+            Err(_) => "Evaluation task panicked".to_string(),
+        };
+
+        let value = Value::string(output, Span::unknown());
+        if root_job_sender
+            .send((None, PipelineData::value(value, None)))
+            .is_err()
+        {
+            tracing::warn!("failed to send background job output to root mailbox");
+        }
+
+        match jobs.lock() {
+            Ok(mut jobs) => {
+                jobs.remove_job(job_id);
+            }
+            Err(err) => {
+                tracing::warn!("failed to remove finished background job: {err}");
+            }
+        }
+    });
+
+    Err(rmcp::ErrorData::internal_error(
+        format!(
+            "Operation promoted to background job (id: {}). \
+             Use `job list` to see it and `job recv` to get the result.",
+            job_id.get()
+        ),
+        None,
+    ))
+}
+
+/// Creates a short description for display in `job list`.
+fn job_description(source: &str) -> String {
+    let first_line = source.lines().next().unwrap_or(source);
+    if first_line.len() <= JOB_DESCRIPTION_MAX_LEN {
+        format!("mcp: {first_line}")
+    } else {
+        let truncated: String = first_line.chars().take(JOB_DESCRIPTION_MAX_LEN).collect();
+        format!("mcp: {truncated}...")
     }
 }
 
@@ -350,7 +591,7 @@ impl Evaluator {
 fn eval_inner(
     mut state: EvalState,
     nu_source: &str,
-) -> (EvalState, Result<String, rmcp::ErrorData>) {
+) -> (EvalState, Result<EvalOutput, rmcp::ErrorData>) {
     let EvalState {
         engine_state,
         stack,
@@ -367,39 +608,45 @@ fn eval_on_state(
     stack: &mut Stack,
     history: &mut History,
     nu_source: &str,
-) -> Result<String, rmcp::ErrorData> {
+) -> Result<EvalOutput, rmcp::ErrorData> {
     let (block, delta) = {
         let mut working_set = StateWorkingSet::new(engine_state);
         let block = nu_parser::parse(&mut working_set, None, nu_source.as_bytes(), false);
 
         if let Some(err) = working_set.parse_errors.first() {
-            return Err(user_input_error(&working_set, err, None));
+            let span = block.span.unwrap_or(Span::unknown());
+            return Err(user_input_error(&working_set, err, None, span));
         }
 
         if let Some(err) = working_set.compile_errors.first() {
-            return Err(user_input_error(&working_set, err, None));
+            let span = block.span.unwrap_or(Span::unknown());
+            return Err(user_input_error(&working_set, err, None, span));
         }
 
         (block, working_set.render())
     };
 
+    let block_span = block.span.unwrap_or(Span::unknown());
+
     engine_state
         .merge_delta(delta)
-        .map_err(|e| shell_error_to_mcp_error(e, engine_state))?;
+        .map_err(|e| shell_error_to_mcp_error(e, engine_state, block_span))?;
 
     // Set up $history variable on the stack before evaluation
-    stack.add_var(history.var_id(), history.as_value());
+    if let Some(history_var_id) = history.var_id() {
+        stack.add_var(history_var_id, history.as_value());
+    }
 
     let output =
         nu_engine::eval_block::<WithoutDebug>(engine_state, stack, &block, PipelineData::empty())
-            .map_err(|e| shell_error_to_mcp_error(e, engine_state))?;
+            .map_err(|e| shell_error_to_mcp_error(e, engine_state, block_span))?;
 
     let cwd = engine_state
         .cwd(Some(stack))
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| String::from("unknown"));
 
-    let (output_value, output_nuon) = process_pipeline(output, engine_state)?;
+    let (output_value, output_nuon) = process_pipeline(output, engine_state, block_span)?;
 
     // Create timestamp for response
     let timestamp = SystemTime::now()
@@ -409,39 +656,69 @@ fn eval_on_state(
     let timestamp_value = chrono::DateTime::from_timestamp_nanos(timestamp).fixed_offset();
 
     // Store in history
-    let history_index = history.push(output_value, engine_state, stack);
+    let history_index = history.push(output_value.clone(), engine_state, stack);
 
     let truncated =
         output_limit(engine_state, stack).is_some_and(|limit| output_nuon.len() > limit);
 
-    let mut record = nu_protocol::record! {
-        "cwd" => Value::string(cwd, Span::unknown()),
-        "history_index" => Value::int(history_index as i64, Span::unknown()),
-        "timestamp" => Value::date(timestamp_value, Span::unknown()),
+    let mut response_record = nu_protocol::record! {
+        "cwd" => Value::string(cwd, block_span),
+        "history_index" => Value::int(history_index as i64, block_span),
+        "timestamp" => Value::date(timestamp_value, block_span),
     };
 
     if truncated {
-        record.push(
-            "note",
-            Value::string(
-                format!("output truncated, full result in $history.{history_index}"),
-                Span::unknown(),
-            ),
-        );
+        let note = format!("output truncated, full result in $history.{history_index}");
+        response_record.push("note", Value::string(note, block_span));
     } else {
-        record.push("output", Value::string(output_nuon, Span::unknown()));
+        response_record.push("output", output_value);
     }
 
-    let response = Value::record(record, Span::unknown());
+    let response_value = Value::record(response_record, block_span);
+    let nuon_config = nuon::ToNuonConfig::default()
+        .style(nuon::ToStyle::Raw)
+        .raw_strings(true)
+        .span(Some(block_span));
 
-    nuon::to_nuon(
-        engine_state,
-        &response,
-        nuon::ToNuonConfig::default()
-            .style(nuon::ToStyle::Raw)
-            .span(Some(Span::unknown())),
-    )
-    .map_err(|e| shell_error_to_mcp_error(e, engine_state))
+    let response = nuon::to_nuon(engine_state, &response_value, nuon_config)
+        .map_err(|e| shell_error_to_mcp_error(e, engine_state, block_span))?;
+    let structured_content = structured_json_from_value(response_value, engine_state, block_span)?;
+
+    Ok(EvalOutput {
+        response,
+        structured_content,
+        full_output: output_nuon,
+    })
+}
+
+fn structured_json_from_value(
+    value: Value,
+    engine_state: &EngineState,
+    span: Span,
+) -> Result<JsonValue, rmcp::ErrorData> {
+    let value = nu_json::Value::from_value_serialized(value, engine_state)
+        .map_err(|e| shell_error_to_mcp_error(e, engine_state, span))?;
+
+    serde_json::to_value(value).map_err(|err| {
+        rmcp::ErrorData::internal_error(
+            format!("failed to serialize structured MCP content: {err}"),
+            None,
+        )
+    })
+}
+
+/// Returns the duration after which a running evaluation is auto-promoted
+/// to a background job.
+///
+/// Defaults to [`DEFAULT_PROMOTE_AFTER`] (2 minutes). Can be overridden via
+/// `NU_MCP_PROMOTE_AFTER` env var on the persistent stack.
+fn promote_timeout(engine_state: &EngineState, stack: &Stack) -> Duration {
+    stack
+        .get_env_var(engine_state, "NU_MCP_PROMOTE_AFTER")
+        .and_then(|v| v.as_duration().ok())
+        .and_then(|nanos| u64::try_from(nanos).ok())
+        .map(Duration::from_nanos)
+        .unwrap_or(DEFAULT_PROMOTE_AFTER)
 }
 
 /// Returns the output limit in bytes.
@@ -461,17 +738,23 @@ fn output_limit(engine_state: &EngineState, stack: &Stack) -> Option<usize> {
 fn process_pipeline(
     pipeline_execution_data: PipelineExecutionData,
     engine_state: &EngineState,
+    call_span: Span,
 ) -> Result<(Value, String), rmcp::ErrorData> {
-    let span = pipeline_execution_data.span();
+    let span = pipeline_execution_data.span().unwrap_or(call_span);
 
     if let PipelineData::ByteStream(stream, ..) = pipeline_execution_data.body {
         // Try to handle as a child process first (external commands)
         // This properly handles both stdout and stderr when capture_all() is used
         match stream.into_child() {
-            Ok(child) => {
+            Ok(mut child) => {
+                // `process_pipeline` reports the captured output itself. Mark the child
+                // exit status as handled so `pipefail` does not re-raise a
+                // `non_zero_exit_code` after we already collected stdout/stderr.
+                child.ignore_error(true);
+
                 let output = child
                     .wait_with_output()
-                    .map_err(|e| shell_error_to_mcp_error(e, engine_state))?;
+                    .map_err(|e| shell_error_to_mcp_error(e, engine_state, call_span))?;
 
                 // Combine stdout and stderr into a single output
                 let mut combined = Vec::new();
@@ -486,7 +769,7 @@ fn process_pipeline(
                 }
 
                 let string_output = String::from_utf8_lossy(&combined).into_owned();
-                let value = Value::string(&string_output, Span::unknown());
+                let value = Value::string(&string_output, span);
                 return Ok((value, string_output));
             }
             Err(stream) => {
@@ -494,9 +777,9 @@ fn process_pipeline(
                 let mut buffer = Vec::new();
                 stream
                     .write_to(&mut buffer)
-                    .map_err(|e| shell_error_to_mcp_error(e, engine_state))?;
+                    .map_err(|e| shell_error_to_mcp_error(e, engine_state, call_span))?;
                 let string_output = String::from_utf8_lossy(&buffer).into_owned();
-                let value = Value::string(&string_output, Span::unknown());
+                let value = Value::string(&string_output, span);
                 return Ok((value, string_output));
             }
         }
@@ -505,16 +788,18 @@ fn process_pipeline(
     let mut values = Vec::new();
     for item in pipeline_execution_data.body {
         if let Value::Error { error, .. } = &item {
-            return Err(shell_error_to_mcp_error(*error.clone(), engine_state));
+            return Err(shell_error_to_mcp_error(
+                *error.clone(),
+                engine_state,
+                call_span,
+            ));
         }
         values.push(item);
     }
 
     let value_to_store = match values.len() {
-        1 => values
-            .pop()
-            .expect("values has exactly one element; this cannot fail"),
-        _ => Value::list(values, span.unwrap_or(Span::unknown())),
+        1 => values.pop().unwrap_or_else(|| Value::nothing(span)),
+        _ => Value::list(values, span),
     };
 
     let nuon_string = nuon::to_nuon(
@@ -522,9 +807,9 @@ fn process_pipeline(
         &value_to_store,
         nuon::ToNuonConfig::default()
             .style(nuon::ToStyle::Raw)
-            .span(Some(Span::unknown())),
+            .span(Some(call_span)),
     )
-    .map_err(|e| shell_error_to_mcp_error(e, engine_state))?;
+    .map_err(|e| shell_error_to_mcp_error(e, engine_state, call_span))?;
 
     Ok((value_to_store, nuon_string))
 }
@@ -532,6 +817,123 @@ fn process_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use nu_engine::eval_expression;
+    #[cfg(unix)]
+    use nu_protocol::engine::StateWorkingSet;
+    #[cfg(unix)]
+    use nu_protocol::{
+        ShellError, Signature, SyntaxShape, Value,
+        engine::{Call, Command as NuCommand},
+        shell_error::io::IoError,
+    };
+    #[cfg(unix)]
+    use std::process::{Command as ProcessCommand, Stdio};
+
+    fn tool_result_text(result: &CallToolResult) -> &str {
+        result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|text| text.text.as_str())
+            .unwrap_or("")
+    }
+
+    fn assert_tool_success(result: &CallToolResult) {
+        assert_eq!(
+            result.is_error,
+            Some(false),
+            "tool result should succeed, got: {}",
+            tool_result_text(result)
+        );
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone)]
+    struct TestRunExternal;
+
+    #[cfg(unix)]
+    impl NuCommand for TestRunExternal {
+        fn name(&self) -> &str {
+            "run-external"
+        }
+
+        fn signature(&self) -> Signature {
+            Signature::build("run-external")
+                .rest(
+                    "args",
+                    SyntaxShape::String,
+                    "External command and arguments",
+                )
+                .allows_unknown_args()
+        }
+
+        fn description(&self) -> &str {
+            "Run an external command for test coverage"
+        }
+
+        fn run(
+            &self,
+            engine_state: &EngineState,
+            stack: &mut Stack,
+            call: &Call,
+            _input: PipelineData,
+        ) -> Result<PipelineData, ShellError> {
+            let args: Vec<Value> =
+                call.rest_iter_flattened(engine_state, stack, eval_expression::<WithoutDebug>, 0)?;
+            let args = args
+                .into_iter()
+                .map(|value| value.coerce_into_string())
+                .collect::<Result<Vec<_>, ShellError>>()?;
+
+            let mut args = args.into_iter();
+            let program = args.next().ok_or_else(|| ShellError::MissingParameter {
+                param_name: "external command".into(),
+                span: call.head,
+            })?;
+
+            let output = ProcessCommand::new(program)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .map_err(IoError::factory(call.head, None))?;
+
+            let mut combined = Vec::new();
+            combined.extend(output.stdout);
+            if !output.stderr.is_empty() {
+                if !combined.is_empty() {
+                    combined.push(b'\n');
+                }
+                combined.extend(output.stderr);
+            }
+
+            let output_string = String::from_utf8_lossy(&combined).into_owned();
+            Ok(PipelineData::Value(
+                Value::string(output_string, call.head),
+                None,
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    fn external_engine_state() -> EngineState {
+        let mut engine_state = nu_cmd_lang::create_default_context();
+        let mut working_set = StateWorkingSet::new(&engine_state);
+        working_set.add_decl(Box::new(TestRunExternal));
+        engine_state
+            .merge_delta(working_set.render())
+            .expect("should add run-external command");
+
+        let cwd = std::env::current_dir().expect("current directory should exist");
+        engine_state.add_env_var("PWD".into(), Value::test_string(cwd.to_string_lossy()));
+        engine_state.add_env_var(
+            "PATH".into(),
+            Value::test_string(std::env::var("PATH").expect("PATH should be set")),
+        );
+        engine_state
+    }
 
     #[test]
     fn test_evaluator_response_format() -> Result<(), Box<dyn std::error::Error>> {
@@ -559,6 +961,57 @@ mod tests {
             result.contains("42"),
             "Output should contain the evaluated value, got: {result}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_string_output_is_not_double_escaped() -> Result<(), Box<dyn std::error::Error>> {
+        let engine_state = nu_cmd_lang::create_default_context();
+        let evaluator = Evaluator::new(engine_state);
+
+        let result_nuon = evaluator.eval("'hello world'")?;
+        let result = nuon::from_nuon(&result_nuon, None)?;
+
+        let output = result
+            .into_record()?
+            .remove("output")
+            .ok_or("missing output field in evaluate response")?
+            .into_string()?;
+
+        assert_eq!(
+            output, "hello world",
+            "string output should not include serialized quote wrappers, got: {result_nuon}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_structured_output_is_not_string_wrapped() -> Result<(), Box<dyn std::error::Error>> {
+        let engine_state = nu_cmd_lang::create_default_context();
+        let evaluator = Evaluator::new(engine_state);
+
+        let result_nuon = evaluator.eval("{a: 1, b: [2 3]}")?;
+        let result = nuon::from_nuon(&result_nuon, None)?;
+        let output = result
+            .into_record()?
+            .remove("output")
+            .ok_or("missing output field in evaluate response")?;
+        let output = output.into_record()?;
+
+        assert_eq!(
+            output.get("a").ok_or("missing a field")?.as_int()?,
+            1,
+            "record output should remain a record, got: {result_nuon}"
+        );
+        assert!(
+            matches!(
+                output.get("b").ok_or("missing b field")?,
+                Value::List { .. }
+            ),
+            "list field should remain a list, got: {result_nuon}"
+        );
+
         Ok(())
     }
 
@@ -663,10 +1116,11 @@ mod tests {
         let err = result.unwrap_err();
         let err_msg = err.message.to_string();
 
-        // Error should be in NUON format with structured fields
+        // Error should be in NUON format with structured fields.
+        // Incomplete list `[1, 2, 3` is reported as unclosed delimiter (need `]`).
         assert!(
-            err_msg.contains("code:") && err_msg.contains("nu::parser::unexpected_eof"),
-            "Error message should contain code field with 'nu::parser::unexpected_eof', but got: {err_msg}"
+            err_msg.contains("code:") && err_msg.contains("nu::parser::unclosed_delimiter"),
+            "Error message should contain code field with 'nu::parser::unclosed_delimiter', but got: {err_msg}"
         );
 
         assert!(
@@ -763,7 +1217,7 @@ mod tests {
         };
         let evaluator = Evaluator::new(engine_state);
 
-        let result = evaluator.eval(r#"do { |x| $x + 1 } 41"#);
+        let result = evaluator.eval("do { |x| $x + 1 } 41");
 
         assert!(
             result.is_ok(),
@@ -819,6 +1273,117 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_failing_external_command_returns_captured_output()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let engine_state = external_engine_state();
+        let evaluator = Evaluator::new(engine_state);
+
+        let result = evaluator.eval("sh -c 'printf stdout; printf stderr >&2; exit 7'")?;
+
+        assert!(
+            result.contains("stdout"),
+            "Expected stdout from external command, got: {result}"
+        );
+        assert!(
+            result.contains("stderr"),
+            "Expected stderr from external command, got: {result}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn promote_timeout_defaults_when_env_var_unset() {
+        let engine_state = nu_cmd_lang::create_default_context();
+        let evaluator = Evaluator::new(engine_state);
+
+        let state = evaluator.state.lock().await;
+        assert_eq!(
+            promote_timeout(&state.engine_state, &state.stack),
+            DEFAULT_PROMOTE_AFTER,
+            "without NU_MCP_PROMOTE_AFTER the default 2-minute timeout should apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_timeout_reads_nu_mcp_promote_after_env_var() {
+        let engine_state = nu_cmd_lang::create_default_context();
+        let evaluator = Evaluator::new(engine_state);
+
+        let result = evaluator
+            .eval_async(
+                "$env.NU_MCP_PROMOTE_AFTER = 750ms",
+                CancellationToken::new(),
+            )
+            .await;
+        assert_tool_success(&result);
+
+        let state = evaluator.state.lock().await;
+        assert_eq!(
+            promote_timeout(&state.engine_state, &state.stack),
+            Duration::from_millis(750),
+            "promote_timeout should honor NU_MCP_PROMOTE_AFTER on the persistent stack"
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_timeout_ignores_malformed_env_var() {
+        let engine_state = nu_cmd_lang::create_default_context();
+        let evaluator = Evaluator::new(engine_state);
+
+        // A non-duration value must not override the default; otherwise a typo
+        // could silently disable promotion entirely.
+        let result = evaluator
+            .eval_async(
+                "$env.NU_MCP_PROMOTE_AFTER = 'not-a-duration'",
+                CancellationToken::new(),
+            )
+            .await;
+        assert_tool_success(&result);
+
+        let state = evaluator.state.lock().await;
+        assert_eq!(
+            promote_timeout(&state.engine_state, &state.stack),
+            DEFAULT_PROMOTE_AFTER,
+            "malformed NU_MCP_PROMOTE_AFTER should fall back to the default"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_external_command_promotion_respects_promote_after_env() {
+        let engine_state = external_engine_state();
+        let evaluator = Evaluator::new(engine_state);
+
+        let result = evaluator
+            .eval_async(
+                "$env.NU_MCP_PROMOTE_AFTER = 100ms",
+                CancellationToken::new(),
+            )
+            .await;
+        assert_tool_success(&result);
+
+        let result = evaluator
+            .eval_async(
+                "sh -c 'sleep 0.2; printf stdout; printf stderr >&2; exit 7'",
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "long-running external command should be promoted"
+        );
+        let err_msg = tool_result_text(&result);
+        assert!(
+            err_msg.contains("promoted to background job"),
+            "promotion error should mention background jobs, got: {err_msg}"
+        );
+    }
+
     #[test]
     fn test_history_ring_buffer() -> Result<(), Box<dyn std::error::Error>> {
         let engine_state = nu_cmd_lang::create_default_context();
@@ -857,15 +1422,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cancellation_discards_state() {
+    async fn test_cancellation_promotes_to_background_job() {
         let engine_state = nu_cmd_lang::create_default_context();
         let evaluator = Evaluator::new(engine_state);
 
         // Set a variable first
-        evaluator
+        let result = evaluator
             .eval_async("let x = 1", CancellationToken::new())
-            .await
-            .unwrap();
+            .await;
+        assert_tool_success(&result);
 
         // Start an evaluation that we'll cancel
         let ct = CancellationToken::new();
@@ -874,18 +1439,87 @@ mod tests {
         // Cancel immediately
         ct_clone.cancel();
 
-        // This should be cancelled and state should not change
+        // Should be promoted to a background job, not just discarded
         let result = evaluator.eval_async("let x = 999", ct).await;
-        assert!(result.is_err(), "Cancelled evaluation should error");
-
-        // Original variable should still be 1
-        let result = evaluator
-            .eval_async("$x", CancellationToken::new())
-            .await
-            .unwrap();
-        assert!(
-            result.contains('1') && !result.contains("999"),
-            "Variable should still be 1 after cancelled eval, got: {result}"
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "Cancelled evaluation should error"
         );
+        let err_msg = tool_result_text(&result);
+        assert!(
+            err_msg.contains("promoted to background job"),
+            "Error should mention promotion, got: {err_msg}"
+        );
+
+        // Original variable should still be 1 (forked state not committed)
+        let result = evaluator.eval_async("$x", CancellationToken::new()).await;
+        assert_tool_success(&result);
+        let output = result
+            .structured_content
+            .and_then(|value| value.get("output").cloned())
+            .and_then(|value| value.as_i64())
+            .unwrap();
+        assert_eq!(output, 1, "Variable should still be 1 after promoted eval");
+    }
+
+    #[tokio::test]
+    async fn test_promoted_background_job_sends_full_output() {
+        let mut engine_state = nu_cmd_lang::create_default_context();
+        let history = History::new(&mut engine_state);
+        let state = EvalState {
+            engine_state,
+            stack: Stack::new(),
+            history,
+        };
+
+        let (result_tx, result_rx) = oneshot::channel();
+        let (mail_tx, mail_rx) = mpsc::channel();
+        let jobs = Arc::new(SyncMutex::new(Jobs::default()));
+        let description = "mcp: test".to_string();
+
+        let eval_output = EvalOutput {
+            response: "response note".to_string(),
+            structured_content: json!({ "note": "response note" }),
+            full_output: "full background output".to_string(),
+        };
+
+        result_tx
+            .send((state, Ok(eval_output)))
+            .unwrap_or_else(|_| panic!("send background result should succeed"));
+
+        let err = promote_to_background_job(
+            result_rx,
+            Arc::new(AtomicBool::new(false)),
+            jobs,
+            mail_tx,
+            description,
+        )
+        .expect_err("promotion should return an error indicating background job promotion");
+
+        assert!(
+            err.message.contains("promoted to background job"),
+            "promotion error should mention background jobs, got: {}",
+            err.message
+        );
+
+        let (_tag, pipeline_data) = loop {
+            match mail_rx.try_recv() {
+                Ok(mail) => break mail,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(err) => panic!("mailbox receive failed: {err}"),
+            }
+        };
+
+        let value = pipeline_data
+            .into_value(Span::unknown())
+            .expect("mailbox payload should convert to value");
+        let Value::String { val, .. } = value else {
+            panic!("expected string payload, got: {value:?}");
+        };
+
+        assert_eq!(val, "full background output");
     }
 }

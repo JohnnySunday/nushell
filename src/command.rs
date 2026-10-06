@@ -1,12 +1,17 @@
-use crate::test_bins;
 use lexopt::prelude::*;
 use nu_experimental as experimental_options;
 use nu_parser::escape_for_script_arg;
 use nu_protocol::{
     LabeledError, ShellError, Span, Spanned, Value, config::TableMode, did_you_mean,
 };
-use nu_utils::stdout_write_all_and_flush;
-use std::{ffi::OsString, fmt, path::Path};
+use nu_utils::{stdout_write_all_and_flush, strip_ansi_string_likely};
+#[cfg(feature = "plugin")]
+use std::path::Path;
+use std::{
+    ffi::OsString,
+    fmt::{self, Write},
+    io::IsTerminal,
+};
 
 const HELP_SECTION_COLOR: &str = "\x1b[32m";
 const HELP_FLAG_COLOR: &str = "\x1b[36m";
@@ -21,6 +26,7 @@ const TABLE_MODE_VALUES: &[&str] = &[
     "thin",
     "light",
     "compact",
+    "frameless",
     "with_love",
     "compact_double",
     "default",
@@ -38,27 +44,10 @@ const TABLE_MODE_VALUES: &[&str] = &[
     "double",
 ];
 const ERROR_STYLE_VALUES: &[&str] = &["fancy", "plain", "short"];
-const LOG_LEVEL_VALUES: &[&str] = &["error", "warn", "info", "debug", "trace"];
+const LOG_LEVEL_VALUES: &[&str] = &["error", "warn", "info", "debug", "trace", "perf"];
 const LOG_TARGET_VALUES: &[&str] = &["stdout", "stderr", "mixed", "file"];
+#[cfg(feature = "mcp")]
 const MCP_TRANSPORT_VALUES: &[&str] = &["stdio", "http"];
-const TEST_BIN_VALUES: &[&str] = &[
-    "echo_env",
-    "echo_env_stderr",
-    "echo_env_stderr_fail",
-    "echo_env_mixed",
-    "cococo",
-    "meow",
-    "meowb",
-    "relay",
-    "iecho",
-    "fail",
-    "nonu",
-    "chop",
-    "repeater",
-    "repeat_bytes",
-    "nu_repl",
-    "input_bytes_length",
-];
 
 // Parsed CLI output with nushell flags and script information.
 #[derive(Clone, Debug)]
@@ -88,7 +77,6 @@ enum ValueHint {
     Int,
     Path,
     ListString,
-    ListPath,
 }
 
 // Metadata describing a CLI flag in the lexopt parser.
@@ -256,10 +244,18 @@ const CLI_FLAGS: &[CliFlag] = &[
         "nu --env-config env.nu",
     ),
     CliFlag::value(
+        "config-home",
+        None,
+        ValueHint::Path,
+        "start with an alternate config directory (e.g. ~/.config/nushell)",
+        CliCategory::Config,
+        "nu --config-home /path/to/config",
+    ),
+    CliFlag::value(
         "log-level",
         None,
         ValueHint::String,
-        "log level for diagnostic logs (error, warn, info, debug, trace). Off by default",
+        "log level for diagnostic logs (error, warn, perf, info, debug, trace). Off by default",
         CliCategory::Logging,
         "nu --log-level info",
     ),
@@ -285,7 +281,7 @@ const CLI_FLAGS: &[CliFlag] = &[
         ValueHint::ListString,
         "set the Rust module prefixes to include from the log output",
         CliCategory::Logging,
-        "nu --log-include info",
+        "nu --log-include nu_cli",
     ),
     CliFlag::value(
         "log-exclude",
@@ -293,7 +289,7 @@ const CLI_FLAGS: &[CliFlag] = &[
         ValueHint::ListString,
         "set the Rust module prefixes to exclude from the log output",
         CliCategory::Logging,
-        "nu --log-exclude info",
+        "nu --log-exclude nu_cli",
     ),
     CliFlag::switch(
         "stdin",
@@ -303,14 +299,6 @@ const CLI_FLAGS: &[CliFlag] = &[
         "nu --stdin -c \"print $in\"",
     ),
     CliFlag::value(
-        "testbin",
-        None,
-        ValueHint::String,
-        "run an internal test binary (see available bins below)",
-        CliCategory::Startup,
-        "nu --testbin cococo",
-    ),
-    CliFlag::value(
         "experimental-options",
         None,
         ValueHint::ListString,
@@ -318,6 +306,7 @@ const CLI_FLAGS: &[CliFlag] = &[
         CliCategory::Experimental,
         "nu --experimental-options [example=false]",
     ),
+    #[cfg(feature = "lsp")]
     CliFlag::switch(
         "lsp",
         None,
@@ -325,29 +314,37 @@ const CLI_FLAGS: &[CliFlag] = &[
         CliCategory::Ide,
         "nu --lsp",
     ),
+    #[cfg(feature = "dap")]
+    CliFlag::switch(
+        "dap",
+        None,
+        "start nu's debug adapter protocol server (over stdio)",
+        CliCategory::Ide,
+        "nu --dap",
+    ),
     CliFlag::value(
         "ide-goto-def",
         None,
         ValueHint::Int,
-        "go to the definition of the item at the given position",
+        "go to the definition of the item at the given cursor position and file",
         CliCategory::Ide,
-        "nu --ide-goto-def 0",
+        "nu --ide-goto-def 0 script.nu",
     ),
     CliFlag::value(
         "ide-hover",
         None,
         ValueHint::Int,
-        "give information about the item at the given position",
+        "give information about the item at the given cursor position and file",
         CliCategory::Ide,
-        "nu --ide-hover 0",
+        "nu --ide-hover 0 script.nu",
     ),
     CliFlag::value(
         "ide-complete",
         None,
         ValueHint::Int,
-        "list completions for the item at the given position",
+        "list completions for the item at the given cursor position and file",
         CliCategory::Ide,
-        "nu --ide-complete 0",
+        "nu --ide-complete 4 script.nu",
     ),
     CliFlag::value(
         "ide-check",
@@ -355,14 +352,14 @@ const CLI_FLAGS: &[CliFlag] = &[
         ValueHint::Int,
         "run a diagnostic check on the given source and limit number of errors returned to provided number",
         CliCategory::Ide,
-        "nu --ide-check 0",
+        "nu --ide-check 100 script.nu",
     ),
     CliFlag::switch(
         "ide-ast",
         None,
         "generate the ast on the given source",
         CliCategory::Ide,
-        "nu --ide-ast -c \"print 1\"",
+        "nu --ide-ast script.nu",
     ),
     #[cfg(feature = "plugin")]
     CliFlag::value(
@@ -377,10 +374,10 @@ const CLI_FLAGS: &[CliFlag] = &[
     CliFlag::value(
         "plugins",
         None,
-        ValueHint::ListPath,
-        "list of plugin executable files to load (full paths), separately from the registry file",
+        ValueHint::Path,
+        "list of plugin executable files to load (full paths), separately from the registry file (use multiple `--plugins` flags or a bracketed list: `--plugins '[/path/a /path/b]'`)",
         CliCategory::Plugins,
-        "nu --plugins /path/nu_plugin_one /path/nu_plugin_two",
+        "nu --plugins /path/nu_plugin_one --plugins /path/nu_plugin_two",
     ),
     #[cfg(feature = "mcp")]
     CliFlag::switch(
@@ -408,6 +405,15 @@ const CLI_FLAGS: &[CliFlag] = &[
         CliCategory::Startup,
         "nu --mcp --mcp-transport http --mcp-port 3000",
     ),
+    #[cfg(feature = "mcp")]
+    CliFlag::value(
+        "mcp-host",
+        None,
+        ValueHint::String,
+        "host for MCP HTTP transhost (default 127.0.0.1)",
+        CliCategory::Startup,
+        "nu --mcp --mcp-transhost http --mcp-host 0.0.0.0",
+    ),
 ];
 
 // Container for parsed CLI values before conversion to NushellCliArgs.
@@ -417,7 +423,6 @@ struct CliValues {
     login_shell: Option<Spanned<String>>,
     interactive_shell: Option<Spanned<String>>,
     commands: Option<Spanned<String>>,
-    testbin: Option<Spanned<String>>,
     #[cfg(feature = "plugin")]
     plugin_file: Option<Spanned<String>>,
     #[cfg(feature = "plugin")]
@@ -427,6 +432,7 @@ struct CliValues {
     no_std_lib: Option<Spanned<String>>,
     config_file: Option<Spanned<String>>,
     env_file: Option<Spanned<String>>,
+    config_home: Option<Spanned<String>>,
     log_level: Option<Spanned<String>>,
     log_target: Option<Spanned<String>>,
     log_file: Option<Spanned<String>>,
@@ -437,7 +443,10 @@ struct CliValues {
     error_style: Option<Value>,
     no_newline: Option<Spanned<String>>,
     include_path: Option<Spanned<String>>,
+    #[cfg(feature = "lsp")]
     lsp: bool,
+    #[cfg(feature = "dap")]
+    dap: bool,
     ide_goto_def: Option<Value>,
     ide_hover: Option<Value>,
     ide_complete: Option<Value>,
@@ -450,6 +459,8 @@ struct CliValues {
     mcp_transport: Option<Spanned<String>>,
     #[cfg(feature = "mcp")]
     mcp_port: Option<u16>,
+    #[cfg(feature = "mcp")]
+    mcp_host: Option<String>,
 }
 
 // Error type for CLI parsing with optional help text.
@@ -527,9 +538,25 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
     }
 
     while let Some(arg) = parser.next().map_err(map_lexopt_error)? {
+        let mut consume_remaining_args = |parser: &mut lexopt::Parser| {
+            let rest = parser
+                .raw_args()
+                .map_err(map_lexopt_error)?
+                .map(|arg| arg.to_string_lossy().to_string())
+                .map(|arg| escape_for_script_arg(&arg))
+                .collect::<Vec<_>>();
+            args_to_script.extend(rest);
+            Ok(())
+        };
+
         match arg {
             Short('h') | Long("help") => {
                 let help = cli_help_text();
+                let help = if std::io::stdout().is_terminal() {
+                    help
+                } else {
+                    strip_ansi_string_likely(help)
+                };
                 let _ = std::panic::catch_unwind(move || stdout_write_all_and_flush(help));
                 std::process::exit(0);
             }
@@ -545,6 +572,8 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
             Short('c') | Long("commands") => {
                 let value = parse_string_value(&mut parser, "commands")?;
                 cli.commands = Some(spanned_value(value));
+                consume_remaining_args(&mut parser)?;
+                break;
             }
             Short('e') | Long("execute") => {
                 let value = parse_string_value(&mut parser, "execute")?;
@@ -558,6 +587,7 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
                 let value = parse_string_value(&mut parser, "table-mode")?;
                 let normalized = value.trim().to_ascii_lowercase();
                 match normalized.parse::<TableMode>() {
+                    // No source span — CLI argument parsing happens before engine setup
                     Ok(_) => cli.table_mode = Some(Value::string(value, Span::unknown())),
                     Err(valid) => {
                         let suggestion = did_you_mean(TABLE_MODE_VALUES, &normalized)
@@ -581,6 +611,7 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
                     "error style",
                 )?;
                 // Store original case value for error-style
+                // No source span — CLI argument parsing happens before engine setup
                 cli.error_style = Some(Value::string(normalized, Span::unknown()));
             }
             Long("no-newline") => cli.no_newline = Some(spanned_true()),
@@ -594,6 +625,10 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
             Long("env-config") => {
                 let value = parse_string_value(&mut parser, "env-config")?;
                 cli.env_file = Some(spanned_value(value));
+            }
+            Long("config-home") => {
+                let value = parse_string_value(&mut parser, "config-home")?;
+                cli.config_home = Some(spanned_value(value));
             }
             Long("log-level") => {
                 let value = parse_validated_option(
@@ -619,31 +654,29 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
             }
             Long("log-include") => {
                 let values = parse_list_values(&mut parser, "log-include")?;
-                let parsed = parse_log_filters("log-include", values)?;
+                let parsed = parse_log_filters(values);
                 cli.log_include
                     .get_or_insert_with(Vec::new)
                     .extend(parsed.into_iter().map(spanned_value));
             }
             Long("log-exclude") => {
                 let values = parse_list_values(&mut parser, "log-exclude")?;
-                let parsed = parse_log_filters("log-exclude", values)?;
+                let parsed = parse_log_filters(values);
                 cli.log_exclude
                     .get_or_insert_with(Vec::new)
                     .extend(parsed.into_iter().map(spanned_value));
             }
             Long("stdin") => cli.redirect_stdin = Some(spanned_true()),
-            Long("testbin") => {
-                let normalized =
-                    parse_validated_option(&mut parser, "testbin", TEST_BIN_VALUES, "test bin")?;
-                cli.testbin = Some(spanned_value(normalized));
-            }
             Long("experimental-options") => {
                 let values = parse_experimental_options(&mut parser)?;
                 cli.experimental_options
                     .get_or_insert_with(Vec::new)
                     .extend(values.into_iter().map(spanned_value));
             }
+            #[cfg(feature = "lsp")]
             Long("lsp") => cli.lsp = true,
+            #[cfg(feature = "dap")]
+            Long("dap") => cli.dap = true,
             Long("ide-goto-def") => {
                 cli.ide_goto_def = Some(parse_ide_int_option(&mut parser, "ide-goto-def")?)
             }
@@ -664,15 +697,11 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
             }
             #[cfg(feature = "plugin")]
             Long("plugins") => {
-                let values = parse_list_values(&mut parser, "plugins")?;
+                let value = parse_string_value(&mut parser, "plugins")?;
+                let paths = parse_plugin_paths(&value);
                 let mut parsed = Vec::new();
-                for value in values {
-                    let trimmed = value.trim();
-                    // Skip empty strings and bracket-wrapped empty lists like "[]"
-                    if trimmed.is_empty() || trimmed == "[]" {
-                        continue;
-                    }
-                    let path = Path::new(trimmed);
+                for path_str in paths {
+                    let path = Path::new(&path_str);
                     let absolute = if path.is_absolute() {
                         path.to_path_buf()
                     } else {
@@ -697,7 +726,6 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
                         ));
                     }
                 }
-                // Only set plugins if we actually parsed some valid paths
                 if !parsed.is_empty() {
                     cli.plugins.get_or_insert_with(Vec::new).extend(parsed);
                 }
@@ -724,15 +752,10 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
                     CliError::new("Invalid argument", "argument is not valid unicode")
                         .with_help("Use UTF-8 arguments when calling nushell.")
                 })?;
-                if script_name.is_empty() {
+
+                if script_name.is_empty() && cli.commands.is_none() {
                     script_name = value;
-                    let rest = parser
-                        .raw_args()
-                        .map_err(map_lexopt_error)?
-                        .map(|arg| arg.to_string_lossy().to_string())
-                        .map(|arg| escape_for_script_arg(&arg))
-                        .collect::<Vec<_>>();
-                    args_to_script.extend(rest);
+                    consume_remaining_args(&mut parser)?;
                     break;
                 } else {
                     args_to_script.push(escape_for_script_arg(&value));
@@ -749,7 +772,6 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
             login_shell: cli.login_shell,
             interactive_shell: cli.interactive_shell,
             commands: cli.commands,
-            testbin: cli.testbin,
             #[cfg(feature = "plugin")]
             plugin_file: cli.plugin_file,
             #[cfg(feature = "plugin")]
@@ -759,6 +781,7 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
             no_std_lib: cli.no_std_lib,
             config_file: cli.config_file,
             env_file: cli.env_file,
+            config_home: cli.config_home,
             log_level: cli.log_level,
             log_target: cli.log_target,
             log_file: cli.log_file,
@@ -769,7 +792,10 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
             error_style: cli.error_style,
             no_newline: cli.no_newline,
             include_path: cli.include_path,
+            #[cfg(feature = "lsp")]
             lsp: cli.lsp,
+            #[cfg(feature = "dap")]
+            dap: cli.dap,
             ide_goto_def: cli.ide_goto_def,
             ide_hover: cli.ide_hover,
             ide_complete: cli.ide_complete,
@@ -782,6 +808,8 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
             mcp_transport: cli.mcp_transport,
             #[cfg(feature = "mcp")]
             mcp_port: cli.mcp_port,
+            #[cfg(feature = "mcp")]
+            mcp_host: cli.mcp_host,
         },
         script_name,
         args_to_script,
@@ -789,6 +817,7 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
 }
 
 // Helper to build a spanned boolean-like "true" value.
+// No source span — these originate from CLI argument parsing, before the engine exists.
 fn spanned_true() -> Spanned<String> {
     Spanned {
         item: "true".to_string(),
@@ -797,6 +826,7 @@ fn spanned_true() -> Spanned<String> {
 }
 
 // Wrap a string value in a Spanned wrapper with unknown span.
+// No source span — these originate from CLI argument parsing, before the engine exists.
 fn spanned_value(value: String) -> Spanned<String> {
     Spanned {
         item: value,
@@ -861,6 +891,7 @@ fn parse_int_value(parser: &mut lexopt::Parser, name: &str) -> Result<i64, CliEr
     })
 }
 
+#[cfg(feature = "mcp")]
 // Parse and validate a TCP port number.
 fn parse_port_value(parser: &mut lexopt::Parser, name: &str) -> Result<u16, CliError> {
     let value = parse_int_value(parser, name)?;
@@ -876,6 +907,7 @@ fn parse_port_value(parser: &mut lexopt::Parser, name: &str) -> Result<u16, CliE
 // Helper to parse IDE integer options and wrap in Value::int.
 fn parse_ide_int_option(parser: &mut lexopt::Parser, name: &str) -> Result<Value, CliError> {
     let value = parse_int_value(parser, name)?;
+    // No source span — CLI argument parsing happens before the engine exists
     Ok(Value::int(value, Span::unknown()))
 }
 
@@ -896,9 +928,108 @@ fn parse_list_values(parser: &mut lexopt::Parser, name: &str) -> Result<Vec<Stri
     Ok(parsed)
 }
 
+/// Parse a single `--plugins` value into a list of plugin paths.
+///
+/// Supports two formats:
+/// - A single path: `/path/to/nu_plugin_foo`
+/// - A bracketed list (nushell-style): `[/path/foo /path/bar]` or `[/path/foo, /path/bar]`
+///
+/// Paths in the bracketed form may be double-quoted to handle spaces:
+/// `["/path/with spaces/foo" /path/bar]`
+///
+/// Commas are treated as optional separators in the bracketed form.
+/// When present, commas are used as the delimiter instead of whitespace.
+#[cfg(feature = "plugin")]
+fn parse_plugin_paths(value: &str) -> Vec<String> {
+    let trimmed = value.trim();
+
+    // Empty list: `[]`
+    if trimmed == "[]" {
+        return vec![];
+    }
+
+    if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        let inner = inner.trim();
+        if inner.is_empty() {
+            return vec![];
+        }
+
+        // Prefer comma-delimited when commas are present
+        if inner.contains(',') {
+            inner
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(strip_quotes)
+                .collect()
+        } else {
+            split_respecting_quotes(inner)
+        }
+    } else {
+        vec![strip_quotes(trimmed)]
+    }
+}
+
+/// Remove surrounding double-quotes from a string.
+#[cfg(feature = "plugin")]
+fn strip_quotes(s: &str) -> String {
+    let s = s.trim();
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Split a string by whitespace, respecting double-quoted sections.
+///
+/// Each segment between whitespace boundaries is returned with quotes stripped.
+#[cfg(feature = "plugin")]
+fn split_respecting_quotes(s: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for ch in s.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push(ch);
+            }
+            ' ' | '\t' if !in_quotes => {
+                if !current.is_empty() {
+                    result.push(strip_quotes(&current));
+                    current.clear();
+                }
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+    }
+    if !current.is_empty() {
+        result.push(strip_quotes(&current));
+    }
+    result
+}
+
 // Parse experimental options, allowing bracketed and comma-delimited forms.
 fn parse_experimental_options(parser: &mut lexopt::Parser) -> Result<Vec<String>, CliError> {
-    let values = parse_list_values(parser, "experimental-options")?;
+    let first = parse_string_value(parser, "experimental-options")?;
+    let mut values = vec![first.clone()];
+
+    let starts_bracket_list = first.trim_start().starts_with('[');
+    let ends_bracket_list = first.trim_end().ends_with(']');
+    if starts_bracket_list && !ends_bracket_list {
+        loop {
+            let next = parse_string_value(parser, "experimental-options")?;
+            let done = next.trim_end().ends_with(']');
+            values.push(next);
+            if done {
+                break;
+            }
+        }
+    }
     let mut parsed = Vec::new();
     for value in values {
         let trimmed = value.trim();
@@ -936,7 +1067,7 @@ fn parse_experimental_options(parser: &mut lexopt::Parser) -> Result<Vec<String>
 
 // Parse log filters and ensure they match known log levels.
 // Supports multiple formats: [error,warn], [error, warn], error warn, etc.
-fn parse_log_filters(name: &str, values: Vec<String>) -> Result<Vec<String>, CliError> {
+fn parse_log_filters(values: Vec<String>) -> Vec<String> {
     let mut parsed = Vec::new();
 
     // Process each value, handling brackets and comma-delimited forms
@@ -951,41 +1082,15 @@ fn parse_log_filters(name: &str, values: Vec<String>) -> Result<Vec<String>, Cli
                 let item = item.trim();
                 if !item.is_empty() {
                     let normalized = item.to_ascii_lowercase();
-                    if LOG_LEVEL_VALUES.contains(&normalized.as_str()) {
-                        parsed.push(normalized);
-                    } else {
-                        let suggestion = did_you_mean(LOG_LEVEL_VALUES, &normalized)
-                            .map(|item| format!("Did you mean '{item}'?"));
-                        let help = suggestion.unwrap_or_else(|| {
-                            format!("Valid log levels: {}", LOG_LEVEL_VALUES.join(", "))
-                        });
-                        return Err(CliError::new(
-                            format!("Invalid value for `--{name}`"),
-                            "invalid log level",
-                        )
-                        .with_help(help));
-                    }
+                    parsed.push(normalized);
                 }
             }
         } else if !trimmed.is_empty() {
             let normalized = trimmed.to_ascii_lowercase();
-            if LOG_LEVEL_VALUES.contains(&normalized.as_str()) {
-                parsed.push(normalized);
-            } else {
-                let suggestion = did_you_mean(LOG_LEVEL_VALUES, &normalized)
-                    .map(|item| format!("Did you mean '{item}'?"));
-                let help = suggestion.unwrap_or_else(|| {
-                    format!("Valid log levels: {}", LOG_LEVEL_VALUES.join(", "))
-                });
-                return Err(CliError::new(
-                    format!("Invalid value for `--{name}`"),
-                    "invalid log level",
-                )
-                .with_help(help));
-            }
+            parsed.push(normalized);
         }
     }
-    Ok(parsed)
+    parsed
 }
 
 // Validate an experimental option name against the known list.
@@ -1010,7 +1115,6 @@ fn missing_value_help(option: &str) -> String {
     match option {
         "-m" | "--table-mode" => format!("Valid table modes: {}", TABLE_MODE_VALUES.join(", ")),
         "--error-style" => format!("Valid error styles: {}", ERROR_STYLE_VALUES.join(", ")),
-        "--testbin" => format!("Valid test bins: {}", TEST_BIN_VALUES.join(", ")),
         "--log-level" | "--log-include" | "--log-exclude" => {
             format!("Valid log levels: {}", LOG_LEVEL_VALUES.join(", "))
         }
@@ -1117,13 +1221,14 @@ fn prevalidate_short_groups_before_lexopt(args: &[OsString]) -> Result<(), CliEr
         }
 
         // Flags that take a single value - skip validation of their values
-        // Note: Multi-value flags (--plugins, --log-include, etc.) are not included here
+        // Note: Multi-value flags (--log-include, --log-exclude) are not included here
         // because they consume multiple arguments and the validator can't know how many.
         if arg == "-e"
             || arg == "--execute"
             || arg == "--config"
             || arg == "--env-config"
             || arg == "--plugin-config"
+            || arg == "--plugins"
             || arg == "--log-level"
             || arg == "--log-target"
             || arg == "-I"
@@ -1135,7 +1240,6 @@ fn prevalidate_short_groups_before_lexopt(args: &[OsString]) -> Result<(), CliEr
             || arg == "--ide-hover"
             || arg == "--ide-complete"
             || arg == "--include-path"
-            || arg == "--testbin"
         {
             skip_next = true;
             i += 1;
@@ -1261,44 +1365,46 @@ fn cli_help_text() -> String {
         if flags.clone().next().is_none() {
             continue;
         }
-        output.push_str(&format!(
+        write!(
+            output,
             "\n{HELP_SECTION_COLOR}{}:{RESET_COLOR}\n",
             category_name(category)
-        ));
+        )
+        .expect("writing to a String is infallible");
         for flag in flags {
             output.push_str("  ");
             if let Some(short) = flag.short {
-                output.push_str(&format!("{HELP_FLAG_COLOR}-{short}{RESET_COLOR}"));
+                write!(output, "{HELP_FLAG_COLOR}-{short}{RESET_COLOR}")
+                    .expect("writing to a String is infallible");
                 if !flag.long.is_empty() {
-                    output.push_str(&format!("{DEFAULT_COLOR},{RESET_COLOR} "));
+                    write!(output, "{DEFAULT_COLOR},{RESET_COLOR} ")
+                        .expect("writing to a String is infallible");
                 }
             }
             if !flag.long.is_empty() {
-                output.push_str(&format!("{HELP_FLAG_COLOR}--{}{RESET_COLOR}", flag.long));
+                write!(output, "{HELP_FLAG_COLOR}--{}{RESET_COLOR}", flag.long)
+                    .expect("writing to a String is infallible");
             }
             if flag.value != ValueHint::None {
-                output.push_str(&format!(
+                write!(
+                    output,
                     " <{HELP_TYPE_COLOR}{}{RESET_COLOR}>",
                     value_hint(flag.value)
-                ));
+                )
+                .expect("writing to a String is infallible");
             }
-            output.push_str(&format!(
+            write!(
+                output,
                 "\n      {HELP_DESC_COLOR}{}{RESET_COLOR}\n",
                 flag.description
-            ));
-            output.push_str(&format!(
-                "      {HELP_DESC_COLOR}Example: {RESET_COLOR}{}\n",
+            )
+            .expect("writing to a String is infallible");
+            writeln!(
+                output,
+                "      {HELP_DESC_COLOR}Example: {RESET_COLOR}{}",
                 flag.example
-            ));
-
-            // For the --testbin option we augment the static description with a dynamically generated list of the available binaries
-            // and their individual help strings
-            if flag.long == "testbin" {
-                output.push_str(&format!(
-                    "      {HELP_DESC_COLOR}Available test bins:{RESET_COLOR}\n"
-                ));
-                output.push_str(&test_bins::help_list());
-            }
+            )
+            .expect("writing to a String is infallible");
         }
     }
     output
@@ -1330,7 +1436,6 @@ fn value_hint(value: ValueHint) -> &'static str {
         ValueHint::Int => "int",
         ValueHint::Path => "path",
         ValueHint::ListString => "string...",
-        ValueHint::ListPath => "path...",
     }
 }
 
@@ -1341,7 +1446,6 @@ pub(crate) struct NushellCliArgs {
     pub(crate) login_shell: Option<Spanned<String>>,
     pub(crate) interactive_shell: Option<Spanned<String>>,
     pub(crate) commands: Option<Spanned<String>>,
-    pub(crate) testbin: Option<Spanned<String>>,
     #[cfg(feature = "plugin")]
     pub(crate) plugin_file: Option<Spanned<String>>,
     #[cfg(feature = "plugin")]
@@ -1351,6 +1455,7 @@ pub(crate) struct NushellCliArgs {
     pub(crate) no_std_lib: Option<Spanned<String>>,
     pub(crate) config_file: Option<Spanned<String>>,
     pub(crate) env_file: Option<Spanned<String>>,
+    pub(crate) config_home: Option<Spanned<String>>,
     pub(crate) log_level: Option<Spanned<String>>,
     pub(crate) log_target: Option<Spanned<String>>,
     pub(crate) log_file: Option<Spanned<String>>,
@@ -1361,7 +1466,10 @@ pub(crate) struct NushellCliArgs {
     pub(crate) error_style: Option<Value>,
     pub(crate) no_newline: Option<Spanned<String>>,
     pub(crate) include_path: Option<Spanned<String>>,
+    #[cfg(feature = "lsp")]
     pub(crate) lsp: bool,
+    #[cfg(feature = "dap")]
+    pub(crate) dap: bool,
     pub(crate) ide_goto_def: Option<Value>,
     pub(crate) ide_hover: Option<Value>,
     pub(crate) ide_complete: Option<Value>,
@@ -1374,30 +1482,14 @@ pub(crate) struct NushellCliArgs {
     pub(crate) mcp_transport: Option<Spanned<String>>,
     #[cfg(feature = "mcp")]
     pub(crate) mcp_port: Option<u16>,
+    #[cfg(feature = "mcp")]
+    pub(crate) mcp_host: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_bins;
     use std::ffi::OsString;
-
-    #[test]
-    fn cli_help_includes_testbin_list() {
-        let help = cli_help_text();
-        // the description for the testbin flag should be present
-        assert!(help.contains("--testbin"));
-
-        // there should be an entry for at least one known bin
-        assert!(help.contains("echo_env"));
-
-        // ensure the dynamic list from test_bins::help_list is embedded
-        let list = test_bins::help_list();
-        assert!(help.contains(list.trim()));
-
-        // colored subcommand names should use the new bright-cyan code
-        assert!(help.contains(HELP_SUBCMD_COLOR));
-    }
 
     #[test]
     fn test_log_file_parsing() {
@@ -1430,5 +1522,301 @@ mod tests {
 
         let result = parse_cli_args(args);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn experimental_options_with_script_file_does_not_consume_script_name() {
+        let args = vec![
+            OsString::from("nu"),
+            OsString::from("--experimental-options"),
+            OsString::from("[example=true]"),
+            OsString::from("script.nu"),
+        ];
+
+        let parsed = parse_cli_args(args).expect("should parse args");
+        assert_eq!(parsed.script_name, "script.nu");
+        assert_eq!(
+            parsed
+                .nu
+                .experimental_options
+                .expect("experimental options")
+                .iter()
+                .map(|v| v.item.clone())
+                .collect::<Vec<_>>(),
+            vec!["example=true".to_string()]
+        );
+    }
+
+    #[test]
+    fn experimental_options_with_separator_and_script_file_still_works() {
+        let args = vec![
+            OsString::from("nu"),
+            OsString::from("--experimental-options"),
+            OsString::from("[example=true]"),
+            OsString::from("--"),
+            OsString::from("script.nu"),
+        ];
+
+        let parsed = parse_cli_args(args).expect("should parse args");
+        assert_eq!(parsed.script_name, "script.nu");
+    }
+
+    #[test]
+    fn experimental_options_repeated_flags_accumulate_values() {
+        let args = vec![
+            OsString::from("nu"),
+            OsString::from("--experimental-options"),
+            OsString::from("example=true"),
+            OsString::from("--experimental-options"),
+            OsString::from("pipefail=false"),
+            OsString::from("script.nu"),
+        ];
+
+        let parsed = parse_cli_args(args).expect("should parse args");
+        assert_eq!(parsed.script_name, "script.nu");
+        assert_eq!(
+            parsed
+                .nu
+                .experimental_options
+                .expect("experimental options")
+                .iter()
+                .map(|v| v.item.clone())
+                .collect::<Vec<_>>(),
+            vec!["example=true".to_string(), "pipefail=false".to_string()]
+        );
+    }
+
+    #[test]
+    fn experimental_options_accept_multiple_formats_and_boolean_variants() {
+        let args = vec![
+            OsString::from("nu"),
+            OsString::from("--experimental-options"),
+            OsString::from("[example, pipefail=true, native-clip=false]"),
+            OsString::from("--experimental-options"),
+            OsString::from("reorder-cell-paths"),
+            OsString::from("--experimental-options"),
+            OsString::from("[enforce-runtime-annotations=false, cell-path-types=true]"),
+            OsString::from("script.nu"),
+        ];
+
+        let parsed = parse_cli_args(args).expect("should parse args");
+        assert_eq!(parsed.script_name, "script.nu");
+        assert_eq!(
+            parsed
+                .nu
+                .experimental_options
+                .expect("experimental options")
+                .iter()
+                .map(|v| v.item.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "example".to_string(),
+                "pipefail=true".to_string(),
+                "native-clip=false".to_string(),
+                "reorder-cell-paths".to_string(),
+                "enforce-runtime-annotations=false".to_string(),
+                "cell-path-types=true".to_string(),
+            ]
+        );
+    }
+
+    // --- strip_quotes tests ---
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn strip_quotes_removes_double_quotes() {
+        assert_eq!(strip_quotes(r#""hello""#), "hello");
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn strip_quotes_no_op_when_no_quotes() {
+        assert_eq!(strip_quotes("hello"), "hello");
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn strip_quotes_handles_single_quote() {
+        assert_eq!(strip_quotes(r#""hello"#), r#""hello"#);
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn strip_quotes_trims_whitespace() {
+        assert_eq!(strip_quotes(r#"  "/path/foo"  "#), "/path/foo");
+    }
+
+    // --- split_respecting_quotes tests ---
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn split_respecting_quotes_splits_by_whitespace() {
+        assert_eq!(
+            split_respecting_quotes("/path/a /path/b /path/c"),
+            vec!["/path/a", "/path/b", "/path/c"]
+        );
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn split_respecting_quotes_preserves_quoted_spaces() {
+        assert_eq!(
+            split_respecting_quotes(r#""/path/with spaces/a" /path/b"#),
+            vec!["/path/with spaces/a", "/path/b"]
+        );
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn split_respecting_quotes_empty_input() {
+        let empty: Vec<String> = vec![];
+        assert_eq!(split_respecting_quotes(""), empty);
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn split_respecting_quotes_single_value_no_spaces() {
+        assert_eq!(split_respecting_quotes("/path/a"), vec!["/path/a"]);
+    }
+
+    // --- parse_plugin_paths tests ---
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn parse_plugin_paths_single_absolute_path() {
+        assert_eq!(
+            parse_plugin_paths("/path/to/nu_plugin_foo"),
+            vec!["/path/to/nu_plugin_foo"]
+        );
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn parse_plugin_paths_bracketed_list_with_spaces() {
+        assert_eq!(
+            parse_plugin_paths("[/path/foo /path/bar]"),
+            vec!["/path/foo", "/path/bar"]
+        );
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn parse_plugin_paths_bracketed_list_with_commas() {
+        assert_eq!(
+            parse_plugin_paths("[/path/foo, /path/bar]"),
+            vec!["/path/foo", "/path/bar"]
+        );
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn parse_plugin_paths_bracketed_list_with_commas_and_quoted_spaces() {
+        assert_eq!(
+            parse_plugin_paths(r#"["/path/with spaces/a", /path/b]"#),
+            vec!["/path/with spaces/a", "/path/b"]
+        );
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn parse_plugin_paths_quoted_single_path() {
+        assert_eq!(
+            parse_plugin_paths(r#""/path/with spaces/foo""#),
+            vec!["/path/with spaces/foo"]
+        );
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn parse_plugin_paths_empty_brackets() {
+        let empty: Vec<String> = vec![];
+        assert_eq!(parse_plugin_paths("[]"), empty);
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn parse_plugin_paths_brackets_with_whitespace_only() {
+        let empty: Vec<String> = vec![];
+        assert_eq!(parse_plugin_paths("[  ]"), empty);
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn parse_plugin_paths_trims_whitespace() {
+        assert_eq!(
+            parse_plugin_paths("  /path/to/nu_plugin_foo  "),
+            vec!["/path/to/nu_plugin_foo"]
+        );
+    }
+
+    // --- Integration tests for --plugins with script arguments ---
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn plugins_single_path_does_not_consume_script_name() {
+        let args = vec![
+            OsString::from("nu"),
+            OsString::from("--plugins"),
+            OsString::from("/path/to/nu_plugin_foo"),
+            OsString::from("script.nu"),
+        ];
+
+        let parsed = parse_cli_args(args).expect("should parse args");
+        assert_eq!(parsed.script_name, "script.nu");
+
+        let plugins = parsed.nu.plugins.expect("should have plugins");
+        assert_eq!(plugins.len(), 1);
+        assert!(plugins[0].item.contains("nu_plugin_foo"));
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn plugins_bracketed_list_does_not_consume_script_name() {
+        let args = vec![
+            OsString::from("nu"),
+            OsString::from("--plugins"),
+            OsString::from("[/path/nu_plugin_foo /path/nu_plugin_bar]"),
+            OsString::from("script.nu"),
+        ];
+
+        let parsed = parse_cli_args(args).expect("should parse args");
+        assert_eq!(parsed.script_name, "script.nu");
+
+        let plugins = parsed.nu.plugins.expect("should have plugins");
+        assert_eq!(plugins.len(), 2);
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn plugins_multiple_flags_accumulate() {
+        let args = vec![
+            OsString::from("nu"),
+            OsString::from("--plugins"),
+            OsString::from("/path/nu_plugin_foo"),
+            OsString::from("--plugins"),
+            OsString::from("/path/nu_plugin_bar"),
+            OsString::from("script.nu"),
+        ];
+
+        let parsed = parse_cli_args(args).expect("should parse args");
+        assert_eq!(parsed.script_name, "script.nu");
+
+        let plugins = parsed.nu.plugins.expect("should have plugins");
+        assert_eq!(plugins.len(), 2);
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn plugins_empty_list_is_skipped() {
+        let args = vec![
+            OsString::from("nu"),
+            OsString::from("--plugins"),
+            OsString::from("[]"),
+            OsString::from("script.nu"),
+        ];
+
+        let parsed = parse_cli_args(args).expect("should parse args");
+        assert_eq!(parsed.script_name, "script.nu");
+        assert!(parsed.nu.plugins.is_none());
     }
 }

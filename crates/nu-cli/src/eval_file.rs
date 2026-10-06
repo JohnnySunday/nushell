@@ -1,4 +1,4 @@
-use crate::util::{eval_source, print_pipeline};
+use crate::util::{eval_parsed_block_source, eval_source, print_pipeline};
 use log::{info, trace};
 use nu_engine::eval_block;
 use nu_parser::parse;
@@ -44,13 +44,14 @@ pub fn evaluate_file(
                 "Input file name '{}' is not valid UTF8",
                 file_path.to_string_lossy()
             ),
+            // No call span available during file evaluation startup
             span: Span::unknown(),
         })?;
 
     let file = std::fs::read(&file_path).map_err(|err| {
         let cmdline = format!("nu {path} {}", args.join(" "));
         let mut working_set = StateWorkingSet::new(engine_state);
-        let file_id = working_set.add_file("<commandline>".into(), cmdline.as_bytes());
+        let file_id = working_set.add_file("<commandline>", cmdline.as_bytes());
         let span = working_set
             .get_span_for_file(file_id)
             .subspan(3, path.len() + 3)
@@ -71,6 +72,7 @@ pub fn evaluate_file(
         )
     })?;
 
+    // These env vars are set before parsing, so no source span is available
     stack.add_env_var(
         "FILE_PWD".to_string(),
         Value::string(parent.to_string_lossy(), Span::unknown()),
@@ -171,36 +173,38 @@ pub fn evaluate_file(
     let exit_code = if file_has_main && engine_state.find_decl(&script_name_bytes, &[]).is_some() {
         // Evaluate the file, but don't run main yet.
         let pipeline =
-            match eval_block::<WithoutDebug>(engine_state, stack, &block, PipelineData::empty())
-                .map(|p| p.body)
-            {
-                Ok(data) => data,
-                Err(ShellError::Return { .. }) => {
+            match eval_block::<WithoutDebug>(engine_state, stack, &block, PipelineData::empty()) {
+                Ok(data) if data.early_return => {
                     // Allow early return before main is run.
                     return Ok(());
                 }
+                Ok(data) => data.body,
                 Err(err) => return Err(err),
             };
 
         // Print the pipeline output of the last command of the file.
         print_pipeline(engine_state, stack, pipeline, true)?;
 
-        // Invoke the main command with arguments.  Keep using `main` as the
-        // internal command name so the parser reliably resolves it; the block's
-        // signature was already rewritten to the script filename above, so help
-        // messages will show the correct `script.nu`-qualified name.
-        // Arguments with whitespaces are quoted, thus can be safely concatenated by whitespace.
-        let args = format!("main {}", args.join(" "));
+        // Invoke the main command with arguments. Keep using `main` as the internal command name
+        // so the parser reliably resolves it; the block's signature was already rewritten to the
+        // script filename above, so help messages will show the correct `script.nu`-qualified name.
+        // The CLI parser has already escaped script arguments via `args_to_script`, so we must not
+        // escape them again here or we would double-quote values like `"arg 2"`.
+        let command_line = format!("main {}", args.join(" "));
         eval_source(
             engine_state,
             stack,
-            args.as_bytes(),
+            command_line.as_bytes(),
             "<commandline>",
             input,
             true,
         )
     } else {
-        eval_source(engine_state, stack, &file, file_path_str, input, true)
+        // Evaluate the already-parsed block instead of re-parsing through
+        // eval_source. Re-parsing can return stale `source` blocks whose
+        // VarIds no longer match re-declared `let`/`mut` variables.
+        // See https://github.com/nushell/nushell/issues/18515
+        eval_parsed_block_source(engine_state, stack, &block, file_path_str, input, true)
     };
 
     if exit_code != 0 {
@@ -210,4 +214,30 @@ pub fn evaluate_file(
     info!("evaluate {}:{}:{}", file!(), line!(), column!());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use nu_test_support::fs::Stub::FileWithContent;
+    use nu_test_support::playground::Playground;
+    use nu_test_support::prelude::*;
+
+    #[test]
+    #[deps(NU)]
+    fn evaluate_file_arg_with_various_characters_escape_properly() -> Result {
+        Playground::setup("evaluate_file_various_characters", |dirs, sandbox| {
+            sandbox.with_files(&[FileWithContent(
+                "test.nu",
+                "def main [...args: string] { $args | to json }",
+            )]);
+
+            let args = r#"a "" b "c\nd" "e f" ] "[" "}" "{" "\"" '"'"#;
+            let expected = ["a", "", "b", "c\nd", "e f", "]", "[", "}", "{", "\"", "\""];
+
+            test()
+                .cwd(dirs.test())
+                .run(format!("nu test.nu {args} | from json"))
+                .expect_value_eq(expected)
+        })
+    }
 }

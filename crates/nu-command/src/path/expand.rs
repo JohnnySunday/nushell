@@ -2,6 +2,7 @@ use super::PathSubcommandArguments;
 use nu_engine::command_prelude::*;
 use nu_path::{canonicalize_with, expand_path_with};
 use nu_protocol::engine::StateWorkingSet;
+use nu_protocol::shell_error::generic::GenericError;
 use std::path::Path;
 
 struct Arguments {
@@ -72,15 +73,16 @@ impl Command for PathExpand {
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let head = call.head;
         #[allow(deprecated)]
         let args = Arguments {
-            strict: call.has_flag_const(working_set, "strict")?,
+            strict: call.has_flag_const(working_set, stack, "strict")?,
             cwd: working_set.permanent_state.cwd_as_string(None)?,
-            not_follow_symlink: call.has_flag_const(working_set, "no-symlink")?,
+            not_follow_symlink: call.has_flag_const(working_set, stack, "no-symlink")?,
         };
         // This doesn't match explicit nulls
         if let PipelineData::Empty = input {
@@ -155,15 +157,12 @@ fn expand(path: &Path, span: Span, args: &Arguments) -> Value {
                 }
             }
             Err(_) => Value::error(
-                ShellError::GenericError {
-                    error: "Could not expand path".into(),
-                    msg: "could not be expanded (path might not exist, non-final \
-                            component is not a directory, or other cause)"
-                        .into(),
-                    span: Some(span),
-                    help: None,
-                    inner: vec![],
-                },
+                ShellError::Generic(GenericError::new(
+                    "Could not expand path",
+                    "could not be expanded (path might not exist, non-final \
+                            component is not a directory, or other cause)",
+                    span,
+                )),
                 span,
             ),
         }
@@ -189,9 +188,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(PathExpand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(PathExpand)
     }
 }

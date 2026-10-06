@@ -49,7 +49,8 @@ impl Command for DecodeHex {
 
     fn run_const(
         &self,
-        working_set: &StateWorkingSet,
+        _working_set: &StateWorkingSet,
+        _stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
@@ -83,7 +84,7 @@ impl Command for EncodeHex {
         vec![
             Example {
                 description: "Encode a binary value",
-                example: r#"0x[C3 06] | encode hex"#,
+                example: "0x[C3 06] | encode hex",
                 result: Some(Value::test_string("C306")),
             },
             Example {
@@ -93,7 +94,7 @@ impl Command for EncodeHex {
             },
             Example {
                 description: "Output a Lowercase version of the encoding",
-                example: r#"0x[AD EF] | encode hex --lower"#,
+                example: "0x[AD EF] | encode hex --lower",
                 result: Some(Value::test_string("adef")),
             },
         ]
@@ -122,10 +123,11 @@ impl Command for EncodeHex {
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let encoding = if call.has_flag_const(working_set, "lower")? {
+        let encoding = if call.has_flag_const(working_set, stack, "lower")? {
             data_encoding::HEXLOWER
         } else {
             data_encoding::HEXUPPER
@@ -140,12 +142,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_examples_decode() {
-        crate::test_examples(DecodeHex)
+    fn test_examples_decode() -> nu_test_support::Result {
+        nu_test_support::test().examples(DecodeHex)
     }
 
     #[test]
-    fn test_examples_encode() {
-        crate::test_examples(EncodeHex)
+    fn test_examples_encode() -> nu_test_support::Result {
+        nu_test_support::test().examples(EncodeHex)
     }
 }

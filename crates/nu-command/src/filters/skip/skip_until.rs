@@ -20,7 +20,7 @@ impl Command for SkipUntil {
             ])
             .required(
                 "predicate",
-                SyntaxShape::Closure(Some(vec![SyntaxShape::Any])),
+                SyntaxShape::RowCondition,
                 "The predicate that skipped element must not match.",
             )
             .category(Category::Filters)
@@ -38,7 +38,7 @@ impl Command for SkipUntil {
         vec![
             Example {
                 description: "Skip until the element is positive.",
-                example: "[-2 0 2 -1] | skip until {|x| $x > 0 }",
+                example: "[-2 0 2 -1] | skip until $it > 0",
                 result: Some(Value::test_list(vec![
                     Value::test_int(2),
                     Value::test_int(-1),
@@ -54,7 +54,7 @@ impl Command for SkipUntil {
             },
             Example {
                 description: "Skip until the field value is positive.",
-                example: "[{a: -2} {a: 0} {a: 2} {a: -1}] | skip until {|x| $x.a > 0 }",
+                example: "[{a: -2} {a: 0} {a: 2} {a: -1}] | skip until a > 0",
                 result: Some(Value::test_list(vec![
                     Value::test_record(record! {
                         "a" => Value::test_int(2),
@@ -72,14 +72,14 @@ impl Command for SkipUntil {
         engine_state: &EngineState,
         stack: &mut Stack,
         call: &Call,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let head = call.head;
         let closure: Closure = call.req(engine_state, stack, 0)?;
 
         let mut closure = ClosureEval::new(engine_state, stack, closure);
 
-        let metadata = input.metadata();
+        let metadata = input.take_metadata();
         Ok(input
             .into_iter_strict(head)?
             .skip_while(move |value| {
@@ -98,9 +98,7 @@ mod tests {
     use crate::SkipUntil;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SkipUntil)
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(SkipUntil)
     }
 }

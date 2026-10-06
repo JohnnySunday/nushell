@@ -73,11 +73,12 @@ impl Command for StrDistance {
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let compare_string: String = call.req_const(working_set, 0)?;
-        let cell_paths: Vec<CellPath> = call.rest_const(working_set, 1)?;
+        let compare_string: String = call.req_const(working_set, stack, 0)?;
+        let cell_paths: Vec<CellPath> = call.rest_const(working_set, stack, 1)?;
         let cell_paths = (!cell_paths.is_empty()).then_some(cell_paths);
         let args = Arguments {
             compare_string,
@@ -144,9 +145,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(StrDistance {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(StrDistance)
     }
 }

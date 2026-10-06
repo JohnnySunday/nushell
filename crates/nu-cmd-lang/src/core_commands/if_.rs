@@ -1,8 +1,5 @@
 use nu_engine::command_prelude::*;
-use nu_protocol::{
-    engine::{CommandType, StateWorkingSet},
-    eval_const::{eval_const_subexpression, eval_constant, eval_constant_with_input},
-};
+use nu_protocol::engine::CommandType;
 
 #[derive(Clone)]
 pub struct If;
@@ -40,8 +37,8 @@ impl Command for If {
     }
 
     fn extra_description(&self) -> &str {
-        r#"This command is a parser keyword. For details, check:
-  https://www.nushell.sh/book/thinking_in_nu.html"#
+        "This command is a parser keyword. For details, check:
+  https://www.nushell.sh/book/thinking_in_nu.html"
     }
 
     fn command_type(&self) -> CommandType {
@@ -54,43 +51,17 @@ impl Command for If {
 
     fn run_const(
         &self,
-        working_set: &StateWorkingSet,
+        _working_set: &StateWorkingSet,
+        _stack: &mut Stack,
         call: &Call,
-        input: PipelineData,
+        _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let call = call.assert_ast_call()?;
-        let cond = call.positional_nth(0).expect("checked through parser");
-        let then_expr = call.positional_nth(1).expect("checked through parser");
-        let then_block = then_expr
-            .as_block()
-            .ok_or_else(|| ShellError::TypeMismatch {
-                err_message: "expected block".into(),
-                span: then_expr.span,
-            })?;
-        let else_case = call.positional_nth(2);
-
-        if eval_constant(working_set, cond)?.as_bool()? {
-            let block = working_set.get_block(then_block);
-            eval_const_subexpression(working_set, block, input, block.span.unwrap_or(call.head))
-        } else if let Some(else_case) = else_case {
-            if let Some(else_expr) = else_case.as_keyword() {
-                if let Some(block_id) = else_expr.as_block() {
-                    let block = working_set.get_block(block_id);
-                    eval_const_subexpression(
-                        working_set,
-                        block,
-                        input,
-                        block.span.unwrap_or(call.head),
-                    )
-                } else {
-                    eval_constant_with_input(working_set, else_expr, input)
-                }
-            } else {
-                eval_constant_with_input(working_set, else_case, input)
-            }
-        } else {
-            Ok(PipelineData::empty())
-        }
+        // Unreachable: const `if` is dispatched through `eval_const_if`, not `run_const`.
+        Err(ShellError::NushellFailedSpanned {
+            msg: "const `if` must be evaluated via eval_const_if".into(),
+            label: "internal error: unexpected const if run_const".into(),
+            span: call.head,
+        })
     }
 
     fn run(
@@ -138,9 +109,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(If {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(If)
     }
 }

@@ -1,9 +1,9 @@
 //! Conversion utilities between Nu values and JSON, and config documentation parsing.
 
 use crate::explore_config::types::NuValueType;
-use nu_protocol::ShellError;
+use nu_config::ConfigFileKind;
 use nu_protocol::engine::EngineState;
-use nu_utils::ConfigFileKind;
+use nu_protocol::{ShellError, shell_error::generic::GenericError};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::error::Error;
@@ -42,12 +42,15 @@ pub fn nu_value_to_json(
             // Convert closure to its string representation instead of serializing internal structure
             let closure_string =
                 val.coerce_into_string(engine_state, value.span())
-                    .map_err(|e| ShellError::GenericError {
-                        error: "Failed to convert closure to string".to_string(),
-                        msg: "".to_string(),
-                        span: Some(value.span()),
-                        help: None,
-                        inner: vec![e],
+                    .map_err(|e| {
+                        ShellError::Generic(
+                            GenericError::new(
+                                "Failed to convert closure to string",
+                                "",
+                                value.span(),
+                            )
+                            .with_inner([e]),
+                        )
                     })?;
             Value::String(closure_string.to_string())
         }
@@ -618,7 +621,7 @@ mod tests {
                 data
             );
             if let nu_protocol::Value::Binary { val, .. } = data {
-                assert_eq!(val, &vec![0u8, 1, 2, 255]);
+                assert_eq!(val.as_slice(), &[0u8, 1, 2, 255]);
             }
         } else {
             panic!("Expected Record");

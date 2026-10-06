@@ -4,6 +4,7 @@ use crate::{
 };
 
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
+use nu_protocol::shell_error::generic::GenericError;
 use nu_protocol::{
     Category, Example, LabeledError, PipelineData, ShellError, Signature, Span, SyntaxShape, Value,
 };
@@ -28,7 +29,7 @@ impl PluginCommand for Replace {
         Signature::build(self.name())
             .required(
                 "old",
-                SyntaxShape::OneOf(vec![SyntaxShape::Record(vec![]), SyntaxShape::List(Box::new(SyntaxShape::Any))]),
+                SyntaxShape::OneOf(vec![SyntaxShape::record(), SyntaxShape::List(Box::new(SyntaxShape::Any))]),
                 "Values to be replaced.",
             )
             .optional(
@@ -53,10 +54,16 @@ impl PluginCommand for Replace {
                 "Data type of the resulting expression. If set to `null` (default), the data type is determined automatically based on the other inputs.",
                 Some('t'),
             )
-            .input_output_type(
-                PolarsPluginType::NuExpression.into(),
-                PolarsPluginType::NuExpression.into(),
-            )
+            .input_output_types(vec![
+                (
+                    PolarsPluginType::NuExpression.into(),
+                    PolarsPluginType::NuExpression.into()
+                ),
+                (
+                    PolarsPluginType::NuSelector.into(),
+                    PolarsPluginType::NuExpression.into()
+                )
+             ])
             .category(Category::Custom("expression".into()))
     }
 
@@ -136,7 +143,7 @@ impl PluginCommand for Replace {
                 description: "Replace column with different values using a record",
                 example: "[[a]; [1] [1] [2] [2]]
                 | polars into-df
-                | polars select (polars col a | polars replace {1: a, 2: b} --strict --return-dtype str)
+                | polars select (polars col a | polars replace {1: a, 2: b} --default c --strict --return-dtype str)
                 | polars collect",
                 result: Some(
                     NuDataFrame::from(
@@ -168,19 +175,14 @@ impl PluginCommand for Replace {
                 .into_iter()
                 .unzip(),
             (Value::List { vals: old_vals, .. }, Some(Value::List { vals: new_vals, .. })) => {
-                (old_vals, new_vals)
+                (old_vals.into_owned(), new_vals.into_owned())
             }
             (_, _) => {
-                return Err(LabeledError::from(ShellError::GenericError {
-                    error: "Invalid arguments".into(),
-                    msg: "".into(),
-                    span: Some(call.head),
-                    help: Some("`old` must be either a record or list. If `old` is a record, then `new` must not be specified. Otherwise, `new` must also be a list".into()),
-                    inner: vec![],
-                }));
+                return Err(LabeledError::from(ShellError::Generic(
+                    GenericError::new("Invalid arguments", "", call.head).with_help("`old` must be either a record or list. If `old` is a record, then `new` must not be specified. Otherwise, `new` must also be a list"),
+                )));
             }
         };
-        // let new_vals: Vec<Value> = call.req(1)?;
 
         let old = values_to_expr(plugin, call.head, old_vals)?;
         let new = values_to_expr(plugin, call.head, new_vals)?;
@@ -189,13 +191,11 @@ impl PluginCommand for Replace {
         let return_dtype = match call.get_flag::<String>("return-dtype")? {
             Some(dtype) => {
                 if !strict {
-                    return Err(LabeledError::from(ShellError::GenericError {
-                        error: "`return-dtype` may only be used with `strict`".into(),
-                        msg: "".into(),
-                        span: Some(call.head),
-                        help: None,
-                        inner: vec![],
-                    }));
+                    return Err(LabeledError::from(ShellError::Generic(GenericError::new(
+                        "`return-dtype` may only be used with `strict`",
+                        "",
+                        call.head,
+                    ))));
                 }
                 Some(str_to_dtype(&dtype, call.head)?)
             }
@@ -206,13 +206,11 @@ impl PluginCommand for Replace {
         let default = match call.get_flag::<Value>("default")? {
             Some(default) => {
                 if !strict {
-                    return Err(LabeledError::from(ShellError::GenericError {
-                        error: "`default` may only be used with `strict`".into(),
-                        msg: "".into(),
-                        span: Some(call.head),
-                        help: None,
-                        inner: vec![],
-                    }));
+                    return Err(LabeledError::from(ShellError::Generic(GenericError::new(
+                        "`default` may only be used with `strict`",
+                        "",
+                        call.head,
+                    ))));
                 }
                 Some(values_to_expr(plugin, call.head, vec![default])?)
             }
@@ -286,13 +284,11 @@ fn values_to_expr(
 
         Some(Value::Custom { .. }) => {
             if values.len() > 1 {
-                return Err(ShellError::GenericError {
-                    error: "Multiple expressions to be replaced is not supported".into(),
-                    msg: "".into(),
-                    span: Some(span),
-                    help: None,
-                    inner: vec![],
-                });
+                return Err(ShellError::Generic(GenericError::new(
+                    "Multiple expressions to be replaced is not supported",
+                    "",
+                    span,
+                )));
             }
 
             NuExpression::try_from_value(
@@ -304,21 +300,16 @@ fn values_to_expr(
             .map(|expr| expr.into_polars())
         }
 
-        x @ Some(_) => Err(ShellError::GenericError {
-            error: "Cannot convert input to expression".into(),
-            msg: "".into(),
-            span: Some(span),
-            help: Some(format!("Unexpected type: {x:?}")),
-            inner: vec![],
-        }),
+        x @ Some(_) => Err(ShellError::Generic(
+            GenericError::new("Cannot convert input to expression", "", span)
+                .with_help(format!("Unexpected type: {x:?}")),
+        )),
 
-        None => Err(ShellError::GenericError {
-            error: "Missing input values".into(),
-            msg: "".into(),
-            span: Some(span),
-            help: None,
-            inner: vec![],
-        }),
+        None => Err(ShellError::Generic(GenericError::new(
+            "Missing input values",
+            "",
+            span,
+        ))),
     }
 }
 

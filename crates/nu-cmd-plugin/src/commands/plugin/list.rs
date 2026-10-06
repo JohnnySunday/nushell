@@ -17,14 +17,23 @@ impl Command for PluginList {
             .input_output_type(
                 Type::Nothing,
                 Type::Table(
-                    [
+                    vec![
                         ("name".into(), Type::String),
                         ("version".into(), Type::String),
                         ("status".into(), Type::String),
                         ("pid".into(), Type::Int),
                         ("filename".into(), Type::String),
                         ("shell".into(), Type::String),
-                        ("commands".into(), Type::List(Type::String.into())),
+                        (
+                            "commands".into(),
+                            Type::List(Box::new(Type::Record(
+                                vec![
+                                    ("name".into(), Type::String),
+                                    ("description".into(), Type::String),
+                                ]
+                                .into(),
+                            ))),
+                        ),
                     ]
                     .into(),
                 ),
@@ -53,7 +62,7 @@ impl Command for PluginList {
     }
 
     fn extra_description(&self) -> &str {
-        r#"
+        "
 The `status` column will contain one of the following values:
 
 - `added`:    The plugin is present in the plugin registry file, but not in
@@ -75,7 +84,7 @@ or the plugin has not been loaded yet, the values of `version`, `filename`,
 the plugin registry file.
 
 See also: `plugin use`
-"#
+"
         .trim()
     }
 
@@ -99,7 +108,10 @@ See also: `plugin use`
                         Value::test_string("/opt/nu/plugins/nu_plugin_inc")
                     },
                     "shell" => Value::test_nothing(),
-                    "commands" => Value::test_list(vec![Value::test_string("inc")]),
+                    "commands" => Value::test_list(vec![Value::test_record(record! {
+                        "name" => Value::test_string("inc"),
+                        "description" => Value::test_string("Increment a number by 1."),
+                    })]),
                 })])),
             },
             Example {

@@ -7,12 +7,14 @@ use nu_protocol::{
     debugger::WithoutDebug,
     engine::{ArgType, Command, EngineState, Stack, StateWorkingSet},
 };
-use nu_test_support::fs;
+use nu_test_support::prelude::*;
 use reedline::Suggestion;
 use std::path::MAIN_SEPARATOR;
 
 fn create_default_context() -> EngineState {
-    nu_command::add_shell_command_context(nu_cmd_lang::create_default_context())
+    let state = nu_cmd_lang::create_default_context();
+    let state = nu_command::add_shell_command_context(state);
+    nu_cli::add_cli_context(state)
 }
 
 // A fake cmd for testing.
@@ -36,12 +38,18 @@ impl Command for FakeCmd {
                 "Example flag which support auto completion.",
                 Some('f'),
             )
+            .named(
+                "plugin-config",
+                SyntaxShape::Int,
+                "Example flag which support auto completion from plugin config.",
+                None,
+            )
     }
 
     #[expect(deprecated, reason = "example usage")]
     fn get_dynamic_completion(
         &self,
-        _engine_state: &EngineState,
+        engine_state: &EngineState,
         _stack: &mut Stack,
         _call: DynamicCompletionCallRef,
         arg_type: &ArgType,
@@ -81,6 +89,18 @@ impl Command for FakeCmd {
                         })
                         .collect(),
                 ),
+                "plugin-config" => engine_state
+                    .get_plugin_config("fake-cmd")
+                    .and_then(|config| {
+                        config.get_data_by_key("completion").map(|completion| {
+                            vec![DynamicSuggestion {
+                                value: completion.into_string().unwrap_or_else(|_| {
+                                    "fake-cmd plugin config incorrect".to_string()
+                                }),
+                                ..Default::default()
+                            }]
+                        })
+                    }),
                 _ => None,
             },
         })
@@ -155,13 +175,18 @@ pub fn new_engine_helper(pwd: AbsolutePathBuf) -> (AbsolutePathBuf, String, Engi
 
 /// creates a new engine with the current path in the completions fixtures folder
 pub fn new_engine() -> (AbsolutePathBuf, String, EngineState, Stack) {
-    new_engine_helper(fs::fixtures().join("completions"))
+    new_engine_helper(
+        FIXTURES
+            .join("completions")
+            .try_into()
+            .expect("fixtures is absolute"),
+    )
 }
 
 /// Adds pseudo PATH env for external completion tests
 pub fn new_external_engine() -> EngineState {
     let mut engine = create_default_context();
-    let dir = fs::fixtures().join("external_completions").join("path");
+    let dir = FIXTURES.join("external_completions").join("path");
     let dir_str = dir.to_string_lossy().to_string();
     let span = nu_protocol::Span::new(0, dir_str.len());
     engine.add_env_var(
@@ -174,7 +199,10 @@ pub fn new_external_engine() -> EngineState {
 /// creates a new engine with the current path in the dotnu_completions fixtures folder
 pub fn new_dotnu_engine() -> (AbsolutePathBuf, String, EngineState, Stack) {
     // Target folder inside assets
-    let dir = fs::fixtures().join("dotnu_completions");
+    let dir = FIXTURES
+        .join("dotnu_completions")
+        .try_into()
+        .expect("fixtures is absolute");
     let (dir, dir_str, mut engine_state, mut stack) = new_engine_helper(dir);
     let dir_span = nu_protocol::Span::new(0, dir_str.len());
 
@@ -182,7 +210,7 @@ pub fn new_dotnu_engine() -> (AbsolutePathBuf, String, EngineState, Stack) {
     let mut working_set = StateWorkingSet::new(&engine_state);
     let var_id = working_set.add_variable(
         b"$NU_LIB_DIRS".into(),
-        Span::unknown(),
+        Span::test_data(),
         nu_protocol::Type::List(Box::new(nu_protocol::Type::String)),
         false,
     );
@@ -211,15 +239,26 @@ pub fn new_dotnu_engine() -> (AbsolutePathBuf, String, EngineState, Stack) {
 }
 
 pub fn new_quote_engine() -> (AbsolutePathBuf, String, EngineState, Stack) {
-    new_engine_helper(fs::fixtures().join("quoted_completions"))
+    new_engine_helper(
+        FIXTURES
+            .join("quoted_completions")
+            .try_into()
+            .expect("fixtures is absolute"),
+    )
 }
 
 pub fn new_partial_engine() -> (AbsolutePathBuf, String, EngineState, Stack) {
-    new_engine_helper(fs::fixtures().join("partial_completions"))
+    new_engine_helper(
+        FIXTURES
+            .join("partial_completions")
+            .try_into()
+            .expect("fixtures is absolute"),
+    )
 }
 
 /// match a list of suggestions with the expected values
-pub fn match_suggestions(expected: &Vec<&str>, suggestions: &Vec<Suggestion>) {
+#[track_caller]
+pub fn match_suggestions(expected: &Vec<&str>, suggestions: &[Suggestion]) {
     let expected_len = expected.len();
     let suggestions_len = suggestions.len();
     if expected_len != suggestions_len {
@@ -239,7 +278,8 @@ pub fn match_suggestions(expected: &Vec<&str>, suggestions: &Vec<Suggestion>) {
 }
 
 /// match a list of suggestions with the expected values
-pub fn match_suggestions_by_string(expected: &[String], suggestions: &Vec<Suggestion>) {
+#[track_caller]
+pub fn match_suggestions_by_string(expected: &[String], suggestions: &[Suggestion]) {
     let expected = expected.iter().map(|it| it.as_str()).collect::<Vec<_>>();
     match_suggestions(&expected, suggestions);
 }
@@ -280,7 +320,7 @@ pub fn merge_input(
             engine_state,
             stack,
             &block,
-            PipelineData::value(Value::nothing(Span::unknown()), None),
+            PipelineData::value(Value::nothing(Span::test_data()), None),
         )
         .is_ok()
     );

@@ -1,220 +1,233 @@
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches:
       - main
       - 'patch-release-*'
 
-name: continuous-integration
+name: Continuous Integration
+
+permissions:
+  contents: read
 
 env:
-  NUSHELL_CARGO_PROFILE: ci
+  NU_BUILD_PR: ${{ github.event.pull_request.html_url }}
   NU_LOG_LEVEL: DEBUG
-  # If changing these settings also change toolkit.nu
-  CLIPPY_OPTIONS: "-D warnings -D clippy::unwrap_used -D clippy::unchecked_time_subtraction"
+  NU_TEST_SKIP_DEPS_BUILD: true
+  NUSHELL_CARGO_PROFILE: ci
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
-  fmt-clippy:
+  root:
+    name: ${{ matrix.platform.name }} / root
+    runs-on: ${{ matrix.platform.runner }}
+    # Do not run CI on draft PRs or on the lower layers of stacked PRs
+    if: &job_if >-
+      !github.event.pull_request.draft &&
+      (
+        github.event.pull_request.stack == null ||
+        github.event.pull_request.stack.position ==
+          github.event.pull_request.stack.size
+      )
+    env:
+      build-target: ${{ matrix.platform.target }}
+      working-directory: ${{ github.workspace }}
+      cargo-options: --workspace --all-targets
+      profile: ci
     strategy:
-      fail-fast: true
       matrix:
-        # Pinning to Ubuntu 22.04 because building on newer Ubuntu versions causes linux-gnu
-        # builds to link against a too-new-for-many-Linux-installs glibc version. Consider
-        # revisiting this when 22.04 is closer to EOL (June 2027)
-        platform: [windows-latest, macos-latest, ubuntu-22.04]
-
-    runs-on: ${{ matrix.platform }}
-
+        platform: &platforms
+          - name: Linux
+            runner: &runner_linux incredibuild-ubuntu-2204
+            target: &target_linux x86_64-unknown-linux-gnu
+          - name: Windows
+            runner: &runner_windows incredibuild-windows-2022
+            target: &target_windows x86_64-pc-windows-msvc
+          - name: MacOS
+            runner: &runner_macos macos-latest
+            target: &target_macos x86_64-apple-darwin
     steps:
-      - uses: actions/checkout@v6
 
-      - name: Setup Rust toolchain and cache
-        uses: actions-rust-lang/setup-rust-toolchain@v1.12.0
+      - &step_checkout_repo
+        name: Checkout Repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: cargo fmt
-        run: cargo fmt --all -- --check
+      - &step_setup_rust_toolchain
+        name: Setup Rust Toolchain
+        run: rustup target add ${{ env.build-target }}
+        working-directory: ${{ env.working-directory }}
 
-        # If changing these settings also change toolkit.nu
-      - name: Clippy
-        run: cargo clippy --workspace --exclude nu_plugin_* -- $CLIPPY_OPTIONS
+      - &step_cache_rust
+        name: Cache Rust
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ${{ env.working-directory }} -> target
+          cache-all-crates: true
+          cache-workspace-crates: true
 
-        # In tests we don't have to deny unwrap
-      - name: Clippy of tests
-        run: cargo clippy --tests --workspace --exclude nu_plugin_* -- -D warnings
-
-      - name: Clippy of benchmarks
-        run: cargo clippy --benches --workspace --exclude nu_plugin_* -- -D warnings
-
-  tests:
-    strategy:
-      fail-fast: true
-      matrix:
-        platform: [windows-latest, macos-latest, ubuntu-22.04]
-
-    runs-on: ${{ matrix.platform }}
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Setup Rust toolchain and cache
-        uses: actions-rust-lang/setup-rust-toolchain@v1.12.0
-
-      - name: Tests
-        run: cargo test --workspace --profile ci --exclude nu_plugin_*
-      - name: Check for clean repo
-        shell: bash
+      - &step_fmt
+        name: Fmt
+        working-directory: ${{ env.working-directory }}
         run: |
-          if [ -n "$(git status --porcelain)" ]; then
-            echo "there are changes";
-            git status --porcelain
-            exit 1
-          else
-            echo "no changes in working directory";
-          fi
+          rustup component add rustfmt
+          cargo fmt --all --check
 
-  std-lib-and-python-virtualenv:
-    strategy:
-      fail-fast: true
-      matrix:
-        platform: [ubuntu-22.04, macos-latest, windows-latest]
-        py:
-          - py
+      - &step_check
+        name: Check
+        working-directory: ${{ env.working-directory }}
+        run: >-
+          cargo --config "${{ github.workspace }}/.cargo/ci.toml" 
+          check ${{ env.cargo-options }} 
+          --profile ${{ env.profile }}
 
-    runs-on: ${{ matrix.platform }}
+      - &step_clippy
+        name: Clippy
+        working-directory: ${{ env.working-directory }}
+        run: >-
+          rustup component add clippy
 
-    steps:
-      - uses: actions/checkout@v6
+          cargo --config "${{ github.workspace }}/.cargo/ci.toml" 
+          clippy ${{ env.cargo-options }} 
+          --profile ${{ env.profile }} 
+          -- -D warnings
 
-      - name: Setup Rust toolchain and cache
-        uses: actions-rust-lang/setup-rust-toolchain@v1.12.0
+      - &step_build
+        name: Build
+        working-directory: ${{ env.working-directory }}
+        run: >-
+          cargo --config "${{ github.workspace }}/.cargo/ci.toml" 
+          build ${{ env.cargo-options }} 
+          --profile ${{ env.profile }}
 
-      - name: Install Nushell
-        run: cargo install --path . --locked --force
+      - &step_test
+        name: Test
+        working-directory: ${{ env.working-directory }}
+        run: >-
+          cargo --config "${{ github.workspace }}/.cargo/ci.toml"
+          test ${{ env.cargo-options }}
+          --profile ${{ env.profile }}
 
-      - name: Upload Nushell build (Ubuntu and macOS)
-        uses: actions/upload-artifact@v7
-        if: runner.os != 'Windows'
-        with:
-          name: "nu-${{ github.event.number || github.ref_name }}-${{ matrix.platform }}"
-          path: "~/.cargo/bin/nu"
-          retention-days: 14
+      - &step_doctest
+        name: Doctest
+        working-directory: ${{ env.working-directory }}
+        run: >-
+          cargo --config "${{ github.workspace }}/.cargo/ci.toml" 
+          test --workspace --doc 
+          --profile ${{ env.profile }}
 
-      - name: Upload Nushell build (Windows)
-        uses: actions/upload-artifact@v7
-        if: runner.os == 'Windows'
-        with:
-          name: "nu-${{ github.event.number || github.ref_name }}-${{ matrix.platform }}"
-          path: 'C:\Users\runneradmin\.cargo\bin\nu.exe'
-          retention-days: 14
+      - &step_add_nushell_to_path
+        name: Add Nushell to PATH
+        shell: bash
+        env:
+          NU_HOME: ${{ env.working-directory }}/target/${{ env.profile }}
+        run: printf '%s\n' "${NU_HOME}" >> "$GITHUB_PATH"
 
-      - name: Standard library tests
-        run: nu -c 'use crates/nu-std/testing.nu; testing run-tests --path crates/nu-std'
+      - &step_test_std
+        name: Test Std
+        run: nu -n -c 'use crates/nu-std/testing.nu; testing run-tests --path crates/nu-std'
 
-      - name: Ensure that Cargo.toml MSRV and rust-toolchain.toml use the same version
-        run: nu .github/workflows/check-msrv.nu
-
-      - name: Setup Python
-        uses: actions/setup-python@v6
+      - &step_setup_python
+        name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.10"
 
-      - name: Install virtualenv
+      - &step_install_virtualenv
+        name: Install virtualenv
         run: pip install virtualenv
-        shell: bash
 
-      - name: Test Nushell in virtualenv
+      - &step_test_virtualenv
+        name: Test virtualenv
         run: nu scripts/test_virtualenv.nu
+
+      - &step_upload_artifacts
+        name: Upload Artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        env:
+          OS_NAMES: '{"Windows":"windows","Linux":"linux","macOS":"macos"}'
+          ARCH_NAMES: '{"X86":"x86","X64":"x86_64","ARM":"arm","ARM64":"aarch64"}'
+        with:
+          name: &artifact_name >-
+            ${{ format('nu-{0}-{1}-{2}',
+              github.event.number || github.ref_name,
+              fromJSON(env.OS_NAMES)[runner.os],
+              fromJSON(env.ARCH_NAMES)[runner.arch]) }}
+          path: |
+            ${{ format('{0}/target/{1}/nu',
+              env.working-directory || github.workspace,
+              env.profile || 'ci') }}
+            ${{ format('{0}/target/{1}/nu.exe',
+              env.working-directory || github.workspace,
+              env.profile || 'ci') }}
+          retention-days: 14
+
+      - &step_assert_clean_repo
+        name: Assert Clean Repo
         shell: bash
+        run: test -z "$(git status --porcelain)"
 
-      - name: Check for clean repo
-        shell: bash
-        run: |
-          if [ -n "$(git status --porcelain)" ]; then
-            echo "there are changes";
-            git status --porcelain
-            exit 1
-          else
-            echo "no changes in working directory";
-          fi
-
-  plugins:
-    strategy:
-      fail-fast: true
-      matrix:
-        platform: [windows-latest, macos-latest, ubuntu-22.04]
-
-    runs-on: ${{ matrix.platform }}
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Setup Rust toolchain and cache
-        uses: actions-rust-lang/setup-rust-toolchain@v1.12.0
-
-      - name: Clippy
-        run: cargo clippy --package nu_plugin_* -- $CLIPPY_OPTIONS
-
-      - name: Tests
-        run: cargo test --profile ci --package nu_plugin_*
-
-      - name: Check for clean repo
-        shell: bash
-        run: |
-          if [ -n "$(git status --porcelain)" ]; then
-            echo "there are changes";
-            git status --porcelain
-            exit 1
-          else
-            echo "no changes in working directory";
-          fi
-
-  wasm:
+  root_wasm:
+    name: WASM / root
+    runs-on: *runner_linux
+    if: *job_if
     env:
-      WASM_OPTIONS: --no-default-features --target wasm32-unknown-unknown
-      CLIPPY_CONF_DIR: ${{ github.workspace }}/clippy/wasm/
+      build-target: wasm32-unknown-unknown
+      working-directory: ${{ github.workspace }}
+      profile: ci
+      cargo-options: >-
+        --no-default-features
+        --target wasm32-unknown-unknown
+        -p nu-cmd-base
+        -p nu-cmd-extra
+        -p nu-cmd-lang
+        -p nu-color-config
+        -p nu-command
+        -p nu-derive-value
+        -p nu-engine
+        -p nu-glob
+        -p nu-json
+        -p nu-parser
+        -p nu-path
+        -p nu-pretty-hex
+        -p nu-protocol
+        -p nu-std
+        -p nu-system
+        -p nu-table
+        -p nu-term-grid
+        -p nu-utils
+        -p nuon
+    steps:
+      - *step_checkout_repo
+      - *step_setup_rust_toolchain
+      - *step_cache_rust
+      - *step_check
+      - *step_build
+      - *step_assert_clean_repo
 
+  fuzz:
+    name: ${{ matrix.platform.name }} / ${{ matrix.crate }} / fuzz
+    runs-on: ${{ matrix.platform.runner }}
+    if: *job_if
+    env:
+      build-target: ${{ matrix.platform.target }}
+      working-directory: ${{ github.workspace }}/crates/${{ matrix.crate }}/fuzz
+      profile: dev
+      cargo-options: --all-targets
     strategy:
       matrix:
-        job:
-          - name: Build WASM
-            command: cargo build
-            args:
-          - name: Clippy WASM
-            command: cargo clippy
-            args: -- $CLIPPY_OPTIONS
-
-    name: ${{ matrix.job.name }}
-
-    runs-on: ubuntu-latest
+        platform: *platforms
+        crate:
+          - nu-parser
+          - nu-path
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Setup Rust toolchain and cache
-        uses: actions-rust-lang/setup-rust-toolchain@v1.12.0
-
-      - name: Add wasm32-unknown-unknown target
-        run: rustup target add wasm32-unknown-unknown
-
-      - run: ${{ matrix.job.command }} -p nu-cmd-base $WASM_OPTIONS ${{ matrix.job.args }}
-      - run: ${{ matrix.job.command }} -p nu-cmd-extra $WASM_OPTIONS ${{ matrix.job.args }}
-      - run: ${{ matrix.job.command }} -p nu-cmd-lang $WASM_OPTIONS ${{ matrix.job.args }}
-      - run: ${{ matrix.job.command }} -p nu-color-config $WASM_OPTIONS ${{ matrix.job.args }}
-      - run: ${{ matrix.job.command }} -p nu-command $WASM_OPTIONS ${{ matrix.job.args }}
-      - run: ${{ matrix.job.command }} -p nu-derive-value $WASM_OPTIONS ${{ matrix.job.args }}
-      - run: ${{ matrix.job.command }} -p nu-engine $WASM_OPTIONS ${{ matrix.job.args }}
-      - run: ${{ matrix.job.command }} -p nu-glob $WASM_OPTIONS ${{ matrix.job.args }}
-      - run: ${{ matrix.job.command }} -p nu-json $WASM_OPTIONS ${{ matrix.job.args }}
-      - run: ${{ matrix.job.command }} -p nu-parser $WASM_OPTIONS ${{ matrix.job.args }}
-      - run: ${{ matrix.job.command }} -p nu-path $WASM_OPTIONS ${{ matrix.job.args }}
-      - run: ${{ matrix.job.command }} -p nu-pretty-hex $WASM_OPTIONS ${{ matrix.job.args }}
-      - run: ${{ matrix.job.command }} -p nu-protocol $WASM_OPTIONS ${{ matrix.job.args }}
-      - run: ${{ matrix.job.command }} -p nu-std $WASM_OPTIONS ${{ matrix.job.args }}
-      - run: ${{ matrix.job.command }} -p nu-system $WASM_OPTIONS ${{ matrix.job.args }}
-      - run: ${{ matrix.job.command }} -p nu-table $WASM_OPTIONS ${{ matrix.job.args }}
-      - run: ${{ matrix.job.command }} -p nu-term-grid $WASM_OPTIONS ${{ matrix.job.args }}
-      - run: ${{ matrix.job.command }} -p nu-utils $WASM_OPTIONS ${{ matrix.job.args }}
-      - run: ${{ matrix.job.command }} -p nuon $WASM_OPTIONS ${{ matrix.job.args }}
+      - *step_checkout_repo
+      - *step_setup_rust_toolchain
+      - *step_cache_rust
+      - *step_fmt
+      - *step_check
+      - *step_clippy
+      - *step_assert_clean_repo

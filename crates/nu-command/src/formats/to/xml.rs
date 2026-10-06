@@ -4,7 +4,8 @@ use nu_engine::command_prelude::*;
 
 use quick_xml::{
     escape,
-    events::{BytesEnd, BytesPI, BytesStart, BytesText, Event},
+    events::{BytesEnd, BytesPI, BytesStart, BytesText, Event, attributes::Attribute},
+    name::QName,
 };
 use std::{borrow::Cow, io::Cursor};
 
@@ -53,21 +54,21 @@ Additionally any field which is: empty record, empty list or null, can be omitte
         vec![
             Example {
                 description: "Outputs an XML string representing the contents of this table.",
-                example: r#"{tag: note attributes: {} content : [{tag: remember attributes: {} content : [{tag: null attributes: null content : Event}]}]} | to xml"#,
+                example: "{tag: note attributes: {} content : [{tag: remember attributes: {} content : [{tag: null attributes: null content : Event}]}]} | to xml",
                 result: Some(Value::test_string(
                     "<note><remember>Event</remember></note>",
                 )),
             },
             Example {
                 description: "When formatting xml null and empty record fields can be omitted and strings can be written without a wrapping record.",
-                example: r#"{tag: note content : [{tag: remember content : [Event]}]} | to xml"#,
+                example: "{tag: note content : [{tag: remember content : [Event]}]} | to xml",
                 result: Some(Value::test_string(
                     "<note><remember>Event</remember></note>",
                 )),
             },
             Example {
                 description: "Optionally, formats the text with a custom indentation setting.",
-                example: r#"{tag: note content : [{tag: remember content : [Event]}]} | to xml --indent 3"#,
+                example: "{tag: note content : [{tag: remember content : [Event]}]} | to xml --indent 3",
                 result: Some(Value::test_string(
                     "<note>\n   <remember>Event</remember>\n</note>",
                 )),
@@ -79,8 +80,8 @@ Additionally any field which is: empty record, empty list or null, can be omitte
             },
             Example {
                 description: "Save space using self-closed tags.",
-                example: r#"{tag: root content: [[tag]; [a] [b] [c]]} | to xml --self-closed"#,
-                result: Some(Value::test_string(r#"<root><a/><b/><c/></root>"#)),
+                example: "{tag: root content: [[tag]; [a] [b] [c]]} | to xml --self-closed",
+                result: Some(Value::test_string("<root><a/><b/><c/></root>")),
             },
         ]
     }
@@ -127,9 +128,9 @@ impl Job {
         }
     }
 
-    fn run(mut self, input: PipelineData, head: Span) -> Result<PipelineData, ShellError> {
+    fn run(mut self, mut input: PipelineData, head: Span) -> Result<PipelineData, ShellError> {
         let metadata = input
-            .metadata()
+            .take_metadata()
             .unwrap_or_default()
             .with_content_type(Some("application/xml".into()));
         let value = input.into_value(head)?;
@@ -152,41 +153,43 @@ impl Job {
     ) {
         for (k, v) in attributes {
             if self.partial_escape {
-                element.push_attribute((k.as_bytes(), Self::partial_escape_attribute(v).as_ref()))
+                // Attribute::from re-escapes, so pre-escaped values must be set directly.
+                element.push_attribute(Attribute {
+                    key: QName(k.as_str()),
+                    value: Self::partial_escape_attribute(v),
+                });
             } else {
-                element.push_attribute((k.as_bytes(), escape::escape(v).as_bytes()))
-            };
+                element.push_attribute((k.as_str(), v.as_str()));
+            }
         }
     }
 
-    fn partial_escape_attribute(raw: &str) -> Cow<'_, [u8]> {
-        let bytes = raw.as_bytes();
-        let mut escaped: Vec<u8> = Vec::new();
-        let mut iter = bytes.iter().enumerate();
-        let mut pos = 0;
-        while let Some((new_pos, byte)) =
-            iter.find(|(_, ch)| matches!(ch, b'<' | b'>' | b'&' | b'"'))
-        {
-            escaped.extend_from_slice(&bytes[pos..new_pos]);
-            match byte {
-                b'<' => escaped.extend_from_slice(b"&lt;"),
-                b'>' => escaped.extend_from_slice(b"&gt;"),
-                b'&' => escaped.extend_from_slice(b"&amp;"),
-                b'"' => escaped.extend_from_slice(b"&quot;"),
-
-                _ => unreachable!("Only '<', '>','&', '\"' are escaped"),
+    fn partial_escape_attribute(raw: &str) -> Cow<'_, str> {
+        let mut escaped = String::new();
+        let mut last = 0;
+        for (idx, ch) in raw.char_indices() {
+            let replacement = match ch {
+                '<' => Some("&lt;"),
+                '>' => Some("&gt;"),
+                '&' => Some("&amp;"),
+                '"' => Some("&quot;"),
+                _ => None,
+            };
+            if let Some(replacement) = replacement {
+                if escaped.is_empty() {
+                    escaped.reserve(raw.len());
+                }
+                escaped.push_str(&raw[last..idx]);
+                escaped.push_str(replacement);
+                last = idx + ch.len_utf8();
             }
-            pos = new_pos + 1;
         }
 
-        if !escaped.is_empty() {
-            if let Some(raw) = bytes.get(pos..) {
-                escaped.extend_from_slice(raw);
-            }
-
-            Cow::Owned(escaped)
+        if escaped.is_empty() {
+            Cow::Borrowed(raw)
         } else {
-            Cow::Borrowed(bytes)
+            escaped.push_str(&raw[last..]);
+            Cow::Owned(escaped)
         }
     }
 
@@ -220,15 +223,15 @@ impl Job {
             let tag = record
                 .get(COLUMN_TAG_NAME)
                 .cloned()
-                .unwrap_or_else(|| Value::nothing(Span::unknown()));
+                .unwrap_or_else(|| Value::nothing(entry_span));
             let attrs = record
                 .get(COLUMN_ATTRS_NAME)
                 .cloned()
-                .unwrap_or_else(|| Value::nothing(Span::unknown()));
+                .unwrap_or_else(|| Value::nothing(entry_span));
             let content = record
                 .get(COLUMN_CONTENT_NAME)
                 .cloned()
-                .unwrap_or_else(|| Value::nothing(Span::unknown()));
+                .unwrap_or_else(|| Value::nothing(entry_span));
 
             let content_span = content.span();
             let tag_span = tag.span();
@@ -337,7 +340,7 @@ impl Job {
             };
 
             let content = match content {
-                Value::List { vals, .. } => vals,
+                Value::List { vals, .. } => vals.into_owned(),
                 Value::Nothing { .. } => Vec::new(),
                 _ => {
                     return Err(ShellError::CantConvert {
@@ -513,10 +516,8 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(ToXml {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(ToXml)
     }
 
     #[test]

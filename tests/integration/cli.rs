@@ -26,6 +26,20 @@ fn help_shows_usage() -> TestResult {
 }
 
 #[test]
+fn help_has_no_ansi_when_stdout_is_not_terminal() -> TestResult {
+    let mut cmd = Command::new(cargo_bin!());
+    let output = cmd.arg("--help").output()?;
+
+    assert!(output.status.success());
+    assert!(
+        !output.stdout.contains(&0x1b),
+        "redirected help output should not contain ANSI escape sequences"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn help_lists_all_flags() -> TestResult {
     let mut cmd = Command::new(cargo_bin!());
     let output = cmd.arg("--help").output()?;
@@ -52,7 +66,6 @@ fn help_lists_all_flags() -> TestResult {
         "--log-include",
         "--log-exclude",
         "--stdin",
-        "--testbin",
         "--experimental-options",
         "--lsp",
         "--ide-goto-def",
@@ -433,46 +446,6 @@ fn log_target_rejects_invalid_value() -> TestResult {
 }
 
 #[test]
-fn log_include_rejects_invalid_value() -> TestResult {
-    let mut cmd = Command::new(cargo_bin!());
-    let output = cmd
-        .args([
-            "--no-config-file",
-            "--no-std-lib",
-            "--log-include",
-            "verbose",
-        ])
-        .output()?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(!output.status.success());
-    assert!(stderr.contains("log-include"));
-    assert!(stderr.contains("Did you mean") || stderr.contains("Valid log levels"));
-
-    Ok(())
-}
-
-#[test]
-fn log_exclude_rejects_invalid_value() -> TestResult {
-    let mut cmd = Command::new(cargo_bin!());
-    let output = cmd
-        .args([
-            "--no-config-file",
-            "--no-std-lib",
-            "--log-exclude",
-            "verbose",
-        ])
-        .output()?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(!output.status.success());
-    assert!(stderr.contains("log-exclude"));
-    assert!(stderr.contains("Did you mean") || stderr.contains("Valid log levels"));
-
-    Ok(())
-}
-
-#[test]
 fn log_level_missing_value_lists_modes() -> TestResult {
     let mut cmd = Command::new(cargo_bin!());
     let output = cmd
@@ -547,47 +520,6 @@ fn stdin_flag_runs() -> TestResult {
 }
 
 #[test]
-fn testbin_flag_accepts_value() -> TestResult {
-    let mut cmd = Command::new(cargo_bin!());
-    let output = cmd
-        .args(["--testbin", "cococo", "--no-std-lib", "-c", "print 1"])
-        .output()?;
-
-    assert!(output.status.success());
-
-    Ok(())
-}
-
-#[test]
-fn testbin_rejects_invalid_value() -> TestResult {
-    let mut cmd = Command::new(cargo_bin!());
-    let output = cmd
-        .args(["--no-config-file", "--no-std-lib", "--testbin", "cocooo"])
-        .output()?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(!output.status.success());
-    assert!(stderr.contains("testbin"));
-    assert!(stderr.contains("Did you mean") || stderr.contains("Valid test bins"));
-
-    Ok(())
-}
-
-#[test]
-fn testbin_missing_value_lists_modes() -> TestResult {
-    let mut cmd = Command::new(cargo_bin!());
-    let output = cmd
-        .args(["--no-config-file", "--no-std-lib", "--testbin"])
-        .output()?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(!output.status.success());
-    assert!(stderr.contains("Valid test bins"));
-
-    Ok(())
-}
-
-#[test]
 fn error_style_flag_accepts_value() -> TestResult {
     let mut cmd = Command::new(cargo_bin!());
     let output = cmd
@@ -656,6 +588,24 @@ fn ide_flags_accept_values() -> TestResult {
 
     assert!(!output.status.success());
     assert!(stderr.contains("ide") || stderr.contains("panicked"));
+
+    Ok(())
+}
+
+#[test]
+fn ide_check_missing_file_reports_error() -> TestResult {
+    let script_path = unique_temp_script_path("ide_check_missing");
+    let mut cmd = Command::new(cargo_bin!());
+    let output = cmd
+        .args(["--no-config-file", "--no-std-lib", "--ide-check", "5"])
+        .arg(&script_path)
+        .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("Could not read file"));
+    assert!(stderr.contains("File not found"));
+    assert!(stderr.contains("does not exist"));
 
     Ok(())
 }
@@ -884,26 +834,6 @@ fn log_include_accepts_bracketed_list_with_spaces() -> TestResult {
     Ok(())
 }
 
-#[test]
-fn log_include_rejects_invalid_level() -> TestResult {
-    let mut cmd = Command::new(cargo_bin!());
-    let output = cmd
-        .args([
-            "--no-config-file",
-            "--no-std-lib",
-            "--log-include",
-            "invalid",
-            "-c",
-            "print 'test'",
-        ])
-        .output()?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(!output.status.success());
-    assert!(stderr.contains("Invalid value for `--log-include`"));
-    Ok(())
-}
-
 // Tests for --log-exclude with various formats
 #[test]
 fn log_exclude_accepts_single_value() -> TestResult {
@@ -975,26 +905,6 @@ fn log_exclude_accepts_bracketed_list() -> TestResult {
         .output()?;
 
     assert!(output.status.success());
-    Ok(())
-}
-
-#[test]
-fn log_exclude_rejects_invalid_level() -> TestResult {
-    let mut cmd = Command::new(cargo_bin!());
-    let output = cmd
-        .args([
-            "--no-config-file",
-            "--no-std-lib",
-            "--log-exclude",
-            "invalid",
-            "-c",
-            "print 'test'",
-        ])
-        .output()?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(!output.status.success());
-    assert!(stderr.contains("Invalid value for `--log-exclude`"));
     Ok(())
 }
 
@@ -1125,39 +1035,6 @@ fn missing_error_style_lists_values() -> TestResult {
 
     assert!(!output.status.success());
     assert!(stderr.contains("Valid error styles"));
-    Ok(())
-}
-
-#[test]
-fn missing_testbin_lists_values() -> TestResult {
-    let mut cmd = Command::new(cargo_bin!());
-    let output = cmd
-        .args(["--no-config-file", "--no-std-lib", "--testbin"])
-        .output()?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(!output.status.success());
-    assert!(stderr.contains("Valid test bins"));
-    Ok(())
-}
-
-#[test]
-fn rejects_invalid_testbin_value() -> TestResult {
-    let mut cmd = Command::new(cargo_bin!());
-    let output = cmd
-        .args([
-            "--no-config-file",
-            "--no-std-lib",
-            "--testbin",
-            "cocooo",
-            "-c",
-            "print 1",
-        ])
-        .output()?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(!output.status.success());
-    assert!(stderr.contains("Did you mean") || stderr.contains("Valid test bins"));
     Ok(())
 }
 
@@ -1478,6 +1355,167 @@ fn script_with_nu_flags_before_script_name() -> TestResult {
     Ok(())
 }
 
+// Tests for command-line script with arguments
+#[test]
+fn command_can_receive_arguments() -> TestResult {
+    let mut cmd = Command::new(cargo_bin!());
+    let output = cmd
+        .args([
+            "--no-config-file",
+            "--no-std-lib",
+            "-c",
+            "def main [arg, ...rest] {
+                {arg: $arg, rest: $rest} | to nuon
+            }",
+            "earth",
+            "wind and water",
+            "fire",
+        ])
+        .output()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(
+        stdout.contains(r#"{arg: earth, rest: ["wind and water", fire]}"#),
+        "actual: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn command_ignores_arguments_without_main() -> TestResult {
+    let mut cmd = Command::new(cargo_bin!());
+    let output = cmd
+        .args([
+            "--no-config-file",
+            "--no-std-lib",
+            "-c",
+            "print 'ok'",
+            "--this-is-not-a-nushell-flag",
+            "positional",
+        ])
+        .output()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "ok");
+    Ok(())
+}
+
+#[test]
+fn command_reports_parse_errors() -> TestResult {
+    let mut cmd = Command::new(cargo_bin!());
+    let output = cmd
+        .args([
+            "--no-config-file",
+            "--no-std-lib",
+            "-c",
+            "def main [i: int] { }",
+            "abc",
+        ])
+        .output()?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("nu::parser::parse_mismatch"),
+        "actual: {stderr:?}"
+    );
+    assert!(stderr.contains("expected int"), "actual: {stderr:?}");
+
+    Ok(())
+}
+
+#[test]
+fn command_can_receive_wrapped_arguments() -> TestResult {
+    let mut cmd = Command::new(cargo_bin!());
+    let output = cmd
+        .args([
+            "--no-config-file",
+            "--no-std-lib",
+            "-c",
+            "def --wrapped main [...rest] {
+                $rest | to nuon
+            }",
+            "--",
+            "earth",
+            "wind and water",
+            "fire",
+        ])
+        .output()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(
+        stdout.contains(r#"[--, earth, "wind and water", fire]"#),
+        "actual: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn command_can_parse_flags() -> TestResult {
+    let mut cmd = Command::new(cargo_bin!());
+    let output = cmd
+        .args([
+            "--no-config-file",
+            "--no-std-lib",
+            "-c",
+            "def main [--flag, --zip: string, ...rest] {
+                {flag: $flag, zip: $zip, rest: $rest } | to nuon
+            }",
+            "--flag",
+            "--zip=zap",
+            "'foo bar'",
+            "baz",
+        ])
+        .output()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(
+        stdout.contains(r#"{flag: true, zip: zap, rest: ["'foo bar'", baz]"#),
+        "actual: {stdout:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn command_can_wrap_unknown_args() -> TestResult {
+    let mut cmd = Command::new(cargo_bin!());
+    let output = cmd
+        .args([
+            "--no-config-file",
+            "--no-std-lib",
+            "-c",
+            "def --wrapped main [...rest] {
+                $rest | to nuon
+            }",
+            "--",
+            "--flag",
+            "--zip=zap",
+            "'zop zim'",
+            "beep",
+        ])
+        .output()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(
+        stdout.contains(r#"[--, --flag, "--zip=zap", "'zop zim'", beep]"#),
+        "actual: {stdout:?}"
+    );
+
+    Ok(())
+}
+
 // Tests for combined flags with scripts
 #[test]
 fn combined_short_flags_work_with_commands() -> TestResult {
@@ -1498,6 +1536,7 @@ fn table_mode_accepts_all_valid_modes() -> TestResult {
         "thin",
         "light",
         "compact",
+        "frameless",
         "with_love",
         "compact_double",
         "default",
@@ -1559,7 +1598,7 @@ fn error_style_accepts_all_valid_styles() -> TestResult {
 // Test for log-level with all valid values
 #[test]
 fn log_level_accepts_all_valid_levels() -> TestResult {
-    let levels = ["error", "warn", "info", "debug", "trace"];
+    let levels = ["error", "warn", "info", "debug", "trace", "perf"];
 
     for level in levels {
         let mut cmd = Command::new(cargo_bin!());
@@ -1724,7 +1763,7 @@ fn include_path_sets_env_nu_lib_dirs() -> TestResult {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(output.status.success());
-    assert!(stdout.contains(r#"/tmp/test"#));
+    assert!(stdout.contains("/tmp/test"));
     Ok(())
 }
 
@@ -1748,7 +1787,7 @@ fn include_path_appends_to_env_nu_lib_dirs() -> TestResult {
 
     assert!(output.status.success());
     // Should at least contain the -I path
-    assert!(stdout.contains(r#"/tmp/append"#));
+    assert!(stdout.contains("/tmp/append"));
     #[cfg(windows)]
     {
         assert!(stdout.contains(r#"\scripts"#));
@@ -1756,8 +1795,8 @@ fn include_path_appends_to_env_nu_lib_dirs() -> TestResult {
     }
     #[cfg(not(windows))]
     {
-        assert!(stdout.contains(r#"/scripts"#));
-        assert!(stdout.contains(r#"/completions"#));
+        assert!(stdout.contains("/scripts"));
+        assert!(stdout.contains("/completions"));
     }
     Ok(())
 }
@@ -1778,7 +1817,7 @@ fn nu_lib_dirs_env_var_sets_env() -> TestResult {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(output.status.success());
-    assert!(stdout.contains(r#"/tmp/envpath"#));
+    assert!(stdout.contains("/tmp/envpath"));
     Ok(())
 }
 

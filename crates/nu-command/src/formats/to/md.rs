@@ -216,16 +216,18 @@ impl Command for ToMd {
 }
 
 fn to_md(
-    input: PipelineData,
+    mut input: PipelineData,
     options: ToMdOptions,
     config: &Config,
     head: Span,
 ) -> Result<PipelineData, ShellError> {
     // text/markdown became a valid mimetype with rfc7763
-    let metadata = input
-        .metadata()
-        .unwrap_or_default()
-        .with_content_type(Some("text/markdown".into()));
+    let metadata = Some(
+        input
+            .take_metadata()
+            .unwrap_or_default()
+            .with_content_type(Some("text/markdown".into())),
+    );
 
     // Collect input to check if it's a simple list (no records/tables)
     let values: Vec<Value> = input.into_iter().collect();
@@ -255,7 +257,7 @@ fn to_md(
             .join("")
             .trim()
             .to_string();
-        return Ok(Value::string(result, head).into_pipeline_data_with_metadata(Some(metadata)));
+        return Ok(Value::string(result, head).into_pipeline_data_with_metadata(metadata));
     }
 
     // For tables/records, use the grouping logic
@@ -326,7 +328,7 @@ fn to_md(
                 .trim(),
             head,
         )
-        .into_pipeline_data_with_metadata(Some(metadata)));
+        .into_pipeline_data_with_metadata(metadata));
     }
     Ok(Value::string(
         table(
@@ -339,7 +341,7 @@ fn to_md(
         ),
         head,
     )
-    .into_pipeline_data_with_metadata(Some(metadata)))
+    .into_pipeline_data_with_metadata(metadata))
 }
 
 /// Formats a single list item with the appropriate list marker based on list_style
@@ -388,7 +390,7 @@ fn escape_markdown_characters(input: String, escape_md: bool, for_table: bool) -
 fn escape_value(value: String, escape_md: bool, escape_html: bool, for_table: bool) -> String {
     escape_markdown_characters(
         if escape_html {
-            v_htmlescape::escape(&value).to_string()
+            v_htmlescape::escape_fmt(&value).to_string()
         } else {
             value
         },
@@ -450,7 +452,7 @@ fn collect_headers(headers: &[String], escape_md: bool) -> (Vec<String>, Vec<usi
     if !headers.is_empty() && (headers.len() > 1 || !headers[0].is_empty()) {
         for header in headers {
             let escaped_header_string = escape_markdown_characters(
-                v_htmlescape::escape(header).to_string(),
+                v_htmlescape::escape_fmt(header).to_string(),
                 escape_md,
                 true,
             );
@@ -475,7 +477,7 @@ fn table(
     let vec_of_values = input
         .into_iter()
         .flat_map(|val| match val {
-            Value::List { vals, .. } => vals,
+            Value::List { vals, .. } => vals.into_owned(),
             other => vec![other],
         })
         .collect::<Vec<Value>>();
@@ -513,7 +515,7 @@ fn table(
                         .to_expanded_string(", ", config);
                     let escaped_string = escape_markdown_characters(
                         if escape_html {
-                            v_htmlescape::escape(&value_string).to_string()
+                            v_htmlescape::escape_fmt(&value_string).to_string()
                         } else {
                             value_string
                         },
@@ -534,7 +536,7 @@ fn table(
             }
             p => {
                 let value_string =
-                    v_htmlescape::escape(&p.to_abbreviated_string(config)).to_string();
+                    v_htmlescape::escape_fmt(&p.to_abbreviated_string(config)).to_string();
                 escaped_row.push(value_string);
             }
         }
@@ -756,10 +758,8 @@ mod tests {
     }
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(ToMd {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(ToMd)
     }
 
     #[test]
@@ -833,13 +833,13 @@ mod tests {
                 false,
                 &Config::default()
             ),
-            one(r#"
+            one("
             | country |
             | --- |
             | Ecuador |
             | New Zealand |
             | USA |
-            "#)
+            ")
         );
 
         assert_eq!(
@@ -851,13 +851,13 @@ mod tests {
                 false,
                 &Config::default()
             ),
-            one(r#"
+            one("
             | country     |
             | ----------- |
             | Ecuador     |
             | New Zealand |
             | USA         |
-            "#)
+            ")
         );
     }
 
@@ -883,12 +883,12 @@ mod tests {
                 false,
                 &Config::default()
             ),
-            one(r#"
+            one("
             |  | foo |
             | --- | --- |
             | 1 | 2 |
             | 3 | 4 |
-            "#)
+            ")
         );
     }
 
@@ -918,13 +918,13 @@ mod tests {
                 false,
                 &Config::default()
             ),
-            one(r#"
+            one("
             | foo | bar |
             | --- | --- |
             | 1 | 2 |
             | 3 | 4 |
             | 5 |  |
-            "#)
+            ")
         );
     }
 
@@ -946,11 +946,7 @@ mod tests {
         ]);
 
         let center_columns = Value::test_list(vec![Value::test_cell_path(CellPath {
-            members: vec![PathMember::test_string(
-                "bar".into(),
-                false,
-                Casing::Sensitive,
-            )],
+            members: vec![PathMember::test_string("bar", false, Casing::Sensitive)],
         })]);
 
         let cell_path: Vec<CellPath> = center_columns
@@ -972,13 +968,13 @@ mod tests {
                 false,
                 &Config::default()
             ),
-            one(r#"
+            one("
             | foo | bar |
             | --- |:---:|
             | 1   |  2  |
             | 3   |  4  |
             | 5   |  6  |
-            "#)
+            ")
         );
 
         // Without pretty
@@ -991,13 +987,13 @@ mod tests {
                 false,
                 &Config::default()
             ),
-            one(r#"
+            one("
             | foo | bar |
             | --- |:---:|
             | 1 | 2 |
             | 3 | 4 |
             | 5 | 6 |
-            "#)
+            ")
         );
     }
 
@@ -1029,13 +1025,13 @@ mod tests {
                 false,
                 &Config::default()
             ),
-            one(r#"
+            one("
             | foo | bar |
             | --- | --- |
             | 1   | 2   |
             | 3   | 4   |
             | 5   | 6   |
-            "#)
+            ")
         );
     }
 
@@ -1061,18 +1057,10 @@ mod tests {
 
         let center_columns = Value::test_list(vec![
             Value::test_cell_path(CellPath {
-                members: vec![PathMember::test_string(
-                    "command".into(),
-                    false,
-                    Casing::Sensitive,
-                )],
+                members: vec![PathMember::test_string("command", false, Casing::Sensitive)],
             }),
             Value::test_cell_path(CellPath {
-                members: vec![PathMember::test_string(
-                    "output".into(),
-                    false,
-                    Casing::Sensitive,
-                )],
+                members: vec![PathMember::test_string("output", false, Casing::Sensitive)],
             }),
         ]);
 
@@ -1094,13 +1082,13 @@ mod tests {
                 false,
                 &Config::default()
             ),
-            one(r#"
+            one("
             | command | input |  output  |
             |:-------:| ----- |:--------:|
             |   ls    | .     | file.txt |
             |  echo   | 'hi'  |    hi    |
             |   cp    | a.txt |  b.txt   |
-            "#)
+            ")
         );
     }
 
@@ -1122,11 +1110,7 @@ mod tests {
         ]);
 
         let center_columns = Value::test_list(vec![Value::test_cell_path(CellPath {
-            members: vec![PathMember::test_string(
-                "none".into(),
-                false,
-                Casing::Sensitive,
-            )],
+            members: vec![PathMember::test_string("none", false, Casing::Sensitive)],
         })]);
 
         let cell_path: Vec<CellPath> = center_columns
@@ -1147,13 +1131,13 @@ mod tests {
                 false,
                 &Config::default()
             ),
-            one(r#"
+            one("
             | name    | age |
             | ------- | --- |
             | Alice   | 30  |
             | Bob     | 5   |
             | Charlie | 20  |
-            "#)
+            ")
         );
     }
 
@@ -1173,7 +1157,7 @@ mod tests {
         let center_columns = Value::test_list(vec![Value::test_cell_path(CellPath {
             members: vec![
                 PathMember::test_int(1, false),
-                PathMember::test_string("v".into(), false, Casing::Sensitive),
+                PathMember::test_string("v", false, Casing::Sensitive),
             ],
         })]);
 
@@ -1195,12 +1179,12 @@ mod tests {
                 false,
                 &Config::default()
             ),
-            one(r#"
+            one("
             | k          |             v              |
             | ---------- |:--------------------------:|
             | version    |          0.104.1           |
             | build_time | 2025-05-28 11:00:45 +01:00 |
-            "#)
+            ")
         );
     }
 
@@ -1342,11 +1326,11 @@ mod tests {
                 true,
                 &Config::default()
             ),
-            one(r#"
+            one("
             | tag | code |
             | --- | --- |
             | table | &lt;table&gt;&lt;tr&gt;&lt;td scope=&quot;row&quot;&gt;Chris&lt;&#x2f;td&gt;&lt;td&gt;HTML tables&lt;&#x2f;td&gt;&lt;td&gt;22&lt;&#x2f;td&gt;&lt;&#x2f;tr&gt;&lt;tr&gt;&lt;td scope=&quot;row&quot;&gt;Dennis&lt;&#x2f;td&gt;&lt;td&gt;Web accessibility&lt;&#x2f;td&gt;&lt;td&gt;45&lt;&#x2f;td&gt;&lt;&#x2f;tr&gt;&lt;&#x2f;table&gt; |
-            "#)
+            ")
         );
 
         assert_eq!(
@@ -1358,11 +1342,11 @@ mod tests {
                 true,
                 &Config::default()
             ),
-            one(r#"
+            one("
             | tag   | code                                                                                                                                                                                                                                                                                                                                    |
             | ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
             | table | &lt;table&gt;&lt;tr&gt;&lt;td scope=&quot;row&quot;&gt;Chris&lt;&#x2f;td&gt;&lt;td&gt;HTML tables&lt;&#x2f;td&gt;&lt;td&gt;22&lt;&#x2f;td&gt;&lt;&#x2f;tr&gt;&lt;tr&gt;&lt;td scope=&quot;row&quot;&gt;Dennis&lt;&#x2f;td&gt;&lt;td&gt;Web accessibility&lt;&#x2f;td&gt;&lt;td&gt;45&lt;&#x2f;td&gt;&lt;&#x2f;tr&gt;&lt;&#x2f;table&gt; |
-            "#)
+            ")
         );
     }
 

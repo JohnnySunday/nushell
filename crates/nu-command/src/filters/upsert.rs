@@ -234,6 +234,8 @@ fn upsert_recursive(
                         value.upsert_data_at_cell_path(path, replacement)?;
                     }
                     value
+                } else if pre_elems.is_empty() {
+                    return Err(ShellError::AccessEmptyContent { span: path_span });
                 } else {
                     return Err(ShellError::AccessBeyondEnd {
                         max_idx: pre_elems.len() - 1,
@@ -335,7 +337,7 @@ fn upsert_value_by_closure(
         .unwrap_or(PipelineData::empty());
 
     let new_value = closure
-        .add_arg(value.clone())
+        .add_arg(value.clone())?
         .run_with_input(input)?
         .into_value(span)?;
 
@@ -369,7 +371,7 @@ fn upsert_single_value_by_closure(
         .unwrap_or(PipelineData::empty());
 
     let new_value = closure
-        .add_arg(arg)
+        .add_arg(arg)?
         .run_with_input(input)?
         .into_value(span)?;
 
@@ -381,9 +383,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Upsert {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Upsert)
     }
 }

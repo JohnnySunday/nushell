@@ -55,11 +55,11 @@ impl Command for Decode {
     }
 
     fn extra_description(&self) -> &str {
-        r#"Multiple encodings are supported; here are a few:
+        "Multiple encodings are supported; here are a few:
 big5, euc-jp, euc-kr, gbk, iso-8859-1, utf-16, cp1252, latin5
 
 For a more complete list of encodings please refer to the encoding_rs
-documentation link at https://docs.rs/encoding_rs/latest/encoding_rs/#statics"#
+documentation link at https://docs.rs/encoding_rs/latest/encoding_rs/#statics"
     }
 
     fn examples(&self) -> Vec<Example<'_>> {
@@ -71,7 +71,7 @@ documentation link at https://docs.rs/encoding_rs/latest/encoding_rs/#statics"#
             },
             Example {
                 description: "Decode an UTF-16 string into nushell UTF-8 string",
-                example: r#"0x[00 53 00 6F 00 6D 00 65 00 20 00 44 00 61 00 74 00 61] | decode utf-16be"#,
+                example: "0x[00 53 00 6F 00 6D 00 65 00 20 00 44 00 61 00 74 00 61] | decode utf-16be",
                 result: Some(Value::string("Some Data".to_owned(), Span::test_data())),
             },
         ]
@@ -95,10 +95,11 @@ documentation link at https://docs.rs/encoding_rs/latest/encoding_rs/#statics"#
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let encoding: Option<Spanned<String>> = call.opt_const(working_set, 0)?;
+        let encoding: Option<Spanned<String>> = call.opt_const(working_set, stack, 0)?;
         run(call, input, encoding)
     }
 }
@@ -126,7 +127,9 @@ fn run(
             let input_span = v.span();
             match v {
                 Value::Binary { val: bytes, .. } => match encoding {
-                    Some(encoding_name) => detect_and_decode(encoding_name, head, bytes),
+                    Some(encoding_name) => {
+                        detect_and_decode(encoding_name, head, bytes.into_owned())
+                    }
                     None => super::encoding::detect_encoding_name(head, input_span, &bytes)
                         .map(|encoding| encoding.decode(&bytes).0.into_owned())
                         .map(|s| Value::string(s, head)),
@@ -178,7 +181,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        crate::test_examples(Decode)
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Decode)
     }
 }

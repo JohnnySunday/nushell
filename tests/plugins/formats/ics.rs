@@ -1,14 +1,15 @@
-use nu_test_support::fs::Stub::{FileWithContent, FileWithContentToBeTrimmed};
-use nu_test_support::nu_with_plugins;
-use nu_test_support::playground::Playground;
-use pretty_assertions::assert_eq;
+use nu_test_support::{
+    fs::Stub::{FileWithContent, FileWithContentToBeTrimmed},
+    prelude::*,
+};
 
 #[test]
-fn infers_types() {
+#[deps(NU_PLUGIN_FORMATS)]
+fn infers_types() -> Result {
     Playground::setup("filter_from_ics_test_1", |dirs, sandbox| {
         sandbox.with_files(&[FileWithContentToBeTrimmed(
             "calendar.ics",
-            r#"
+            "
                 BEGIN:VCALENDAR
                 PRODID:-//Google Inc//Google Calendar 70.9054//EN
                 VERSION:2.0
@@ -41,26 +42,23 @@ fn infers_types() {
                 TRANSP:OPAQUE
                 END:VEVENT
                 END:VCALENDAR
-            "#,
+            ",
         )]);
-        let cwd = dirs.test();
 
-        let actual = nu_with_plugins!(
-            cwd: cwd,
-            plugin: ("nu_plugin_formats"),
-            "open calendar.ics | get events.0 | length"
-        );
-
-        assert_eq!(actual.out, "2");
+        test()
+            .cwd(dirs.test())
+            .run("open calendar.ics | get events.0 | length")
+            .expect_value_eq(2)
     })
 }
 
 #[test]
-fn from_ics_text_to_table() {
+#[deps(NU_PLUGIN_FORMATS)]
+fn from_ics_text_to_table() -> Result {
     Playground::setup("filter_from_ics_test_2", |dirs, sandbox| {
         sandbox.with_files(&[FileWithContentToBeTrimmed(
             "calendar.txt",
-            r#"
+            "
                 BEGIN:VCALENDAR
                 BEGIN:VEVENT
                 DTSTART:20171007T200000Z
@@ -77,34 +75,33 @@ fn from_ics_text_to_table() {
                 TRANSP:TRANSPARENT
                 END:VEVENT
                 END:VCALENDAR
-            "#,
+            ",
         )]);
 
-        let cwd = dirs.test();
-        let actual = nu_with_plugins!(
-            cwd: cwd,
-            plugin: ("nu_plugin_formats"),
-            r#"
-                open calendar.txt
-                | from ics
-                | get events.0
-                | get properties.0
-                | where name == "SUMMARY"
-                | first
-                | get value
-            "#
-        );
+        let code = r#"
+            open calendar.txt
+            | from ics
+            | get events.0
+            | get properties.0
+            | where name == "SUMMARY"
+            | first
+            | get value
+        "#;
 
-        assert_eq!(actual.out, "Maryland Game");
+        test()
+            .cwd(dirs.test())
+            .run(code)
+            .expect_value_eq("Maryland Game")
     })
 }
 
 #[test]
-fn from_ics_text_with_linebreak_to_table() {
+#[deps(NU_PLUGIN_FORMATS)]
+fn from_ics_text_with_linebreak_to_table() -> Result {
     Playground::setup("filter_from_ics_test_3", |dirs, sandbox| {
         sandbox.with_files(&[FileWithContent(
             "calendar.txt",
-            r#"BEGIN:VCALENDAR
+            "BEGIN:VCALENDAR
 BEGIN:VEVENT
 DTSTART:20171007T200000Z
 DTEND:20171007T233000Z
@@ -121,24 +118,22 @@ STATUS:CONFIRMED
 SUMMARY:Dinner
 TRANSP:TRANSPARENT
 END:VEVENT
-END:VCALENDAR"#,
+END:VCALENDAR",
         )]);
 
-        let cwd = dirs.test();
-        let actual = nu_with_plugins!(
-            cwd: cwd,
-            plugin: ("nu_plugin_formats"),
-            r#"
-                open calendar.txt
-                | from ics
-                | get events.0
-                | get properties.0
-                | where name == "LOCATION"
-                | first
-                | get value
-            "#
-        );
+        let code = r#"
+            open calendar.txt
+            | from ics
+            | get events.0
+            | get properties.0
+            | where name == "LOCATION"
+            | first
+            | get value
+        "#;
 
-        assert_eq!(actual.out, "The Restaurant near the Belltower");
+        test()
+            .cwd(dirs.test())
+            .run(code)
+            .expect_value_eq("The Restaurant near the Belltower")
     })
 }

@@ -26,8 +26,8 @@ impl Command for Match {
     }
 
     fn extra_description(&self) -> &str {
-        r#"This command is a parser keyword. For details, check:
-  https://www.nushell.sh/book/thinking_in_nu.html"#
+        "This command is a parser keyword. For details, check:
+  https://www.nushell.sh/book/thinking_in_nu.html"
     }
 
     fn command_type(&self) -> CommandType {
@@ -64,6 +64,11 @@ impl Command for Match {
             Example {
                 description: "Match on a value in range.",
                 example: "match 3 { 1..10 => 'yes!' }",
+                result: Some(Value::test_string("yes!")),
+            },
+            Example {
+                description: "Match on a constant expression.",
+                example: "match 42 { (40 + 2) => 'yes!' }",
                 result: Some(Value::test_string("yes!")),
             },
             Example {
@@ -104,9 +109,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Match {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Match)
     }
 }

@@ -2,7 +2,7 @@ use data_encoding::Encoding;
 
 use nu_engine::command_prelude::*;
 
-const EXTRA_USAGE: &str = r"The default alphabet is taken from RFC 4648, section 6.
+const EXTRA_USAGE: &str = "The default alphabet is taken from RFC 4648, section 6.
 
 Note this command will collect stream input.";
 
@@ -72,10 +72,11 @@ impl Command for DecodeBase32 {
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let encoding = if call.has_flag_const(working_set, "nopad")? {
+        let encoding = if call.has_flag_const(working_set, stack, "nopad")? {
             data_encoding::BASE32_NOPAD
         } else {
             data_encoding::BASE32
@@ -114,7 +115,7 @@ impl Command for EncodeBase32 {
         vec![
             Example {
                 description: "Encode a binary value",
-                example: r#"0x[01 02 10] | encode base32"#,
+                example: "0x[01 02 10] | encode base32",
                 result: Some(Value::test_string("AEBBA===")),
             },
             Example {
@@ -152,10 +153,11 @@ impl Command for EncodeBase32 {
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let encoding = if call.has_flag_const(working_set, "nopad")? {
+        let encoding = if call.has_flag_const(working_set, stack, "nopad")? {
             data_encoding::BASE32_NOPAD
         } else {
             data_encoding::BASE32
@@ -169,12 +171,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_examples_decode() {
-        crate::test_examples(DecodeBase32)
+    fn test_examples_decode() -> nu_test_support::Result {
+        nu_test_support::test().examples(DecodeBase32)
     }
 
     #[test]
-    fn test_examples_encode() {
-        crate::test_examples(EncodeBase32)
+    fn test_examples_encode() -> nu_test_support::Result {
+        nu_test_support::test().examples(EncodeBase32)
     }
 }

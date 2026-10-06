@@ -56,10 +56,11 @@ impl Command for StrEscapeRegex {
     fn run_const(
         &self,
         working_set: &nu_protocol::engine::StateWorkingSet,
+        stack: &mut nu_protocol::engine::Stack,
         call: &nu_protocol::engine::Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let column_paths: Vec<CellPath> = call.rest_const(working_set, 0)?;
+        let column_paths: Vec<CellPath> = call.rest_const(working_set, stack, 0)?;
         operate(working_set.permanent(), call, input, column_paths)
     }
 
@@ -137,9 +138,7 @@ fn action(input: &Value, head: Span) -> Value {
 mod test {
     use super::*;
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(StrEscapeRegex);
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(StrEscapeRegex)
     }
 }

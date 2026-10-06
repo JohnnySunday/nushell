@@ -1,6 +1,6 @@
-use crate::database::{MEMORY_DB, SQLiteDatabase};
+use crate::database::{MEMORY_DB, SQLiteDatabase, get_shared_mem_conn};
 use nu_engine::command_prelude::*;
-use nu_protocol::Signals;
+use nu_protocol::shell_error::generic::GenericError;
 
 #[derive(Clone)]
 pub struct StorExport;
@@ -58,25 +58,21 @@ impl Command for StorExport {
             }
         };
 
-        // Open the in-mem database
+        let conn = get_shared_mem_conn()?;
         let db = Box::new(SQLiteDatabase::new(
             std::path::Path::new(MEMORY_DB),
-            Signals::empty(),
+            engine_state.signals().clone(),
         ));
+        // This uses vacuum. I'm not really sure if this is the best way to do this.
+        // I also added backup in the sqlitedatabase impl. If we have problems, we could switch to that.
+        db.export_in_memory_database_to_file(&conn, file_name)
+            .map_err(|err| {
+                ShellError::Generic(GenericError::new_internal(
+                    "Failed to open SQLite connection to the in-memory database from export",
+                    err.to_string(),
+                ))
+            })?;
 
-        if let Ok(conn) = db.open_connection() {
-            // This uses vacuum. I'm not really sure if this is the best way to do this.
-            // I also added backup in the sqlitedatabase impl. If we have problems, we could switch to that.
-            db.export_in_memory_database_to_file(&conn, file_name)
-                .map_err(|err| ShellError::GenericError {
-                    error: "Failed to open SQLite connection in memory from export".into(),
-                    msg: err.to_string(),
-                    span: Some(Span::test_data()),
-                    help: None,
-                    inner: vec![],
-                })?;
-        }
-        // dbg!(db.clone());
         Ok(Value::custom(db, span).into_pipeline_data())
     }
 }
@@ -86,9 +82,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(StorExport {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(StorExport)
     }
 }

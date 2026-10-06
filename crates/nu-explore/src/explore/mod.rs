@@ -6,10 +6,10 @@
 mod command;
 mod commands;
 mod config;
-mod nu_common;
+pub(crate) mod nu_common;
 mod pager;
 mod registry;
-mod views;
+pub(crate) mod views;
 
 use anyhow::Result;
 pub use command::Explore;
@@ -93,7 +93,7 @@ fn help_view() -> Option<Page> {
 
 fn binary_view(input: PipelineData, config: &ExploreConfig) -> Result<Page> {
     let data = match input {
-        PipelineData::Value(Value::Binary { val, .. }, _) => val,
+        PipelineData::Value(Value::Binary { val, .. }, _) => val.into_owned(),
         PipelineData::ByteStream(bs, _) => bs.into_bytes()?,
         _ => unreachable!("checked beforehand"),
     };

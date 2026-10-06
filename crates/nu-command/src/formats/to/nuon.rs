@@ -13,7 +13,7 @@ impl Command for ToNuon {
             .input_output_types(vec![(Type::Any, Type::String)])
             .switch(
                 "raw",
-                "Remove all of the whitespace (overwrites -i and -t).",
+                "Remove all of the whitespace (overwrites -i, -t, and -p).",
                 Some('r'),
             )
             .named(
@@ -43,6 +43,16 @@ impl Command for ToNuon {
                 "Serialize table values as list-of-records instead of table syntax.",
                 Some('l'),
             )
+            .switch(
+                "no-commas",
+                "Do not use commas between items in tables and lists.",
+                Some('c'),
+            )
+            .switch(
+                "pretty",
+                "Format output with indentation and aligned table columns.",
+                Some('p'),
+            )
             .category(Category::Formats)
     }
 
@@ -55,27 +65,46 @@ impl Command for ToNuon {
         engine_state: &EngineState,
         stack: &mut Stack,
         call: &Call,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let metadata = input
-            .metadata()
-            .unwrap_or_default()
-            .with_content_type(Some("application/x-nuon".into()));
-
         let serialize_types = call.has_flag(engine_state, stack, "serialize")?;
         let raw_strings = call.has_flag(engine_state, stack, "raw-strings")?;
         let list_of_records = call.has_flag(engine_state, stack, "list-of-records")?;
-        let style = if call.has_flag(engine_state, stack, "raw")? {
+        let no_commas = call.has_flag(engine_state, stack, "no-commas")?;
+        let pretty = call.has_flag(engine_state, stack, "pretty")?;
+        // `--raw` drops the space after the comma and `--no-commas` drops the comma, so the
+        // two compose by subtraction into no separator at all: `[1 2 3]` is written `[123]`
+        // and reads back as one integer, and a table loses its column boundaries. The
+        // written form is still valid nuon, so nothing downstream can detect the loss.
+        // Rejecting the pair costs nothing, because emitting a space instead would produce
+        // output the same size as `--raw` alone.
+        let raw = call.has_flag(engine_state, stack, "raw")?;
+        if raw && no_commas {
+            return Err(ShellError::IncompatibleParameters {
+                left_message: "this with".into(),
+                left_span: call.get_flag_span(stack, "raw").unwrap_or(call.head),
+                right_message: "`--no-commas` drops the separator `--raw` keeps, so the pair writes no separator at all".into(),
+                right_span: call.get_flag_span(stack, "no-commas").unwrap_or(call.head),
+            });
+        }
+        let style = if raw {
             nuon::ToStyle::Raw
         } else if let Some(t) = call.get_flag(engine_state, stack, "tabs")? {
             nuon::ToStyle::Tabs(t)
         } else if let Some(i) = call.get_flag(engine_state, stack, "indent")? {
             nuon::ToStyle::Spaces(i)
+        } else if pretty {
+            nuon::ToStyle::Spaces(2)
         } else {
             nuon::ToStyle::Default
         };
 
         let span = call.head;
+        let metadata = input
+            .take_metadata()
+            .unwrap_or_default()
+            .with_content_type(Some("application/x-nuon".into()));
+
         let value = input.into_value(span)?;
 
         let config = nuon::ToNuonConfig::default()
@@ -83,7 +112,8 @@ impl Command for ToNuon {
             .span(Some(span))
             .serialize_types(serialize_types)
             .raw_strings(raw_strings)
-            .list_of_records(list_of_records);
+            .list_of_records(list_of_records)
+            .use_commas(!no_commas);
 
         match nuon::to_nuon(engine_state, &value, config) {
             Ok(serde_nuon_string) => Ok(Value::string(serde_nuon_string, span)
@@ -140,6 +170,23 @@ impl Command for ToNuon {
                 example: "[[a, b]; [1, 2], [3, 4]] | to nuon --list-of-records --indent 2",
                 result: Some(Value::test_string("[\n  {a: 1, b: 2},\n  {a: 3, b: 4}\n]")),
             },
+            Example {
+                description: "Output a list without commas between items.",
+                example: "[1 2 3] | to nuon --no-commas",
+                result: Some(Value::test_string("[1 2 3]")),
+            },
+            Example {
+                description: "Output a record without commas between fields.",
+                example: "{a: 1, b: 2} | to nuon --no-commas",
+                result: Some(Value::test_string("{a: 1 b: 2}")),
+            },
+            Example {
+                description: "Format output with pretty indentation and aligned table columns.",
+                example: "[[name, age]; [Alice, 30], [Bob, 25]] | to nuon --pretty",
+                result: Some(Value::test_string(
+                    "[\n  [name,  age];\n  [Alice, 30],\n  [Bob,   25]\n]",
+                )),
+            },
         ]
     }
 }
@@ -152,10 +199,9 @@ mod test {
     use crate::{Get, Metadata};
 
     #[test]
-    fn test_examples() {
+    fn test_examples() -> nu_test_support::Result {
         use super::ToNuon;
-        use crate::test_examples;
-        test_examples(ToNuon {})
+        nu_test_support::test().examples(ToNuon)
     }
 
     #[test]

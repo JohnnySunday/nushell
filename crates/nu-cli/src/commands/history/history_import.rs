@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use nu_engine::command_prelude::*;
 use nu_protocol::{
     HistoryFileFormat,
-    shell_error::{self, io::IoError},
+    shell_error::{self, generic::GenericError, io::IoError},
 };
 
 use reedline::{
@@ -25,12 +25,12 @@ impl Command for HistoryImport {
     }
 
     fn extra_description(&self) -> &str {
-        r#"Can import history from input, either successive command lines or more detailed records. If providing records, available fields are:
+        "Can import history from input, either successive command lines or more detailed records. If providing records, available fields are:
     command, start_timestamp, hostname, cwd, duration, exit_status.
 
 If no input is provided, will import all history items from existing history in the other format: if current history is stored in sqlite, it will store it in plain text and vice versa.
 
-Note that history item IDs are ignored when importing from file."#
+Note that history item IDs are ignored when importing from file."
     }
 
     fn signature(&self) -> nu_protocol::Signature {
@@ -77,7 +77,8 @@ Note that history item IDs are ignored when importing from file."#
         let Some(history) = engine_state.history_config() else {
             return ok;
         };
-        let Some(current_history_path) = history.file_path() else {
+        let Some(current_history_path) = history.file_path(&engine_state.config_dirs.config_home)
+        else {
             return Err(ShellError::ConfigDirNotFound { span });
         };
         if let Some(bak_path) = backup(&current_history_path, span)? {
@@ -89,9 +90,18 @@ Note that history item IDs are ignored when importing from file."#
                     HistoryFileFormat::Sqlite => HistoryFileFormat::Plaintext,
                     HistoryFileFormat::Plaintext => HistoryFileFormat::Sqlite,
                 };
-                let src = new_backend(other_format, None, call.head)?;
-                let mut dst =
-                    new_backend(history.file_format, Some(current_history_path), call.head)?;
+                let src = new_backend(
+                    other_format,
+                    None,
+                    &engine_state.config_dirs.config_home,
+                    call.head,
+                )?;
+                let mut dst = new_backend(
+                    history.file_format,
+                    Some(current_history_path),
+                    &engine_state.config_dirs.config_home,
+                    call.head,
+                )?;
                 let items = src
                     .search(SearchQuery::everything(
                         reedline::SearchDirection::Forward,
@@ -105,8 +115,13 @@ Note that history item IDs are ignored when importing from file."#
             _ => {
                 let input = input.into_iter().map(item_from_value);
                 import(
-                    new_backend(history.file_format, Some(current_history_path), call.head)?
-                        .as_mut(),
+                    new_backend(
+                        history.file_format,
+                        Some(current_history_path),
+                        &engine_state.config_dirs.config_home,
+                        call.head,
+                    )?
+                    .as_mut(),
                     input,
                 )
             }
@@ -119,16 +134,18 @@ Note that history item IDs are ignored when importing from file."#
 fn new_backend(
     format: HistoryFileFormat,
     path: Option<PathBuf>,
+    config_home: &std::path::Path,
     span: Span,
 ) -> Result<Box<dyn History>, ShellError> {
     let path = match path {
         Some(path) => path,
         None => {
-            let Some(mut path) = nu_path::nu_config_dir() else {
+            if config_home.as_os_str().is_empty() {
                 return Err(ShellError::ConfigDirNotFound { span });
-            };
+            }
+            let mut path = config_home.to_path_buf();
             path.push(format.default_file_name());
-            path.into_std_path_buf()
+            path
         }
     };
 
@@ -160,13 +177,7 @@ fn import(
 
 fn error_from_reedline(e: ReedlineError) -> ShellError {
     // TODO: Should we add a new ShellError variant?
-    ShellError::GenericError {
-        error: "Reedline error".to_owned(),
-        msg: format!("{e}"),
-        span: None,
-        help: None,
-        inner: Vec::new(),
-    }
+    ShellError::Generic(GenericError::new_internal("Reedline error", format!("{e}")))
 }
 
 fn item_from_value(v: Value) -> Result<HistoryItem, ShellError> {
@@ -245,13 +256,11 @@ fn duration_from_value(v: Value, span: Span) -> Result<std::time::Duration, Shel
 fn find_backup_path(path: &Path, span: Span) -> Result<PathBuf, ShellError> {
     let Ok(mut bak_path) = path.to_path_buf().into_os_string().into_string() else {
         // This isn't fundamentally problem, but trying to work with OsString is a nightmare.
-        return Err(ShellError::GenericError {
-            error: "History path not UTF-8".to_string(),
-            msg: "History path must be representable as UTF-8".to_string(),
-            span: Some(span),
-            help: None,
-            inner: vec![],
-        });
+        return Err(ShellError::Generic(GenericError::new(
+            "History path not UTF-8",
+            "History path must be representable as UTF-8",
+            span,
+        )));
     };
     bak_path.push_str(".bak");
     if !Path::new(&bak_path).exists() {
@@ -266,13 +275,11 @@ fn find_backup_path(path: &Path, span: Span) -> Result<PathBuf, ShellError> {
             return Ok(PathBuf::from(bak_path));
         }
     }
-    Err(ShellError::GenericError {
-        error: "Too many backup files".to_string(),
-        msg: "Found too many existing backup files".to_string(),
-        span: Some(span),
-        help: None,
-        inner: vec![],
-    })
+    Err(ShellError::Generic(GenericError::new(
+        "Too many backup files",
+        "Found too many existing backup files",
+        span,
+    )))
 }
 
 fn backup(path: &Path, span: Span) -> Result<Option<PathBuf>, ShellError> {
@@ -308,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_item_from_value_string() -> Result<(), ShellError> {
-        let item = item_from_value(Value::string("foo", Span::unknown()))?;
+        let item = item_from_value(Value::string("foo", Span::test_data()))?;
         assert_eq!(
             item,
             HistoryItem {
@@ -328,7 +335,7 @@ mod tests {
 
     #[test]
     fn test_item_from_value_record() {
-        let span = Span::unknown();
+        let span = Span::test_data();
         let rec = new_record(&[
             ("command", Value::string("foo", span)),
             (
@@ -367,7 +374,7 @@ mod tests {
 
     #[test]
     fn test_item_from_value_record_extra_field() {
-        let span = Span::unknown();
+        let span = Span::test_data();
         let rec = new_record(&[
             ("command_line", Value::string("foo", span)),
             ("id_nonexistent", Value::int(1, span)),
@@ -377,7 +384,7 @@ mod tests {
 
     #[test]
     fn test_item_from_value_record_bad_type() {
-        let span = Span::unknown();
+        let span = Span::test_data();
         let rec = new_record(&[
             ("command_line", Value::string("foo", span)),
             ("id", Value::string("one".to_string(), span)),
@@ -386,7 +393,7 @@ mod tests {
     }
 
     fn new_record(rec: &[(&'static str, Value)]) -> Value {
-        let span = Span::unknown();
+        let span = Span::test_data();
         let rec = Record::from_raw_cols_vals(
             rec.iter().map(|(col, _)| col.to_string()).collect(),
             rec.iter().map(|(_, val)| val.clone()).collect(),

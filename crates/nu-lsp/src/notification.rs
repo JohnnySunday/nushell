@@ -133,8 +133,7 @@ impl LanguageServer {
             .sender
             .send(lsp_server::Message::Response(lsp_server::Response {
                 id,
-                result: None,
-                error: Some(lsp_server::ResponseError {
+                response_result: Err(lsp_server::ResponseError {
                     code,
                     message,
                     data: None,
@@ -153,15 +152,15 @@ mod tests {
     };
     use assert_json_diff::assert_json_eq;
     use lsp_types::Range;
-    use nu_test_support::fs::fixtures;
+    use nu_test_support::prelude::*;
     use rstest::rstest;
 
     #[rstest]
     #[case::full(
-        r#"# Renders some updated greeting message
+        "# Renders some updated greeting message
 def hello [] {}
 
-hello"#,
+hello",
         None
     )]
     #[case::partial(
@@ -180,7 +179,7 @@ hello"#,
     fn hover_on_command_after_content_change(#[case] text: String, #[case] range: Option<Range>) {
         let (client_connection, _recv) = initialize_language_server(None, None);
 
-        let mut script = fixtures();
+        let mut script = FIXTURES.clone();
         script.push("lsp/hover/command.nu");
         let script = path_to_uri(&script);
 
@@ -193,7 +192,7 @@ hello"#,
             serde_json::json!({
                 "contents": {
                     "kind": "markdown",
-                    "value": "Renders some updated greeting message\n---\n### Usage \n```nu\n  hello {flags}\n```\n\n### Flags\n\n  `-h`, `--help` - Display the help message for this command\n\n"
+                    "value": "Renders some updated greeting message\n\n---\n### Usage \n```nu\n  hello {flags}\n```\n\n### Flags\n\n  `-h`, `--help` - Display the help message for this command\n\n"
                 }
             })
         );
@@ -203,7 +202,7 @@ hello"#,
     fn open_document_with_utf_char() {
         let (client_connection, _recv) = initialize_language_server(None, None);
 
-        let mut script = fixtures();
+        let mut script = FIXTURES.clone();
         script.push("lsp/notifications/issue_11522.nu");
         let script = path_to_uri(&script);
 

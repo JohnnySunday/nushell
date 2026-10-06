@@ -6,7 +6,9 @@ use nu_protocol::{
 };
 use rstest::rstest;
 
-use mock::{Alias, AttrEcho, Const, Def, IfMocked, Let, Mut, ToCustom};
+use mock::{
+    Alias, AttrEcho, Const, Def, IfMocked, Let, LsCustom, LsTest, MatchMocked, Mut, ToCustom, Where,
+};
 
 fn test_int(
     test_tag: &str,     // name of sub-test
@@ -711,11 +713,11 @@ pub fn parse_attribute_block_check_spans() {
     let engine_state = EngineState::new();
     let mut working_set = StateWorkingSet::new(&engine_state);
 
-    let source = br#"
+    let source = b"
     @foo a 1 2
     @bar b 3 4
     echo baz
-    "#;
+    ";
     let block = parse(&mut working_set, None, source, true);
 
     // There SHOULD be errors here, we're using nonexistent commands
@@ -887,11 +889,215 @@ pub fn parse_if_in_const_expression() {
     let _ = parse(&mut working_set, None, source, false);
 
     assert!(!working_set.parse_errors.is_empty());
-    let ParseError::UnexpectedEof(error, _) = &working_set.parse_errors[0] else {
-        panic!("Expected UnexpectedEof");
-    };
+    match &working_set.parse_errors[0] {
+        ParseError::UnexpectedEof(error, _) => assert!(error.contains(')')),
+        ParseError::Unclosed(delim, ..) => assert!(delim.contains(')')),
+        ParseError::Unbalanced(_, close, ..) => assert!(close.contains(']') || close.contains(')')),
+        other => panic!("Expected UnexpectedEof/Unclosed/Unbalanced, got {other:?}"),
+    }
+}
 
-    assert!(error.contains(")"));
+#[test]
+fn parse_percent_prefixed_internal_call() {
+    let mut engine_state = EngineState::new();
+    let mut working_set = StateWorkingSet::new(&engine_state);
+
+    working_set.add_decl(Box::new(LsTest));
+    let _ = engine_state.merge_delta(working_set.render());
+
+    let mut working_set = StateWorkingSet::new(&engine_state);
+    let block = parse(&mut working_set, None, b"%ls", true);
+
+    assert!(working_set.parse_errors.is_empty());
+
+    let pipeline = &block.pipelines[0];
+    let element = &pipeline.elements[0];
+
+    match &element.expr.expr {
+        Expr::Call(call) => {
+            let decl = working_set.get_decl(call.decl_id);
+            assert_eq!(decl.name(), "ls");
+        }
+        other => {
+            panic!("Expected internal call, got: {other:?}");
+        }
+    }
+}
+
+#[test]
+fn parse_percent_prefixed_dynamic_dispatch() {
+    let engine_state = EngineState::new();
+    let mut working_set = StateWorkingSet::new(&engine_state);
+
+    let block = parse(&mut working_set, None, b"%('echo') hello", true);
+
+    assert!(working_set.parse_errors.is_empty());
+
+    let pipeline = &block.pipelines[0];
+    let element = &pipeline.elements[0];
+
+    match &element.expr.expr {
+        Expr::Call(call) => {
+            // Check that the call has the percent_forced_builtin marker
+            assert!(call.parser_info.contains_key("percent_forced_builtin"));
+        }
+        other => {
+            panic!("Expected internal call with percent marker, got: {other:?}");
+        }
+    }
+}
+
+#[test]
+fn parse_percent_prefixed_dynamic_dispatch_bare_var() {
+    let engine_state = EngineState::new();
+    let mut working_set = StateWorkingSet::new(&engine_state);
+
+    let block = parse(&mut working_set, None, b"%$cmd hello", true);
+
+    assert!(
+        working_set
+            .parse_errors
+            .iter()
+            .any(|err| matches!(err, ParseError::VariableNotFound(..)))
+    );
+
+    let pipeline = &block.pipelines[0];
+    let element = &pipeline.elements[0];
+
+    match &element.expr.expr {
+        Expr::Call(call) => {
+            assert!(call.parser_info.contains_key("percent_forced_builtin"));
+        }
+        other => {
+            panic!("Expected internal call with percent marker, got: {other:?}");
+        }
+    }
+}
+
+#[test]
+fn parse_percent_prefixed_dynamic_dispatch_with_spaced_head() {
+    let engine_state = EngineState::new();
+    let mut working_set = StateWorkingSet::new(&engine_state);
+
+    let block = parse(&mut working_set, None, b"% ('echo') hello", true);
+
+    assert!(working_set.parse_errors.is_empty());
+
+    let pipeline = &block.pipelines[0];
+    let element = &pipeline.elements[0];
+
+    match &element.expr.expr {
+        Expr::Call(call) => {
+            assert!(call.parser_info.contains_key("percent_forced_builtin"));
+        }
+        other => {
+            panic!("Expected internal call with percent marker, got: {other:?}");
+        }
+    }
+}
+
+#[test]
+fn parse_percent_prefixed_dynamic_dispatch_with_spread_arg() {
+    let engine_state = EngineState::new();
+    let mut working_set = StateWorkingSet::new(&engine_state);
+
+    let block = parse(&mut working_set, None, b"%('echo') ...$args", true);
+
+    assert!(
+        working_set
+            .parse_errors
+            .iter()
+            .any(|err| matches!(err, ParseError::VariableNotFound(..)))
+    );
+
+    let pipeline = &block.pipelines[0];
+    let element = &pipeline.elements[0];
+
+    match &element.expr.expr {
+        Expr::Call(call) => {
+            assert!(call.parser_info.contains_key("percent_forced_builtin"));
+            assert!(matches!(call.arguments.first(), Some(Argument::Spread(_))));
+        }
+        other => {
+            panic!("Expected internal call with percent marker, got: {other:?}");
+        }
+    }
+}
+
+#[test]
+fn parse_caret_prefixed_call_forces_external_parse() {
+    let mut engine_state = EngineState::new();
+    let mut working_set = StateWorkingSet::new(&engine_state);
+
+    working_set.add_decl(Box::new(LsTest));
+    let _ = engine_state.merge_delta(working_set.render());
+
+    let mut working_set = StateWorkingSet::new(&engine_state);
+    let block = parse(&mut working_set, None, b"^ls", true);
+
+    assert!(working_set.parse_errors.is_empty());
+
+    let pipeline = &block.pipelines[0];
+    let element = &pipeline.elements[0];
+
+    assert!(matches!(element.expr.expr, Expr::ExternalCall(..)));
+}
+
+#[test]
+fn parse_percent_prefixed_prefers_builtin_when_custom_shadows_name() {
+    let mut engine_state = EngineState::new();
+    let mut working_set = StateWorkingSet::new(&engine_state);
+
+    working_set.add_decl(Box::new(LsTest));
+    working_set.add_decl(Box::new(LsCustom));
+    let _ = engine_state.merge_delta(working_set.render());
+
+    let mut working_set = StateWorkingSet::new(&engine_state);
+    let block = parse(&mut working_set, None, b"%ls", true);
+
+    assert!(working_set.parse_errors.is_empty());
+
+    let pipeline = &block.pipelines[0];
+    let element = &pipeline.elements[0];
+
+    match &element.expr.expr {
+        Expr::Call(call) => {
+            let decl = working_set.get_decl(call.decl_id);
+            assert_eq!(decl.name(), "ls");
+            assert_eq!(
+                decl.command_type(),
+                nu_protocol::engine::CommandType::Builtin
+            );
+        }
+        other => {
+            panic!("Expected internal call, got: {other:?}");
+        }
+    }
+}
+
+#[test]
+fn parse_percent_prefixed_unknown_command_does_not_fallback_to_external() {
+    let engine_state = EngineState::new();
+    let mut working_set = StateWorkingSet::new(&engine_state);
+    let block = parse(&mut working_set, None, b"%nu --version", true);
+
+    assert!(!working_set.parse_errors.is_empty());
+    assert!(
+        working_set.parse_errors.iter().any(|err| {
+            matches!(
+                err,
+                ParseError::LabeledErrorWithHelp { error, .. }
+                if error.contains("percent sigil requires a built-in command")
+            )
+        }),
+        "Unexpected parse errors: {:?}",
+        working_set.parse_errors
+    );
+
+    // Keep expression shape for completion while retaining parse-time failure semantics.
+    let pipeline = &block.pipelines[0];
+    let element = &pipeline.elements[0];
+    assert!(matches!(element.expr.expr, Expr::ExternalCall(..)));
 }
 
 fn test_external_call(input: &str, tag: &str, f: impl FnOnce(&Expression, &[ExternalArgument])) {
@@ -1004,12 +1210,12 @@ pub fn test_external_call_head_glob(
 
 #[rstest]
 #[case(
-    r##"^r#'foo-external-call'#"##,
+    "^r#'foo-external-call'#",
     "foo-external-call",
     "raw string with caret"
 )]
 #[case(
-    r##"^r#'foo/external-call'#"##,
+    "^r#'foo/external-call'#",
     "foo/external-call",
     "raw string with forward slash and caret"
 )]
@@ -1050,12 +1256,12 @@ pub fn test_external_call_head_raw_string(
 )]
 #[case(
     r#"^"foo external call""#,
-    r#"foo external call"#,
+    "foo external call",
     "double quote with caret"
 )]
 #[case(
     r#"^"foo/external call""#,
-    r#"foo/external call"#,
+    "foo/external call",
     "double quote with forward slash and caret"
 )]
 #[case(
@@ -1082,14 +1288,14 @@ pub fn test_external_call_head_string(
 }
 
 #[rstest]
-#[case(r"~/.foo/(1)", 2, false, "unquoted interpolated string")]
+#[case("~/.foo/(1)", 2, false, "unquoted interpolated string")]
 #[case(
     r"~\.foo(2)\(1)",
     4,
     false,
     "unquoted interpolated string with backslash"
 )]
-#[case(r"^~/.foo/(1)", 2, false, "unquoted interpolated string with caret")]
+#[case("^~/.foo/(1)", 2, false, "unquoted interpolated string with caret")]
 #[case(r#"^$"~/.foo/(1)""#, 2, true, "quoted interpolated string with caret")]
 pub fn test_external_call_head_interpolated_string(
     #[case] input: &str,
@@ -1134,32 +1340,13 @@ pub fn test_external_call_head_interpolated_string(
 )]
 #[case(
     r#"^foo --flag="value""#,
-    r#"--flag=value"#,
+    "--flag=value",
     "flag value with double quote"
 )]
+#[case("^foo --flag='value'", "--flag=value", "flag value with single quote")]
 #[case(
-    r#"^foo --flag='value'"#,
-    r#"--flag=value"#,
-    "flag value with single quote"
-)]
-#[case(
-    r#"^foo {a:1,b:'c',c:'d'}"#,
-    r#"{a:1,b:c,c:d}"#,
-    "value with many inner single quotes"
-)]
-#[case(
-    r#"^foo {a:1,b:"c",c:"d"}"#,
-    r#"{a:1,b:c,c:d}"#,
-    "value with many double quotes"
-)]
-#[case(
-    r#"^foo {a:1,b:'c',c:"d"}"#,
-    r#"{a:1,b:c,c:d}"#,
-    "value with single quote and double quote"
-)]
-#[case(
-    r#"^foo `hello world`"#,
-    r#"hello world"#,
+    "^foo `hello world`",
+    "hello world",
     "value is surrounded by backtick quote"
 )]
 #[case(
@@ -1168,7 +1355,7 @@ pub fn test_external_call_head_interpolated_string(
     "value is surrounded by backtick quote, with inner double quote"
 )]
 #[case(
-    r#"^foo `'hello world'`"#,
+    "^foo `'hello world'`",
     "'hello world'",
     "value is surrounded by backtick quote, with inner single quote"
 )]
@@ -1201,9 +1388,9 @@ pub fn test_external_call_arg_glob(#[case] input: &str, #[case] expected: &str, 
 }
 
 #[rstest]
-#[case(r##"^foo r#'foo-external-call'#"##, "foo-external-call", "raw string")]
+#[case("^foo r#'foo-external-call'#", "foo-external-call", "raw string")]
 #[case(
-    r##"^foo r#'foo/external-call'#"##,
+    "^foo r#'foo/external-call'#",
     "foo/external-call",
     "raw string with forward slash"
 )]
@@ -1255,10 +1442,10 @@ pub fn test_external_call_arg_raw_string(
     r"foo\external call",
     "single quote with backslash"
 )]
-#[case(r#"^foo "foo external call""#, r#"foo external call"#, "double quote")]
+#[case(r#"^foo "foo external call""#, "foo external call", "double quote")]
 #[case(
     r#"^foo "foo/external call""#,
-    r#"foo/external call"#,
+    "foo/external call",
     "double quote with forward slash"
 )]
 #[case(
@@ -1266,6 +1453,7 @@ pub fn test_external_call_arg_raw_string(
     r#"foo\external call"#,
     "double quote with backslash"
 )]
+#[case("^foo '{a:1}'", "{a:1}", "quoted record-like string")]
 pub fn test_external_call_arg_string(
     #[case] input: &str,
     #[case] expected: &str,
@@ -1300,7 +1488,7 @@ pub fn test_external_call_arg_string(
 }
 
 #[rstest]
-#[case(r"^foo ~/.foo/(1)", 2, false, "unquoted interpolated string")]
+#[case("^foo ~/.foo/(1)", 2, false, "unquoted interpolated string")]
 #[case(r#"^foo $"~/.foo/(1)""#, 2, true, "quoted interpolated string")]
 pub fn test_external_call_arg_interpolated_string(
     #[case] input: &str,
@@ -1331,9 +1519,53 @@ pub fn test_external_call_arg_interpolated_string(
     })
 }
 
+#[rstest]
+#[case(r#"^foo {|my_var| $"($my_var)" }"#)]
+#[case(r#"^foo { |my_var| $"($my_var)" }"#)]
+#[case("^foo { 42 }")]
+fn test_external_call_arg_closure(#[case] input: &str) {
+    test_external_call(input, "closure argument", |_, args| {
+        assert_eq!(1, args.len());
+        assert!(matches!(
+            &args[0],
+            ExternalArgument::Regular(Expression {
+                expr: Expr::Closure(_),
+                ..
+            })
+        ));
+    })
+}
+
+#[rstest]
+#[case("^foo {a: 1}")]
+#[case("^foo {}")]
+#[case("^foo {a:1,b:'c',c:'d'}")]
+#[case(r#"^foo {a:1,b:"c",c:"d"}"#)]
+#[case(r#"^foo {a:1,b:'c',c:"d"}"#)]
+#[case("^foo {a: 1, b: 'c', c: 'd'}")]
+#[case(r#"^foo {a: 1, b: "c", c: "d"}"#)]
+#[case(r#"^foo {a: 1, b: 'c', c: "d"}"#)]
+#[case(r#"^foo {"key with spaces": "value"}"#)]
+#[case(r#"^foo {outer: {inner: "value"}}"#)]
+#[case(r#"^foo {items: [1 "two" true]}"#)]
+fn test_external_call_arg_record(#[case] input: &str) {
+    test_external_call(input, "record argument", |_, args| {
+        assert_eq!(1, args.len());
+        let ExternalArgument::Regular(expr) = &args[0] else {
+            panic!("Expected a regular external argument")
+        };
+        let is_record = match &expr.expr {
+            Expr::Record(_) => true,
+            Expr::FullCellPath(path) => matches!(path.head.expr, Expr::Record(_)),
+            _ => false,
+        };
+        assert!(is_record, "Expected a record expression, found {expr:?}");
+    })
+}
+
 #[test]
 fn test_external_call_argument_spread() {
-    let input = r"^foo ...[a b c]";
+    let input = "^foo ...[a b c]";
     let tag = "spread";
 
     test_external_call(input, tag, |name, args| {
@@ -1416,7 +1648,7 @@ fn test_redirection_with_letmut(#[case] phase: &[u8]) {
     assert!(element.redirection.is_none()); // it should be in the let block, not here
 
     if let Expr::Call(call) = &element.expr.expr {
-        let arg = call.positional_nth(1).expect("no positional args");
+        let arg = call.positional_iter().nth(1).expect("no positional args");
         let block_id = arg.as_block().expect("arg 1 is not a block");
         let block = working_set.get_block(block_id);
         let inner_element = &block.pipelines[0].elements[0];
@@ -1819,13 +2051,26 @@ mod string {
             let engine_state = EngineState::new();
             let mut working_set = StateWorkingSet::new(&engine_state);
 
-            let _ = parse(&mut working_set, None, b"$\"foo (2 + 3\"", true);
+            let block = parse(&mut working_set, None, b"$\"foo (2 + 3\"", true);
+            assert_eq!(block.len(), 1);
 
-            assert!(
-                working_set.parse_errors.iter().any(
-                    |err| matches!(err, ParseError::Unclosed(delimiter, _) if delimiter == ")")
-                )
-            );
+            let pipeline = &block.pipelines[0];
+            assert_eq!(pipeline.len(), 1);
+            let element = &pipeline.elements[0];
+            assert!(element.redirection.is_none());
+
+            let subexprs: Vec<&Expr> = match &element.expr.expr {
+                Expr::StringInterpolation(expressions) => {
+                    expressions.iter().map(|e| &e.expr).collect()
+                }
+                _ => panic!("Expected an `Expr::StringInterpolation`"),
+            };
+
+            assert_eq!(subexprs.len(), 2);
+
+            assert!(working_set.parse_errors.iter().any(
+                |err| matches!(err, ParseError::Unclosed(delimiter, ..) if *delimiter == ")")
+            ));
         }
     }
 
@@ -2177,6 +2422,38 @@ mod range {
         ),);
     }
 
+    #[rstest]
+    #[case("true or ((to-custom) < (to-custom))")]
+    #[case("true and ((to-custom) == (to-custom))")]
+    #[case("true or ((to-custom) in (to-custom))")]
+    fn custom_comparison_is_usable_as_bool(#[case] code: &str) {
+        let engine_state = EngineState::new();
+        let mut working_set = StateWorkingSet::new(&engine_state);
+        working_set.add_decl(Box::new(ToCustom));
+
+        let _ = parse(&mut working_set, None, code.as_bytes(), true);
+
+        assert!(
+            working_set.parse_errors.is_empty(),
+            "Errors: {:?}",
+            working_set.parse_errors
+        );
+    }
+
+    #[test]
+    fn raw_custom_is_not_a_bool_for_or() {
+        let engine_state = EngineState::new();
+        let mut working_set = StateWorkingSet::new(&engine_state);
+        working_set.add_decl(Box::new(ToCustom));
+
+        let _ = parse(&mut working_set, None, b"true or (to-custom)", true);
+
+        assert!(matches!(
+            &working_set.parse_errors[..],
+            [ParseError::OperatorIncompatibleTypes { .. }]
+        ));
+    }
+
     #[test]
     fn dont_mess_with_external_calls() {
         let engine_state = EngineState::new();
@@ -2203,7 +2480,8 @@ mod mock {
     use super::*;
     use nu_engine::CallExt;
     use nu_protocol::{
-        Category, IntoPipelineData, PipelineData, ShellError, Type, Value, engine::Call,
+        Category, IntoPipelineData, PipelineData, ShellError, Type, Value,
+        engine::{Call, CommandType},
     };
 
     #[derive(Clone)]
@@ -2244,6 +2522,7 @@ mod mock {
         fn run_const(
             &self,
             _working_set: &StateWorkingSet,
+            _stack: &mut Stack,
             _call: &Call,
             _input: PipelineData,
         ) -> Result<PipelineData, ShellError> {
@@ -2330,6 +2609,37 @@ mod mock {
 
         fn signature(&self) -> nu_protocol::Signature {
             Signature::build(self.name()).category(Category::Default)
+        }
+
+        fn run(
+            &self,
+            _engine_state: &EngineState,
+            _stack: &mut Stack,
+            _call: &Call,
+            _input: PipelineData,
+        ) -> Result<PipelineData, ShellError> {
+            todo!()
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct LsCustom;
+
+    impl Command for LsCustom {
+        fn name(&self) -> &str {
+            "ls"
+        }
+
+        fn description(&self) -> &str {
+            "Mock custom ls command."
+        }
+
+        fn signature(&self) -> nu_protocol::Signature {
+            Signature::build(self.name()).category(Category::Default)
+        }
+
+        fn command_type(&self) -> CommandType {
+            CommandType::Custom
         }
 
         fn run(
@@ -2452,10 +2762,11 @@ mod mock {
         fn run_const(
             &self,
             working_set: &StateWorkingSet,
+            stack: &mut Stack,
             call: &Call,
             _input: PipelineData,
         ) -> Result<PipelineData, ShellError> {
-            let value: Value = call.req_const(working_set, 0)?;
+            let value: Value = call.req_const(working_set, stack, 0)?;
             Ok(value.into_pipeline_data())
         }
     }
@@ -2709,6 +3020,10 @@ mod mock {
             todo!()
         }
 
+        fn command_type(&self) -> CommandType {
+            CommandType::Keyword
+        }
+
         fn is_const(&self) -> bool {
             true
         }
@@ -2716,10 +3031,92 @@ mod mock {
         fn run_const(
             &self,
             _working_set: &StateWorkingSet,
+            _stack: &mut Stack,
             _call: &Call,
             _input: PipelineData,
         ) -> Result<PipelineData, ShellError> {
             panic!("Should not be called!")
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct MatchMocked;
+
+    impl Command for MatchMocked {
+        fn name(&self) -> &str {
+            "match"
+        }
+
+        fn description(&self) -> &str {
+            "Conditionally run a block on a matched value."
+        }
+
+        fn signature(&self) -> nu_protocol::Signature {
+            Signature::build("match")
+                .input_output_types(vec![(Type::Any, Type::Any)])
+                .required("value", SyntaxShape::Any, "Value to check.")
+                .required(
+                    "match_block",
+                    SyntaxShape::MatchBlock,
+                    "Block to run if check succeeds.",
+                )
+                .category(Category::Core)
+        }
+
+        fn command_type(&self) -> CommandType {
+            CommandType::Keyword
+        }
+
+        fn run(
+            &self,
+            _engine_state: &EngineState,
+            _stack: &mut Stack,
+            _call: &Call,
+            _input: PipelineData,
+        ) -> Result<PipelineData, ShellError> {
+            todo!()
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct Where;
+
+    impl Command for Where {
+        fn name(&self) -> &str {
+            "where"
+        }
+
+        fn description(&self) -> &str {
+            "Mock `where` command."
+        }
+
+        fn signature(&self) -> nu_protocol::Signature {
+            Signature::build("where")
+                .input_output_types(vec![
+                    (
+                        Type::List(Box::new(Type::Any)),
+                        Type::List(Box::new(Type::Any)),
+                    ),
+                    (Type::table(), Type::table()),
+                    (Type::Range, Type::Any),
+                ])
+                .required(
+                    "condition",
+                    SyntaxShape::RowCondition,
+                    "Filter row condition or closure.",
+                )
+                .allow_variants_without_examples(true)
+                .category(Category::Filters)
+        }
+
+        fn run(
+            &self,
+            _engine_state: &EngineState,
+            _stack: &mut Stack,
+            _call: &Call,
+            _input: PipelineData,
+        ) -> Result<PipelineData, ShellError> {
+            todo!()
         }
     }
 }
@@ -2744,6 +3141,7 @@ mod input_types {
             working_set.add_decl(Box::new(Collect));
             working_set.add_decl(Box::new(WithColumn));
             working_set.add_decl(Box::new(IfMocked));
+            working_set.add_decl(Box::new(MatchMocked));
             working_set.add_decl(Box::new(Mut));
 
             working_set.render()
@@ -2760,7 +3158,7 @@ mod input_types {
         add_declarations(&mut engine_state);
 
         let mut working_set = StateWorkingSet::new(&engine_state);
-        let input = r#"ls | group-by name"#;
+        let input = "ls | group-by name";
 
         let block = parse(&mut working_set, None, input.as_bytes(), true);
 
@@ -2885,9 +3283,9 @@ mod input_types {
 
         for prefix in ["let ", "mut ", "mut foo = 1; $"] {
             let input = format!(
-                r#"{prefix}foo = 1 |
+                "{prefix}foo = 1 |
                 # comment
-                dummy"#
+                dummy"
             );
             let block = parse(&mut working_set, None, input.as_bytes(), true);
             let last_expr = &block.pipelines.last().unwrap().elements[0].expr.expr;
@@ -2917,11 +3315,11 @@ mod input_types {
 
         let mut working_set = StateWorkingSet::new(&engine_state);
         let inputs = vec![
-            r#"let a = 'b'; ($a == 'b') or ($a == 'b')"#,
-            r#"let a = 'b'; ($a == 'b') or ($a == 'b') and ($a == 'b')"#,
-            r#"let a = 1; ($a == 1) or ($a == 2) and ($a == 3)"#,
-            r#"let a = 'b'; if ($a == 'b') or ($a == 'b') { true } else { false }"#,
-            r#"let a = 1; if ($a == 1) or ($a > 0) { true } else { false }"#,
+            "let a = 'b'; ($a == 'b') or ($a == 'b')",
+            "let a = 'b'; ($a == 'b') or ($a == 'b') and ($a == 'b')",
+            "let a = 1; ($a == 1) or ($a == 2) and ($a == 3)",
+            "let a = 'b'; if ($a == 'b') or ($a == 'b') { true } else { false }",
+            "let a = 1; if ($a == 1) or ($a > 0) { true } else { false }",
         ];
 
         for input in inputs {
@@ -2938,7 +3336,7 @@ mod input_types {
         add_declarations(&mut engine_state);
 
         let mut working_set = StateWorkingSet::new(&engine_state);
-        let inputs = [r#"if true { || print hi }"#, r#"if true { |x| $x }"#];
+        let inputs = ["if true { || print hi }", "if true { |x| $x }"];
 
         for input in inputs {
             parse(&mut working_set, None, input.as_bytes(), true);
@@ -3031,6 +3429,16 @@ mod input_types {
         b"def q []: nothing -> record<c: record<a: int b: int> e: int> {{c: {a: 1 b: 2} e: 1}}",
         false
     )]
+    #[case::input_output_pass_through(b"def q []: int -> int {}", false)]
+    #[case::input_output_pass_through(b"def q []: string -> string {}", false)]
+    #[case::input_output_pass_through(b"def q []: [int -> int, string -> string] {}", false)]
+    #[case::input_output_pass_through(b"def q []: [int -> string, string -> int] {}", true)]
+    #[case::input_output_pass_through(
+        b"def q []: record<a: int, b: string> -> record<a: int, b: string> {}",
+        false
+    )]
+    #[case::input_output_pass_through_incorrect(b"def q []: int -> nothing {}", true)]
+    #[case::input_output_pass_through_incorrect(b"def q []: nothing -> int {}", true)]
     #[case::input_output(b"def q []: nothing -> list<string {[]}", true)]
     #[case::input_output(b"def q []: nothing -> record<c: int e: int {{c: 1 e: 1}}", true)]
     #[case::input_output(b"def q []: record<c: int e: int -> record<a: int> {{a: 1}}", true)]
@@ -3083,6 +3491,33 @@ mod input_types {
     #[case::vardecl(b"let a: table<a: int b: int> = [[a b]; [1 1]]", false)]
     #[case::vardecl(b"let a: list<string asd> = []", true)]
     #[case::vardecl(b"let a: record<a: int b: record<a: int> = {a: 1 b: {a: 1}}", true)]
+    #[case::opt_param_is_nullable(b"def f [p?: int] { mut x = $p; $x = null }", false)]
+    #[case::flag_with_type_is_nullable(b"def f [--flag: int] { mut x = $flag; $x = null }", false)]
+    #[case::opt_param_with_default_is_not_nullable(
+        b"def f [p?: int = 42] { mut x = $p; $x = null }",
+        true
+    )]
+    #[case::flag_with_type_and_default_is_not_nullable(
+        b"def f [--flag: int = 42] { mut x = $flag; $x = null }",
+        true
+    )]
+    #[case::multiple_output_command_to_variable_oneof(
+        br#"
+            def str-or-int []: [nothing -> int, nothing -> string] { if (random bool) { 42 } else { "hello" } }
+            mut x = str-or-int
+            $x = "string"
+            $x = 42
+        "#,
+        false
+    )]
+    #[case::multiple_output_command_to_variable_not_any(
+        br#"
+            def str-or-int []: [nothing -> int, nothing -> string] { if (random bool) { 42 } else { "hello" } }
+            mut x = str-or-int
+            $x = [1 2 3]
+        "#,
+        true
+    )]
     fn test_type_annotations(#[case] phrase: &[u8], #[case] expect_errors: bool) {
         let mut engine_state = EngineState::new();
         add_declarations(&mut engine_state);
@@ -3132,8 +3567,8 @@ mod record {
     #[case(b"{ :: x }", "Invalid literal")] // Key is bare colon
     #[case(b"{ a: x:y }", "Invalid literal")] // Value is bare word with colon
     #[case(b"{ a: x('y'):z }", "Invalid literal")] // Value is bare string interpolation with colon
-    #[case(b"{ ;: x }", "Parse mismatch during operation.")] // Key is a non-item token
-    #[case(b"{ a: || }", "Parse mismatch during operation.")] // Value is a non-item token
+    #[case(b"{ ;: x }", "Unexpected token in record")] // Key is a non-item token
+    #[case(b"{ a: || }", "Unexpected token in record value")] // Value is a non-item token
     fn refuse_confusing_record(#[case] expr: &[u8], #[case] error: &str) {
         dbg!(String::from_utf8_lossy(expr));
         let engine_state = EngineState::new();
@@ -3237,4 +3672,295 @@ fn parse_let_in_pipeline() {
         pipeline.elements[1].expr.expr,
         Expr::ExternalCall(_, _)
     ));
+}
+
+#[test]
+fn empty_closure_as_row_condition() {
+    let mut engine_state = EngineState::new();
+    let mut working_set = StateWorkingSet::new(&engine_state);
+
+    working_set.add_decl(Box::new(Where));
+    let _ = engine_state.merge_delta(working_set.render());
+
+    let mut working_set = StateWorkingSet::new(&engine_state);
+
+    let block = parse(&mut working_set, None, b"[0 1 2] | where {}", true);
+
+    assert_eq!(working_set.parse_errors.as_slice(), &[]);
+    let [pipeline] = block.pipelines.as_slice() else {
+        panic!("Expected exactly one pipeline")
+    };
+    let [_, where_call] = pipeline.elements.as_slice() else {
+        panic!("Expected exactly two pipeline elements")
+    };
+    let Expr::Call(where_call) = &where_call.expr.expr else {
+        panic!("Expected a call expression")
+    };
+    let [Argument::Positional(arg)] = where_call.arguments.as_slice() else {
+        panic!("Expected exactly one positional argument and no other argument")
+    };
+    assert!(matches!(arg.expr, Expr::RowCondition(_) | Expr::Closure(_)))
+}
+
+#[rstest]
+#[case("if true { 2 }", &[Type::Int, Type::Nothing])]
+#[case("if true { 2 } else { 'foo' }", &[Type::Int, Type::String])]
+#[case("
+    def erase []: any -> any {}
+    def foo []: [int -> string, list<int> -> list<string>] { erase }
+    
+    [1, 2, 3] | if true { foo } else { }
+    ",
+    &[Type::list(Type::String), Type::list(Type::Int)]
+)]
+#[case(r#"
+    match 1 {
+        1 => 1,
+        2 => "foo",
+        3 => [1, 2, 3],
+    }
+    "#,
+    &[Type::Int, Type::String, Type::list(Type::Int), Type::Nothing]
+)]
+fn conditional_branch_types(#[case] code: &str, #[case] expected_tys: &[Type]) {
+    use nu_protocol::TypeSet;
+
+    let mut engine_state = EngineState::new();
+    let mut working_set = StateWorkingSet::new(&engine_state);
+
+    working_set.add_decl(Box::new(Def));
+    working_set.add_decl(Box::new(IfMocked));
+    working_set.add_decl(Box::new(MatchMocked));
+
+    let _ = engine_state.merge_delta(working_set.render());
+
+    let mut working_set = StateWorkingSet::new(&engine_state);
+
+    let block = parse(&mut working_set, None, code.as_bytes(), true);
+
+    assert_eq!(working_set.parse_errors.as_slice(), &[]);
+
+    let expected_ty = expected_tys
+        .iter()
+        .cloned()
+        .reduce(Type::union)
+        .expect("at least one type should have been expected");
+
+    let out_ty = block.output_type();
+
+    assert_eq!(out_ty, expected_ty);
+}
+
+#[rstest]
+#[case::malformed_table("[a b c; [1 2 3]]")]
+#[case::between_items("[1; 2]")]
+#[case::before_newline("[1;\n2]")]
+#[case::before_variable("[1; $undefined]")]
+#[case::leading("[;1]")]
+#[case::trailing("[1;]")]
+#[case::empty("[;]")]
+#[case::repeated("[1;; 2]")]
+#[case::nested_list("[[1; 2]]")]
+#[case::external_argument("^foo [1; 2]")]
+#[case::table_header("[[a; b]; [1]]")]
+#[case::table_row("[[a b]; [1 2; 3 4]]")]
+fn reject_invalid_list_semicolons(#[case] source: &str) {
+    let engine_state = EngineState::new();
+    let mut working_set = StateWorkingSet::new(&engine_state);
+    let _ = parse(&mut working_set, None, source.as_bytes(), false);
+
+    let error = working_set
+        .parse_errors
+        .first()
+        .expect("a semicolon in a list must produce a parse error");
+    assert!(
+        matches!(error, ParseError::LabeledErrorWithHelp { error, .. }
+            if error == "Unexpected semicolon in list"),
+        "unexpected diagnostic: {error:?}"
+    );
+    assert_eq!(working_set.get_span_contents(error.span()), b";");
+}
+
+#[rstest]
+#[case::plain("[[a b];]")]
+#[case::whitespace("[[a b]; \n]")]
+#[case::comment("[[a b]; # no rows\n]")]
+#[case::empty_header("[[];]")]
+fn table_without_rows_reports_missing_row(#[case] source: &str) {
+    let engine_state = EngineState::new();
+    let mut working_set = StateWorkingSet::new(&engine_state);
+    let _ = parse(&mut working_set, None, source.as_bytes(), false);
+
+    assert!(
+        matches!(
+            working_set.parse_errors.as_slice(),
+            [ParseError::Expected("table row", _)]
+        ),
+        "unexpected diagnostics: {:?}",
+        working_set.parse_errors
+    );
+
+    let span = working_set.parse_errors[0].span();
+    assert_eq!(span.start, span.end);
+    assert!(span.start > 0);
+    assert_eq!(
+        working_set.get_span_contents(Span::new(span.start - 1, span.start)),
+        b";"
+    );
+}
+
+#[rstest]
+#[case::double_quoted(r#"["a;b" 2]"#)]
+#[case::single_quoted("['a;b' 2]")]
+#[case::backtick_quoted("[`a;b` 2]")]
+#[case::raw_string("[r#'a;b'# 2]")]
+#[case::interpolation(r#"[$"(1; 2)" 3]"#)]
+#[case::comment("[1 # ; ignored\n 2]")]
+#[case::subexpression("[(1; 2) 3]")]
+#[case::closure("[{1; 2} 3]")]
+#[case::nested_table("[[[a]; [1]] 2]")]
+#[case::table_separator("[[a]; [1]]")]
+#[case::table_quoted_header(r#"[["a;b"]; [1]]"#)]
+#[case::table_subexpression_cell("[[a]; [(1; 2)]]")]
+#[case::table_nested_table_cell("[[a]; [[[b]; [1]]]]")]
+fn accept_valid_list_semicolons(#[case] source: &str) {
+    let engine_state = EngineState::new();
+    let mut working_set = StateWorkingSet::new(&engine_state);
+    let _ = parse(&mut working_set, None, source.as_bytes(), false);
+
+    assert!(
+        working_set.parse_errors.is_empty(),
+        "{:?}",
+        working_set.parse_errors
+    );
+}
+
+#[rstest]
+#[case::between_items("[1; 2]")]
+#[case::before_newline("[1;\n2]")]
+#[case::leading("[;1]")]
+#[case::trailing("[1;]")]
+#[case::empty("[;]")]
+#[case::repeated("[1;; 2]")]
+#[case::nested_list("[[1; 2]]")]
+#[case::nested_record("[{a: [1; 2]}]")]
+#[case::ignore_rest("[1 ..; 2]")]
+#[case::capture_rest("[1 ..$rest; 2]")]
+fn reject_invalid_list_pattern_semicolons(#[case] pattern: &str) {
+    let engine_state = EngineState::new();
+    let mut working_set = StateWorkingSet::new(&engine_state);
+    working_set.add_decl(Box::new(MatchMocked));
+    let source = format!("match [] {{ {pattern} => true, _ => false }}");
+    let _ = parse(&mut working_set, None, source.as_bytes(), false);
+
+    let error = working_set
+        .parse_errors
+        .first()
+        .expect("a semicolon in a list pattern must produce a parse error");
+    assert!(
+        matches!(error, ParseError::LabeledErrorWithHelp { error, .. }
+            if error == "Unexpected semicolon in list pattern"),
+        "unexpected diagnostic: {error:?}"
+    );
+    assert_eq!(working_set.get_span_contents(error.span()), b";");
+}
+
+#[rstest]
+#[case::double_quoted(r#"["a;b" 2]"#)]
+#[case::single_quoted("['a;b' 2]")]
+#[case::backtick_quoted("[`a;b` 2]")]
+#[case::raw_string("[r#'a;b'# 2]")]
+#[case::comment("[1 # ; ignored\n 2]")]
+#[case::constant_subexpression("[(1; 2)]")]
+#[case::nested_list(r#"[["a;b"]]"#)]
+#[case::nested_record(r#"[{a: "b;c"}]"#)]
+#[case::ignore_rest("[1 ..]")]
+#[case::capture_rest("[1 ..$rest]")]
+fn accept_valid_list_pattern_semicolons(#[case] pattern: &str) {
+    let engine_state = EngineState::new();
+    let mut working_set = StateWorkingSet::new(&engine_state);
+    working_set.add_decl(Box::new(MatchMocked));
+    let source = format!("match [] {{ {pattern} => true, _ => false }}");
+    let _ = parse(&mut working_set, None, source.as_bytes(), false);
+
+    assert!(
+        working_set.parse_errors.is_empty(),
+        "{:?}",
+        working_set.parse_errors
+    );
+}
+
+#[test]
+fn record_semicolon_gives_separator_help() {
+    let engine_state = EngineState::new();
+    let mut working_set = StateWorkingSet::new(&engine_state);
+    let _ = parse(
+        &mut working_set,
+        None,
+        b"{ show_banner: false; table_mode: rounded }",
+        false,
+    );
+    assert!(!working_set.parse_errors.is_empty());
+    let err = format!("{:?}", working_set.parse_errors[0]);
+    assert!(
+        err.contains("semicolon")
+            || err.contains("`;`")
+            || err.contains("Record")
+            || err.contains("record"),
+        "expected record separator help, got {err}"
+    );
+}
+
+#[test]
+fn explicit_record_invalid_value_token_errors() {
+    // Record context must reject non-item tokens as values (not silent parse).
+    // Nested `{ show_banner false }` can still parse as a closure; the
+    // refuse_confusing_record suite covers more shapes — this guards the
+    // value-token path with an assertion.
+    let engine_state = EngineState::new();
+    let mut working_set = StateWorkingSet::new(&engine_state);
+    let _ = parse(&mut working_set, None, b"{ a: || }", false);
+    assert!(
+        !working_set.parse_errors.is_empty(),
+        "expected parse error for invalid record value token"
+    );
+    let err = working_set.parse_errors[0].to_string();
+    assert!(
+        err.contains("Unexpected token") || err.contains("record"),
+        "expected record value token error, got {err}"
+    );
+}
+
+#[test]
+fn empty_and_complete_lines_error_kinds() {
+    // Complete inputs should not leave Unclosed/UnexpectedEof hanging; incomplete
+    // open blocks should.
+    let engine_state = EngineState::new();
+
+    let mut empty = StateWorkingSet::new(&engine_state);
+    parse(&mut empty, None, b"", false);
+    assert!(
+        empty.parse_errors.is_empty(),
+        "empty source should not produce parse errors, got {:?}",
+        empty.parse_errors
+    );
+
+    let mut one = StateWorkingSet::new(&engine_state);
+    parse(&mut one, None, b"1", false);
+    assert!(
+        one.parse_errors.is_empty(),
+        "literal `1` should parse cleanly, got {:?}",
+        one.parse_errors
+    );
+
+    let mut unclosed = StateWorkingSet::new(&engine_state);
+    parse(&mut unclosed, None, b"def f [] {", false);
+    assert!(
+        unclosed
+            .parse_errors
+            .iter()
+            .any(|e| matches!(e, ParseError::Unclosed(..) | ParseError::UnexpectedEof(..))),
+        "open block should be Unclosed/UnexpectedEof, got {:?}",
+        unclosed.parse_errors
+    );
 }

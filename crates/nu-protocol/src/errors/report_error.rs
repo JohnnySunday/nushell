@@ -3,6 +3,7 @@
 //! Relies on the `miette` crate for pretty layout
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
     CompileError, Config, ErrorStyle, ParseError, ParseWarning, ShellError, ShellWarning,
@@ -15,6 +16,11 @@ use miette::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// While doing in-process testing of Nushell, the reports may spam the console output.
+///
+/// This value allows suppressing these outputs to not see them during test execution.
+pub static SUPPRESS_REPORTING: AtomicBool = AtomicBool::new(false);
 
 /// This error exists so that we can defer SourceCode handling. It simply
 /// forwards most methods, except for `.source_code()`, which we provide.
@@ -47,7 +53,8 @@ impl<'src> CliError<'src> {
 /// A bloom-filter like structure to store the hashes of warnings,
 /// without actually permanently storing the entire warning in memory.
 /// May rarely result in warnings incorrectly being unreported upon hash collision.
-#[derive(Default)]
+#[derive(Default, derive_more::Debug)]
+#[debug("ReportLog([...])")]
 pub struct ReportLog(Vec<u64>);
 
 /// How a warning/error should be reported
@@ -177,11 +184,14 @@ fn report_error(
         CliError::new(stack, error, working_set, Some(default_code))
     );
 
-    // Avoid eprintln! since it panics on broken stderr, which double-panics
-    // through miette's panic hook and aborts.
-    if writeln!(std::io::stderr(), "{report}").is_err() {
-        let _ = writeln!(std::io::stdout(), "{report}");
+    if !SUPPRESS_REPORTING.load(Ordering::Relaxed) {
+        // Avoid eprintln! since it panics on broken stderr, which double-panics
+        // through miette's panic hook and aborts.
+        if writeln!(std::io::stderr(), "{report}").is_err() {
+            let _ = writeln!(std::io::stdout(), "{report}");
+        }
     }
+
     // reset vt processing, aka ansi because illbehaved externals can break it
     #[cfg(windows)]
     {
@@ -200,9 +210,12 @@ fn report_warning(
         CliError::new(stack, warning, working_set, Some(default_code))
     );
 
-    if writeln!(std::io::stderr(), "{report}").is_err() {
+    if !SUPPRESS_REPORTING.load(Ordering::Relaxed)
+        && writeln!(std::io::stderr(), "{report}").is_err()
+    {
         let _ = writeln!(std::io::stdout(), "{report}");
     }
+
     // reset vt processing, aka ansi because illbehaved externals can break it
     #[cfg(windows)]
     {
@@ -238,14 +251,10 @@ impl std::fmt::Debug for CliError<'_> {
                     .color(ansi_support)
                     .unicode(ansi_support)
                     .terminal_links(ansi_support)
-                    .context_lines(error_lines as usize);
+                    .context_lines(error_lines as usize)
+                    .with_cause_chain();
                 match style {
-                    ErrorStyle::Nested => Box::new(
-                        handler
-                            .show_related_errors_as_nested()
-                            .with_cause_chain()
-                            .build(),
-                    ),
+                    ErrorStyle::Nested => Box::new(handler.show_related_errors_as_nested().build()),
                     _ => Box::new(handler.build()),
                 }
             }

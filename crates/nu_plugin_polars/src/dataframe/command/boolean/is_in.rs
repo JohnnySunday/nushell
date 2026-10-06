@@ -26,6 +26,11 @@ impl PluginCommand for ExprIsIn {
     fn signature(&self) -> Signature {
         Signature::build(self.name())
             .required("list", SyntaxShape::Any, "List to check if values are in.")
+            .switch(
+                "maintain-order",
+                "Maintains the order of the original values in the list",
+                Some('o'),
+            )
             .input_output_types(vec![
                 (
                     PolarsPluginType::NuExpression.into(),
@@ -70,6 +75,7 @@ impl PluginCommand for ExprIsIn {
                             ),
                         ],
                         None,
+                        Span::test_data(),
                     )
                     .expect("simple df for test should not fail")
                     .into_value(Span::test_data()),
@@ -104,6 +110,7 @@ impl PluginCommand for ExprIsIn {
                             ),
                         ],
                         None,
+                        Span::test_data(),
                     )
                     .expect("simple df for test should not fail")
                     .into_value(Span::test_data()),
@@ -138,6 +145,7 @@ impl PluginCommand for ExprIsIn {
                             ),
                         ],
                         None,
+                        Span::test_data(),
                     )
                     .expect("simple df for test should not fail")
                     .into_value(Span::test_data()),
@@ -155,9 +163,9 @@ impl PluginCommand for ExprIsIn {
         plugin: &Self::Plugin,
         engine: &EngineInterface,
         call: &EvaluatedCall,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
-        let metadata = input.metadata();
+        let metadata = input.take_metadata();
         let value = input.into_value(call.head)?;
         match PolarsPluginObject::try_from_value(plugin, &value)? {
             PolarsPluginObject::NuExpression(expr) => command_expr(plugin, engine, call, expr),
@@ -186,6 +194,7 @@ fn command_expr(
     call: &EvaluatedCall,
     expr: NuExpression,
 ) -> Result<PipelineData, ShellError> {
+    let maintain_order = call.has_flag("maintain-order")?;
     let is_in_expr: Expr = call
         .req::<Value>(0)
         .and_then(|ref value| NuExpression::try_from_value(plugin, value))
@@ -199,6 +208,7 @@ fn command_expr(
                         NuDataFrame::try_from_columns(
                             vec![Column::new("list".to_string(), list)],
                             None,
+                            call.head,
                         )
                     })
                 })?;
@@ -211,7 +221,7 @@ fn command_expr(
                     span: call.head,
                 })
             } else {
-                Ok(lit(list).implode())
+                Ok(lit(list).implode(maintain_order))
             }
         })?;
 

@@ -1,4 +1,5 @@
 use crate::eval_expression;
+use crate::named_flags::flag_type_accepts_nothing;
 use nu_protocol::{
     FromValue, ShellError, Span, Value, ast,
     debugger::WithoutDebug,
@@ -33,6 +34,18 @@ pub trait CallExt {
         starting_pos: usize,
     ) -> Result<Vec<T>, ShellError>;
 
+    /// Returns the rest arguments starting at `starting_pos`, preserving whether each item was
+    /// passed as a spread argument.
+    ///
+    /// The tuple contains `(value, is_spread)`. This differs from [`CallExt::rest()`], which
+    /// flattens spread arguments into a single list of values.
+    fn rest_preserving_spreads<T: FromValue>(
+        &self,
+        engine_state: &EngineState,
+        stack: &mut Stack,
+        starting_pos: usize,
+    ) -> Result<Vec<(T, bool)>, ShellError>;
+
     fn opt<T: FromValue>(
         &self,
         engine_state: &EngineState,
@@ -43,6 +56,7 @@ pub trait CallExt {
     fn opt_const<T: FromValue>(
         &self,
         working_set: &StateWorkingSet,
+        stack: &Stack,
         pos: usize,
     ) -> Result<Option<T>, ShellError>;
 
@@ -104,6 +118,18 @@ impl CallExt for ast::Call {
         if let Some(expr) = self.get_flag_expr(name) {
             let stack = &mut stack.use_call_arg_out_dest();
             let result = eval_expression::<WithoutDebug>(engine_state, stack, expr)?;
+            // Signature-aware null: omit when the flag type does not accept nothing
+            // (IR path does this in normalize_call_arguments before get_flag runs).
+            if result.is_nothing() {
+                let accepts = engine_state
+                    .get_decl(self.decl_id)
+                    .signature()
+                    .get_long_flag(name)
+                    .is_some_and(|flag| flag_type_accepts_nothing(&flag));
+                if !accepts {
+                    return Ok(None);
+                }
+            }
             FromValue::from_value(result).map(Some)
         } else {
             Ok(None)
@@ -129,13 +155,28 @@ impl CallExt for ast::Call {
         .collect()
     }
 
+    fn rest_preserving_spreads<T: FromValue>(
+        &self,
+        engine_state: &EngineState,
+        stack: &mut Stack,
+        starting_pos: usize,
+    ) -> Result<Vec<(T, bool)>, ShellError> {
+        let stack = &mut stack.use_call_arg_out_dest();
+        self.rest_iter(starting_pos)
+            .map(|(expr, is_spread)| {
+                let result = eval_expression::<WithoutDebug>(engine_state, stack, expr)?;
+                Ok((T::from_value(result)?, is_spread))
+            })
+            .collect()
+    }
+
     fn opt<T: FromValue>(
         &self,
         engine_state: &EngineState,
         stack: &mut Stack,
         pos: usize,
     ) -> Result<Option<T>, ShellError> {
-        if let Some(expr) = self.positional_nth(pos) {
+        if let Some(expr) = self.positional_iter().nth(pos) {
             let stack = &mut stack.use_call_arg_out_dest();
             let result = eval_expression::<WithoutDebug>(engine_state, stack, expr)?;
             if result.is_nothing() {
@@ -151,9 +192,10 @@ impl CallExt for ast::Call {
     fn opt_const<T: FromValue>(
         &self,
         working_set: &StateWorkingSet,
+        _stack: &Stack,
         pos: usize,
     ) -> Result<Option<T>, ShellError> {
-        if let Some(expr) = self.positional_nth(pos) {
+        if let Some(expr) = self.positional_iter().nth(pos) {
             let result = eval_constant(working_set, expr)?;
             if result.is_nothing() {
                 Ok(None)
@@ -171,18 +213,21 @@ impl CallExt for ast::Call {
         stack: &mut Stack,
         pos: usize,
     ) -> Result<T, ShellError> {
-        if let Some(expr) = self.positional_nth(pos) {
-            let stack = &mut stack.use_call_arg_out_dest();
-            let result = eval_expression::<WithoutDebug>(engine_state, stack, expr)?;
-            FromValue::from_value(result)
-        } else if self.positional_len() == 0 {
-            Err(ShellError::AccessEmptyContent { span: self.head })
-        } else {
-            Err(ShellError::AccessBeyondEnd {
-                max_idx: self.positional_len() - 1,
-                span: self.head,
-            })
-        }
+        let maybe_expr = self.positional_iter().nth(pos);
+        let expr = maybe_expr.ok_or_else(|| {
+            let max_idx = self.positional_iter().count().checked_sub(1);
+            match max_idx {
+                None => ShellError::AccessEmptyContent { span: self.head },
+                Some(max_idx) => ShellError::AccessBeyondEnd {
+                    max_idx,
+                    span: self.head,
+                },
+            }
+        })?;
+
+        let stack = &mut stack.use_call_arg_out_dest();
+        let result = eval_expression::<WithoutDebug>(engine_state, stack, expr)?;
+        FromValue::from_value(result)
     }
 
     fn req_parser_info<T: FromValue>(
@@ -232,6 +277,8 @@ impl CallExt for ir::Call {
         stack: &mut Stack,
         name: &str,
     ) -> Result<Option<T>, ShellError> {
+        // Null flags that are not type-accepted are dropped in normalize_call_arguments.
+        // Remaining null values are intentional (flag type accepts nothing).
         if let Some(val) = self.get_named_arg(stack, name) {
             T::from_value(val.clone()).map(Some)
         } else {
@@ -256,6 +303,17 @@ impl CallExt for ir::Call {
             .collect()
     }
 
+    fn rest_preserving_spreads<T: FromValue>(
+        &self,
+        _engine_state: &EngineState,
+        stack: &mut Stack,
+        starting_pos: usize,
+    ) -> Result<Vec<(T, bool)>, ShellError> {
+        self.rest_iter(stack, starting_pos)
+            .map(|(val, is_spread)| Ok((T::from_value(val.clone())?, is_spread)))
+            .collect()
+    }
+
     fn opt<T: FromValue>(
         &self,
         _engine_state: &EngineState,
@@ -273,12 +331,15 @@ impl CallExt for ir::Call {
     fn opt_const<T: FromValue>(
         &self,
         _working_set: &StateWorkingSet,
-        _pos: usize,
+        stack: &Stack,
+        pos: usize,
     ) -> Result<Option<T>, ShellError> {
-        Err(ShellError::IrEvalError {
-            msg: "const evaluation is not yet implemented on ir::Call".into(),
-            span: Some(self.head),
-        })
+        self.positional_iter(stack)
+            .nth(pos)
+            .filter(|v| !v.is_nothing())
+            .cloned()
+            .map(T::from_value)
+            .transpose()
     }
 
     fn req<T: FromValue>(
@@ -287,16 +348,19 @@ impl CallExt for ir::Call {
         stack: &mut Stack,
         pos: usize,
     ) -> Result<T, ShellError> {
-        if let Some(val) = self.positional_iter(stack).nth(pos).cloned() {
-            T::from_value(val)
-        } else if self.positional_len(stack) == 0 {
-            Err(ShellError::AccessEmptyContent { span: self.head })
-        } else {
-            Err(ShellError::AccessBeyondEnd {
-                max_idx: self.positional_len(stack) - 1,
-                span: self.head,
-            })
-        }
+        let maybe_val = self.positional_iter(stack).nth(pos).cloned();
+        let val = maybe_val.ok_or_else(|| {
+            let max_idx = self.positional_iter(stack).count().checked_sub(1);
+            match max_idx {
+                None => ShellError::AccessEmptyContent { span: self.head },
+                Some(max_idx) => ShellError::AccessBeyondEnd {
+                    max_idx,
+                    span: self.head,
+                },
+            }
+        })?;
+
+        T::from_value(val)
     }
 
     fn req_parser_info<T: FromValue>(
@@ -368,6 +432,15 @@ impl CallExt for engine::Call<'_> {
         proxy!(self.rest(engine_state, stack, starting_pos))
     }
 
+    fn rest_preserving_spreads<T: FromValue>(
+        &self,
+        engine_state: &EngineState,
+        stack: &mut Stack,
+        starting_pos: usize,
+    ) -> Result<Vec<(T, bool)>, ShellError> {
+        proxy!(self.rest_preserving_spreads(engine_state, stack, starting_pos))
+    }
+
     fn opt<T: FromValue>(
         &self,
         engine_state: &EngineState,
@@ -380,9 +453,10 @@ impl CallExt for engine::Call<'_> {
     fn opt_const<T: FromValue>(
         &self,
         working_set: &StateWorkingSet,
+        stack: &Stack,
         pos: usize,
     ) -> Result<Option<T>, ShellError> {
-        proxy!(self.opt_const(working_set, pos))
+        proxy!(self.opt_const(working_set, stack, pos))
     }
 
     fn req<T: FromValue>(

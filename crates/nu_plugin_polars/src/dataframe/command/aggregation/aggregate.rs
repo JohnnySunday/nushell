@@ -7,6 +7,7 @@ use crate::{
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
 use nu_protocol::{
     Category, Example, LabeledError, PipelineData, ShellError, Signature, Span, SyntaxShape, Value,
+    shell_error::generic::GenericError,
 };
 use polars::{datatypes::DataType, prelude::Expr};
 
@@ -38,6 +39,10 @@ impl PluginCommand for LazyAggregate {
                 ),
                 (
                     PolarsPluginType::NuLazyFrame.into(),
+                    PolarsPluginType::NuLazyFrame.into(),
+                ),
+                (
+                    PolarsPluginType::NuLazyGroupBy.into(),
                     PolarsPluginType::NuLazyFrame.into(),
                 ),
             ])
@@ -79,6 +84,7 @@ impl PluginCommand for LazyAggregate {
                             ),
                         ],
                         None,
+                        Span::test_data(),
                     )
                     .expect("simple df for test should not fail")
                     .into_value(Span::test_data()),
@@ -117,6 +123,7 @@ impl PluginCommand for LazyAggregate {
                             ),
                         ],
                         None,
+                        Span::test_data(),
                     )
                     .expect("simple df for test should not fail")
                     .into_value(Span::test_data()),
@@ -130,9 +137,9 @@ impl PluginCommand for LazyAggregate {
         plugin: &Self::Plugin,
         engine: &EngineInterface,
         call: &EvaluatedCall,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
-        let metadata = input.metadata();
+        let metadata = input.take_metadata();
         let vals: Vec<Value> = call.rest(0)?;
         let value = Value::list(vals, call.head);
         let expressions = NuExpression::extract_exprs(plugin, value)?;
@@ -144,13 +151,17 @@ impl PluginCommand for LazyAggregate {
                 let dtype = group_by.schema.schema.get(name.as_str());
 
                 if let Some(DataType::Object(..)) = dtype {
-                    return Err(ShellError::GenericError {
-                            error: "Object type column not supported for aggregation".into(),
-                            msg: format!("Column '{name}' is type Object"),
-                            span: Some(call.head),
-                            help: Some("Aggregations cannot be performed on Object type columns. Use dtype command to check column types".into()),
-                            inner: vec![],
-                        }).map_err(|e| e.into());
+                    return Err(ShellError::Generic(
+                        GenericError::new(
+                            "Object type column not supported for aggregation",
+                            format!("Column '{name}' is type Object"),
+                            call.head,
+                        )
+                        .with_help(
+                            "Aggregations cannot be performed on Object type columns. Use dtype command to check column types",
+                        ),
+                    ))
+                    .map_err(|e| e.into());
                 }
             }
         }
@@ -174,7 +185,7 @@ fn get_col_name(expr: &Expr) -> Option<String> {
             | polars::prelude::AggExpr::First(e)
             | polars::prelude::AggExpr::Last(e)
             | polars::prelude::AggExpr::Mean(e)
-            | polars::prelude::AggExpr::Implode(e)
+            | polars::prelude::AggExpr::Implode { input: e, .. }
             | polars::prelude::AggExpr::Count { input: e, .. }
             | polars::prelude::AggExpr::Sum(e)
             | polars::prelude::AggExpr::AggGroups(e)
@@ -182,8 +193,7 @@ fn get_col_name(expr: &Expr) -> Option<String> {
             | polars::prelude::AggExpr::Var(e, _)
             | polars::prelude::AggExpr::Item { input: e, .. }
             | polars::prelude::AggExpr::FirstNonNull(e)
-            | polars::prelude::AggExpr::LastNonNull(e)
-            | polars::prelude::AggExpr::Quantile { expr: e, .. } => get_col_name(e.as_ref()),
+            | polars::prelude::AggExpr::LastNonNull(e) => get_col_name(e.as_ref()),
         },
         Expr::Filter { input: expr, .. }
         | Expr::Slice { input: expr, .. }
