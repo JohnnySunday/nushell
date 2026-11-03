@@ -809,11 +809,14 @@ pub fn parse_module_file_or_dir(
     }
 
     if working_set.skip_module_load {
+        working_set.skipped_module_load = true;
         return None;
     }
 
-    #[allow(deprecated)]
-    let cwd = working_set.get_cwd();
+    let cwd = working_set
+        .permanent()
+        .cwd_as_string(None)
+        .unwrap_or_default();
 
     let module_path = if let Some(path) = find_in_dirs(
         &module_path_str,
@@ -997,6 +1000,7 @@ pub fn parse_module(
         )]);
 
         if working_set.skip_module_load {
+            working_set.skipped_module_load = true;
             return (pipeline, None);
         }
 
@@ -1238,6 +1242,7 @@ pub fn parse_use(
             module_id,
         )
     } else if working_set.skip_module_load {
+        working_set.skipped_module_load = true;
         return (
             Pipeline::from_vec(vec![Expression::new(
                 working_set,
@@ -1769,6 +1774,7 @@ pub fn parse_overlay_use(working_set: &mut StateWorkingSet, call: Box<Call>) -> 
                     true,
                 )
             } else if working_set.skip_module_load {
+                working_set.skipped_module_load = true;
                 return pipeline;
             } else if let Some(module_id) = parse_module_file_or_dir(
                 working_set,
